@@ -1,0 +1,1262 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>CV Interactif | Abdoul Aziz KANE</title>
+
+  <!-- Tailwind + Chart.js + pdfmake -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pdfmake@0.2.10/build/pdfmake.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pdfmake@0.2.10/build/vfs_fonts.js"></script>
+
+  <!-- PDF.js pour compter le nombre de pages et optimiser à 1 page -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script>
+    if (window.pdfjsLib) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    }
+  </script>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet"/>
+
+  <style>
+    :root{
+      --bg:#FDFBF7; --ink:#222; --muted:#6B6B6B;
+      --brand:#A68B6D; --brandDark:#8D765D;
+      --card:#FFFFFF; --hair:#E6DDD2;
+    }
+    html,body{background:var(--bg);color:var(--ink);font-family:'Inter',sans-serif}
+    .card{background:var(--card);border:1px solid rgba(0,0,0,.05);border-radius:18px;box-shadow:0 6px 20px rgba(0,0,0,.06)}
+    .hair{height:1px;background:var(--hair)}
+    .section-title{color:#2a2a2a}
+    .pill{border:1px solid #e8e1d7;border-radius:999px;padding:.25rem .75rem}
+
+    /* Spinner dots */
+    .dots{display:inline-flex;gap:3px;align-items:center}
+    .dots i{width:4px;height:4px;background:var(--brand);display:block;border-radius:999px;animation:blink 1s ease-in-out infinite}
+    .dots i:nth-child(2){animation-delay:.15s}
+    .dots i:nth-child(3){animation-delay:.3s}
+    @keyframes blink{0%,80%,100%{opacity:.25;transform:translateY(0)}40%{opacity:1;transform:translateY(-2px)}}
+
+    .timeline-item::before{content:'';position:absolute;left:-.625rem;top:0;width:1.25rem;height:1.25rem;border-radius:50%;background:var(--brand);border:4px solid var(--bg)}
+    .details-content{transition:max-height .45s ease,opacity .45s ease;max-height:0;opacity:0;overflow:hidden}
+    .details-content.open{max-height:1000px;opacity:1}
+    .letter-pre{white-space:pre-wrap;font-family:inherit;line-height:1.6}
+    #cvPreview{border:1px dashed #e7e0d7;border-radius:12px;background:#fff9f1}
+
+    /* Controls centering & responsive */
+    .ctrl{width:100%;max-width:18rem}
+    @media(min-width:640px){ .ctrl{max-width:20rem} }
+
+    /* Selects colorés */
+    .select-brand{
+      appearance:none;background-color:#FFF7EF;border:1px solid var(--brand);color:#1f2937;padding:.5rem .75rem;border-radius:.5rem;
+      background-image:url("data:image/svg+xml;charset=UTF-8,%3csvg width='20' height='20' viewBox='0 0 20 20' fill='none' xmlns='http://www.w3.org/2000/svg'%3e%3cpath d='M5 7l5 5 5-5' stroke='%23A68B6D' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3e%3c/svg%3e");
+      background-repeat:no-repeat;background-position:right .6rem center;background-size:16px 16px;padding-right:2rem;transition:background-color .2s ease, box-shadow .2s ease, border-color .2s ease;
+    }
+    .select-brand:hover{ background-color:#FFF3E6; }
+    .select-brand:focus{ outline:0; box-shadow:0 0 0 3px rgba(166,139,109,.25); border-color:var(--brand); }
+
+    /* Q&A esthétique */
+    .qa-wrap .qa-item{background:#fff;border:1px solid #eee3d7;border-radius:12px;padding:14px;margin-top:12px;box-shadow:0 3px 10px rgba(0,0,0,.04)}
+    .qa-wrap .qa-q{font-weight:700;color:#5B4636;margin-bottom:6px}
+    .qa-wrap .qa-a{color:#333}
+    .qa-wrap .qa-a ul{list-style:disc;margin-left:1rem}
+  </style>
+</head>
+<body class="antialiased">
+  <div class="container mx-auto px-4 sm:px-6 lg:px-8 py-10">
+
+    <!-- =================== HEADER =================== -->
+    <header class="text-center mb-14">
+      <h1 class="text-4xl md:text-5xl font-bold text-gray-900">Abdoul Aziz KANE</h1>
+      <p class="mt-2 text-xl md:text-2xl text-[var(--brand)] font-semibold">Ingénieur Cybersécurité | Consultant en Sécurité Cloud</p>
+      <div class="mt-6 flex flex-wrap justify-center items-center gap-x-6 gap-y-2 text-gray-700 text-[15px]">
+        <span>Choisy-le-Roi (94600)</span>
+        <span class="hidden sm:inline">•</span>
+        <a href="tel:+33753750570" class="hover:text-[var(--brand)]">+33 7 53 75 05 70</a>
+        <span class="hidden sm:inline">•</span>
+        <a href="mailto:Abdoulaziz.kane2021@gmail.com" class="hover:text-[var(--brand)]">Abdoulaziz.kane2021@gmail.com</a>
+        <span class="hidden sm:inline">•</span>
+        <a href="https://linkedin.com/in/aakane0105/" target="_blank" rel="noopener" class="hover:text-[var(--brand)]">linkedin.com/in/aakane0105/</a>
+      </div>
+    </header>
+
+    <!-- =================== PROFIL =================== -->
+    <section id="profile" class="max-w-3xl mx-auto mb-16 text-center">
+      <h2 class="text-3xl font-bold section-title mb-2">Profil</h2>
+      <div class="hair mx-auto w-24 mb-6"></div>
+      <p class="text-lg text-gray-700 leading-relaxed">
+        Ingénieur en cybersécurité spécialisé dans la sécurisation des environnements hybrides Azure/Intune, la gestion d'endpoints et la conformité (ISO 27001/RGPD).
+        Expérimenté en Microsoft 365 Security, SCCM, GPO, tests d'intrusion et gestion des vulnérabilités.
+      </p>
+    </section>
+
+    <!-- =================== SKILLS (Radar + filtres) =================== -->
+    <section id="skills" class="mb-16">
+      <h2 class="text-3xl font-bold section-title text-center mb-2">Tableau de Bord des Compétences</h2>
+      <div class="hair mx-auto w-24 mb-8"></div>
+
+      <div class="flex flex-col md:flex-row items-center md:items-start gap-8">
+        <div class="w-full md:w-1/2 lg:w-2/5">
+          <div class="bg-white rounded-xl p-3 card">
+            <div class="relative h-80 md:h-96">
+              <canvas id="skillsRadarChart"></canvas>
+            </div>
+          </div>
+        </div>
+        <div class="w-full md:w-1/2 lg:w-3/5">
+          <p class="text-center md:text-left text-gray-600 mb-4">Cliquez sur une catégorie pour voir les détails.</p>
+          <div class="flex flex-wrap justify-center md:justify-start gap-2 mb-4" id="skill-filters"></div>
+          <div id="skill-details" class="space-y-3"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =================== PARCOURS =================== -->
+    <section id="timeline" class="max-w-3xl mx-auto">
+      <h2 class="text-3xl font-bold section-title text-center mb-2">Parcours Professionnel & Formation</h2>
+      <div class="hair mx-auto w-24 mb-8"></div>
+
+      <div class="space-y-12">
+        <div>
+          <h3 class="text-2xl font-semibold mb-4">Expérience professionnelle</h3>
+          <div id="experience-timeline" class="relative border-l-2 border-gray-200 pl-8"></div>
+        </div>
+        <div>
+          <h3 class="text-2xl font-semibold mb-4">Formation</h3>
+          <div id="education-timeline" class="relative border-l-2 border-gray-200 pl-8"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =================== CERTIFICATIONS =================== -->
+    <section id="certifications" class="mt-16">
+      <h2 class="text-3xl font-bold section-title text-center mb-2">Certifications</h2>
+      <div class="hair mx-auto w-24 mb-8"></div>
+      <div id="certifications-grid" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 md:gap-6 max-w-4xl mx-auto">
+        <div class="bg-white p-3 rounded-lg shadow-md text-center flex items-center justify-center hover:shadow-lg transition"><p class="font-semibold text-gray-700 text-sm md:text-base">CCNA (1–4)</p></div>
+        <div class="bg-white p-3 rounded-lg shadow-md text-center flex items-center justify-center hover:shadow-lg transition"><p class="font-semibold text-gray-700 text-sm md:text-base">Microsoft Azure (AZ-900)</p></div>
+        <div class="bg-white p-3 rounded-lg shadow-md text-center flex items-center justify-center hover:shadow-lg transition"><p class="font-semibold text-gray-700 text-sm md:text-base">Microsoft 365 (MS-900)</p></div>
+        <div class="bg-white p-3 rounded-lg shadow-md text-center flex items-center justify-center hover:shadow-lg transition"><p class="font-semibold text-gray-700 text-sm md:text-base">Security, Compliance & Identity (SC-900)</p></div>
+        <div class="bg-white p-3 rounded-lg shadow-md text-center flex items-center justify-center hover:shadow-lg transition"><p class="font-semibold text-gray-700 text-sm md:text-base">AWS Cloud Foundations</p></div>
+        <div class="bg-white p-3 rounded-lg shadow-md text-center flex items-center justify-center hover:shadow-lg transition"><p class="font-semibold text-gray-700 text-sm md:text-base">AWS Cloud Architecting</p></div>
+        <div class="bg-white p-3 rounded-lg shadow-md text-center flex items-center justify-center hover:shadow-lg transition"><p class="font-semibold text-gray-700 text-sm md:text-base">LPIC-2</p></div>
+        <div class="bg-white p-3 rounded-lg shadow-md text-center flex items-center justify-center hover:shadow-lg transition"><p class="font-semibold text-gray-700 text-sm md:text-base">CompTIA Linux+</p></div>
+      </div>
+    </section>
+
+    <!-- =================== OUTILS CANDIDATURE (LM + Questions) =================== -->
+    <section id="tools" class="mt-20">
+      <h2 class="text-3xl font-bold section-title text-center mb-2">Outils d'aide à la candidature ✨</h2>
+      <div class="hair mx-auto w-24 mb-10"></div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 max-w-5xl mx-auto">
+        <!-- Lettre de motivation -->
+        <div class="card p-6">
+          <div class="flex items-center justify-between gap-3 mb-2">
+            <h3 class="text-2xl font-bold text-[var(--brand)]">Lettre de motivation ✨</h3>
+            <div class="flex items-center gap-2">
+              <label for="lmLang" class="text-sm text-gray-700">Langue</label>
+              <select id="lmLang" class="select-brand">
+                <option value="fr" selected>Français</option>
+                <option value="en">English</option>
+              </select>
+            </div>
+          </div>
+          <p class="text-gray-600 mb-4">Entrez les infos du poste. Export PDF en 1 clic (mise en page soignée).</p>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-sm font-medium text-gray-700">Nom de l'entreprise</label>
+              <input id="companyName" type="text" class="mt-1 w-full rounded-md border-gray-300 p-2 focus:border-[var(--brand)] focus:ring focus:ring-[var(--brand)]/40" placeholder="Ex: IMOGATE">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-gray-700">Intitulé du poste</label>
+              <input id="jobTitle" type="text" class="mt-1 w-full rounded-md border-gray-300 p-2 focus:border-[var(--brand)] focus:ring focus:ring-[var(--brand)]/40" placeholder="Ex: Ingénieur Réseaux & Sécurité">
+            </div>
+            <div class="md:col-span-2">
+              <label class="block text-sm font-medium text-gray-700">Description du poste (facultatif)</label>
+              <textarea id="jobDescription" rows="4" class="mt-1 w-full rounded-md border-gray-300 p-2 focus:border-[var(--brand)] focus:ring focus:ring-[var(--brand)]/40" placeholder="Collez des extraits de l’offre (missions/outils)."></textarea>
+            </div>
+          </div>
+
+          <div class="mt-5 flex justify-center gap-3">
+            <button id="generateCoverLetterBtn" class="relative bg-[var(--brand)] text-white py-2 px-8 rounded-md font-semibold hover:bg-[var(--brandDark)] transition">
+              <span id="lmBtnText">Générer la lettre ✨</span>
+              <span id="lmBtnSpinner" class="dots hidden absolute right-3 top-1/2 -translate-y-1/2"><i></i><i></i><i></i></span>
+            </button>
+          </div>
+
+          <div class="mt-5 p-4 bg-[#fff9f1] rounded-md" id="coverLetterWrapper">
+            <div id="coverLetterOutput" class="letter-pre text-[15px] text-gray-900">
+              <p class="text-center text-gray-500">Votre lettre de motivation apparaîtra ici.</p>
+            </div>
+            <div class="mt-5 flex justify-center gap-3">
+              <button id="downloadPdfBtn" class="disabled:opacity-40 bg-[var(--brand)] text-white py-2 px-6 rounded-md font-semibold hover:bg-[var(--brandDark)] transition" disabled>
+                Télécharger en PDF
+              </button>
+              <button id="copyLetterBtn" class="disabled:opacity-40 bg-white border border-[var(--brand)] text-[var(--brand)] py-2 px-6 rounded-md font-semibold hover:bg-[#fff3e6] transition" disabled>
+                Copier le texte
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Questions entretien (centré + esthétique) -->
+        <div class="card p-6 text-center">
+          <h3 class="text-2xl font-bold text-[var(--brand)] mb-2">Questions d'entretien ✨</h3>
+          <p class="text-gray-600 mb-4">Sélectionnez une expérience pour générer des questions + éléments de réponse.</p>
+
+          <div class="max-w-md mx-auto">
+            <label class="block text-sm font-medium text-gray-700 mb-1">Sélectionnez une expérience</label>
+            <select id="experienceSelect" class="mt-1 w-full select-brand">
+              <option value="">-- Choisissez une expérience --</option>
+            </select>
+          </div>
+
+          <div class="mt-5 flex justify-center">
+            <button id="generateQuestionsBtn" class="relative bg-[var(--brand)] text-white py-2 px-6 rounded-md font-semibold hover:bg-[var(--brandDark)] transition">
+              <span id="qBtnText">Générer les questions ✨</span>
+              <span id="qBtnSpinner" class="dots hidden absolute right-3 top-1/2 -translate-y-1/2"><i></i><i></i><i></i></span>
+            </button>
+          </div>
+
+          <div id="questionsOutput" class="mt-5 p-4 bg-[#fff9f1] rounded-md text-[15px] max-w-2xl mx-auto text-left">
+            <p class="text-center text-gray-500">Les questions apparaîtront ici.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =================== PITCH D’ASCENSEUR =================== -->
+    <section id="pitch" class="mt-12 max-w-3xl mx-auto">
+      <div class="card p-6">
+        <div class="flex items-center justify-between gap-3 mb-2">
+          <h3 class="text-2xl font-bold text-[var(--brand)]">Pitch d’ascenseur ⚡️</h3>
+          <div class="flex items-center gap-2">
+            <label class="text-sm text-gray-700" for="pitchLang">Langue</label>
+            <select id="pitchLang" class="select-brand">
+              <option value="fr" selected>Français</option>
+              <option value="en">English</option>
+            </select>
+          </div>
+        </div>
+        <p class="text-gray-600 mb-4">Un résumé percutant de votre profil (2–4 phrases).</p>
+        <div class="flex justify-center">
+          <button id="generatePitchBtn" class="relative bg-[var(--brand)] text-white py-2 px-6 rounded-md font-semibold hover:bg-[var(--brandDark)] transition">
+            <span id="pitchBtnText">Générer le pitch</span>
+            <span id="pitchBtnSpinner" class="dots hidden absolute right-3 top-1/2 -translate-y-1/2"><i></i><i></i><i></i></span>
+          </button>
+        </div>
+        <div id="pitchOutput" class="mt-5 p-4 bg-[#fff9f1] rounded-md text-[15px] text-gray-900">
+          <p class="text-center text-gray-500">Votre pitch apparaîtra ici.</p>
+        </div>
+        <div class="mt-3 flex justify-center">
+          <button id="copyPitchBtn" class="bg-white border border-[var(--brand)] text-[var(--brand)] py-2 px-6 rounded-md font-semibold hover:bg-[#fff3e6] transition" disabled>Copier le pitch</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- =================== GÉNÉRATEUR CV ATS =================== -->
+    <section id="cv-maker" class="mt-20">
+      <h2 class="text-3xl font-bold section-title text-center mb-2">Générateur de CV ATS (1 page A4) 🧰</h2>
+      <div class="hair mx-auto w-24 mb-8"></div>
+
+      <div class="max-w-5xl mx-auto card p-6">
+        <div class="flex flex-wrap justify-center gap-5">
+          <div class="ctrl">
+            <label class="block text-sm font-medium text-gray-700 text-center">Type de CV</label>
+            <select id="cvType" class="mt-1 w-full select-brand">
+              <option value="admin">Administrateur Systèmes &amp; Réseaux</option>
+              <option value="sec" selected>Ingénieur Cybersécurité</option>
+              <option value="cloud">Consultant Sécurité Cloud</option>
+            </select>
+          </div>
+          <div class="ctrl">
+            <label class="block text-sm font-medium text-gray-700 text-center">Contrat</label>
+            <select id="cvContract" class="mt-1 w-full select-brand">
+              <option value="CDI" selected>CDI</option>
+              <option value="Alternance">Alternance</option>
+            </select>
+          </div>
+          <div class="ctrl">
+            <label class="block text-sm font-medium text-gray-700 text-center">Langue du CV</label>
+            <select id="cvLang" class="mt-1 w-full select-brand">
+              <option value="fr" selected>Français</option>
+              <option value="en">English</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="mt-6 max-w-3xl mx-auto">
+          <label class="block text-sm font-medium text-gray-700">Descriptif de poste (facultatif)</label>
+          <textarea id="cvJD" rows="5" class="mt-1 w-full rounded-md border-gray-300 p-3 focus:border-[var(--brand)] focus:ring focus:ring-[var(--brand)]/40" placeholder="Collez ici des extraits de l’offre (missions, outils, mots-clés). Ils NE seront pas copiés dans le CV ; l’IA les utilisera pour adapter le contenu à votre profil."></textarea>
+        </div>
+
+        <div class="mt-6 flex justify-center">
+          <button id="generateCvBtn" class="relative bg-[var(--brand)] text-white py-2.5 px-10 rounded-md font-semibold hover:bg-[var(--brandDark)] transition">
+            <span id="cvBtnText">Générer le CV (PDF)</span>
+            <span id="cvBtnSpinner" class="dots absolute right-3 top-1/2 -translate-y-1/2 hidden"><i></i><i></i><i></i></span>
+          </button>
+        </div>
+
+        <div class="mt-3 text-center text-sm text-gray-600">
+          Le PDF est 100% texte (pas d’emoji/icône) pour éviter les « carrés » et optimiser la lecture ATS. Contacts sur une seule ligne.
+        </div>
+
+        <div id="cvPreview" class="mt-6 p-4 text-sm text-gray-700">
+          <div><strong>Abdoul Aziz KANE</strong> — <span class="text-[var(--brand)] font-semibold">Ingénieur Cybersécurité</span></div>
+          <div class="text-[13px] mt-1">Choisy-le-Roi (94600) | +33 7 53 75 05 70 | Abdoulaziz.kane2021@gmail.com | linkedin.com/in/aakane0105/</div>
+          <div class="hair my-3"></div>
+          <div class="text-[13px]"><strong>Profil.</strong> Ingénieur cybersécurité orienté environnements hybrides (Azure/Intune, Microsoft 365 Security, SCCM, GPO), gestion d’endpoints et conformité (ISO 27001/RGPD). Recherche un CDI en Ingénieur Cybersécurité.</div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="text-center mt-20 pt-10 border-t border-gray-200">
+      <p class="text-gray-600">CV interactif – mise en page sobre, lisible et compatible ATS.</p>
+      <p class="text-gray-500 text-sm mt-2">Abdoul Aziz KANE &copy; 2025</p>
+    </footer>
+  </div>
+
+  <script>
+    /* ================= Données de base ================= */
+    const meBase = {
+      name: "Abdoul Aziz KANE",
+      city: "Choisy-le-Roi (94600) | +33 7 53 75 05 70 | Abdoulaziz.kane2021@gmail.com | linkedin.com/in/aakane0105/",
+      phone: "+33 7 53 75 05 70",
+      email: "Abdoulaziz.kane2021@gmail.com",
+      linkedin: "linkedin.com/in/aakane0105/",
+      skills: {
+        cloud: ["Azure/Intune","M365 Security","SCCM/ConfigMgr","Autopilot","GPO","Entra ID (Azure AD)"],
+        sec:   ["Pentest","Gestion des vulnérabilités","Zero Trust","EDR/SIEM","IDS/IPS","VPN","Cryptographie"],
+        sys:   ["Windows","Linux","macOS","VMware vSphere","Active Directory","DNS/DHCP"],
+        auto:  ["PowerShell","Bash","Python"],
+        tools: ["Kali","Metasploit","Nmap","Burp Suite","Wireshark"]
+      },
+      experiences: [
+        { company:"IMOGATE", city:"Paris", dates:"11/2022 – 10/2024",
+          roleFr:"Consultant Junior en Cybersécurité (Alternance)",
+          roleEn:"Junior Cybersecurity Consultant (Apprenticeship)",
+          bulletsFr:[
+            "Administration Intune, Microsoft 365 Security/Compliance, SCCM ; GPO & Autopilot ; Support technique N2/N3.",
+            "Environnements hybrides on-prem / cloud ; intégration Active Directory ; segmentation réseau & VPN.",
+            "Sécurisation multicloud (pare-feu, IDS/IPS) ; gestion proactive des vulnérabilités.",
+            "Automatisation PowerShell/Bash ; contribution ISO 27001 & RGPD ; coordination avec le SOC."
+          ],
+          bulletsEn:[
+            "Intune, Microsoft 365 Security/Compliance, SCCM administration; GPO & Autopilot; L2/L3 technical support.",
+            "Hybrid on-prem/cloud; Active Directory integration; network segmentation & VPN.",
+            "Multi-cloud hardening (firewalls, IDS/IPS); proactive vulnerability management.",
+            "Automation with PowerShell/Bash; ISO 27001 & GDPR contribution; SOC coordination."
+          ]},
+        { company:"K2MTC", city:"Saint-Fons", dates:"11/2021 – 10/2022",
+          roleFr:"Consultant Junior en Cybersécurité (Alternance)",
+          roleEn:"Junior Cybersecurity Consultant (Apprenticeship)",
+          bulletsFr:[
+            "Pentests & remédiations ; gestion des vulnérabilités ; durcissement serveurs (SSL).",
+            "Mise en conformité RGPD ; déploiement pare-feu ; renforcement des contrôles d’accès.",
+            "Amélioration des performances sites ; maintenance de dispositifs connectés.",
+            "Support technique N2 ; documentation & sensibilisation sécurité."
+          ],
+          bulletsEn:[
+            "Pen-tests & remediation; vulnerability management; server hardening (SSL).",
+            "GDPR alignment; firewall deployment; access control hardening.",
+            "Website performance improvements; connected devices maintenance.",
+            "L2 technical support; security documentation & awareness."
+          ]},
+        { company:"K2MTC", city:"Saint-Fons", dates:"07/2021 – 09/2021",
+          roleFr:"Stagiaire en Cybersécurité", roleEn:"Cybersecurity Intern",
+          bulletsFr:["Site web fonctionnel optimisé UX ; identité visuelle cohérente.","Renforcement serveurs & certificats SSL ; suivi de vulnérabilités."],
+          bulletsEn:["Functional website with optimized UX; consistent visual identity.","Server hardening & SSL certificates; vulnerability tracking."]},
+        { company:"BUILT2BUILD", city:"Saint-Cyr-l’École", dates:"07/2020 – 09/2020",
+          roleFr:"Stagiaire IT", roleEn:"IT Intern",
+          bulletsFr:["Formation utilisateurs ; sensibilisation sécurité.","Développement de plateformes WordPress pour la formation."],
+          bulletsEn:["User training; security awareness.","Development of training WordPress platforms."]}
+      ],
+      educationFr:[
+        "Master of Science — Systèmes, Réseaux & Sécurité — SUPINFO — 10/2022 – 06/2024",
+        "Bachelor of Science — Ingénierie Informatique — SUPINFO — 10/2019 – 06/2022",
+        "Baccalauréat Économique & Social (Spécialité Mathématiques) — Lycée Saint-Martin, Pontoise — 2019"
+      ],
+      educationEn:[
+        "MSc — Systems, Networks & Security — SUPINFO — 10/2022 – 06/2024",
+        "BSc — Computer Engineering — SUPINFO — 10/2019 – 06/2022",
+        "French Baccalaureate ES (Mathematics) — Lycée Saint-Martin, Pontoise — 2019"
+      ],
+      certsFr:"Microsoft (AZ-900, MS-900, SC-900) • AWS Cloud Foundations • AWS Cloud Architecting • Cisco CCNA (1-4) • Linux LPIC-2 • CompTIA Linux+",
+      certsEn:"Microsoft (AZ-900, MS-900, SC-900) • AWS Cloud Foundations • AWS Cloud Architecting • Cisco CCNA (1-4) • Linux LPIC-2 • CompTIA Linux+",
+      profileSummaryFr: "Ingénieur cybersécurité orienté environnements hybrides (Azure/Intune, Microsoft 365 Security, SCCM, GPO), gestion d’endpoints et conformité (ISO 27001/RGPD).",
+      profileSummaryEn: "Cybersecurity engineer focused on hybrid environments (Azure/Intune, Microsoft 365 Security, SCCM, GPO), endpoint management and compliance (ISO 27001/GDPR)."
+    };
+
+    /* ===== Helpers (nettoyage) ===== */
+    function stripMd(s){ return (s||'').replace(/\*+/g,'').replace(/_/g,'').replace(/`/g,''); }
+    function cleanBullet(b){ return stripMd((b||'').replace(/^[\s•\-–—]+/,'').trim()); }
+    function sanitizeCv(cv){
+      cv.profile  = stripMd(cv.profile || '');
+      cv.certs    = stripMd(cv.certs || '');
+      cv.langLine = stripMd(cv.langLine || '');
+      ['cloud','sec','sys','auto','tools'].forEach(k=>{
+        if (Array.isArray(cv.skills?.[k])) cv.skills[k] = cv.skills[k].map(stripMd);
+      });
+      if (Array.isArray(cv.xp)){
+        cv.xp = cv.xp.map(x => ({
+          ...x,
+          role:    stripMd(x.role),
+          company: stripMd(x.company),
+          city:    stripMd(x.city),
+          dates:   stripMd(x.dates),
+          bullets: (x.bullets || []).map(cleanBullet)
+        }));
+      }
+      return cv;
+    }
+
+    /* ================= Timeline data (page) ================= */
+    const cvData = {
+      skills: [
+        { category:"Sécurité & Conformité", level:9, details:["Pentest","Gestion des vulnérabilités","IDS/IPS","VPN","EDR","SOC/gestion d'incidents","Cryptographie","Kali Linux","Metasploit","Nmap","Burp Suite","Wireshark","ISO 27001","RGPD"] },
+        { category:"Cloud & Systèmes", level:8, details:["Microsoft Azure","Active Directory (AD)","Linux","Windows","macOS","VMware vSphere"] },
+        { category:"Outils Microsoft", level:9, details:["Microsoft Intune","Microsoft 365 Security","Compliance","SCCM","Autopilot","GPO"] },
+        { category:"Scripting & Programmation", level:7, details:["PowerShell","Bash","Python","C","C++"] }
+      ],
+      professionalExperience: meBase.experiences.map(x=>({
+        date:x.dates,
+        title:`${x.roleFr}`,
+        company:`${x.company} — ${x.city}`,
+        details:x.bulletsFr
+      })),
+      education: [
+        { date:"10/2022 – 06/2024", title:"Master of Science — Systèmes, Réseaux & Sécurité", company:"SUPINFO INTERNATIONAL UNIVERSITY — Paris", details:["Sécurité des SI, réseaux, projets."] },
+        { date:"10/2019 – 06/2022", title:"Bachelor of Science — Ingénierie Informatique", company:"SUPINFO INTERNATIONAL UNIVERSITY — Paris", details:["Dév, bases de données, systèmes & réseaux."] },
+        { date:"2019", title:"Baccalauréat Économique & Social (Spé Maths)", company:"Lycée Saint-Martin — Pontoise", details:["—"] }
+      ]
+    };
+
+    /* ================= Radar + filtres ================= */
+    let radarChart = null;
+    function renderRadarChart(){
+      const values = cvData.skills.map(s=>s.level);
+      const labels = cvData.skills.map(s=>s.category);
+      const ctx = document.getElementById('skillsRadarChart').getContext('2d');
+      if (radarChart) radarChart.destroy();
+      radarChart = new Chart(ctx,{
+        type:'radar',
+        data:{
+          labels,
+          datasets:[{
+            label:'Niveau',
+            data:values,
+            backgroundColor:'rgba(166,139,109,0.2)',
+            borderColor:'rgba(166,139,109,1)',
+            borderWidth:2,
+            pointBackgroundColor:'rgba(166,139,109,1)',
+            pointBorderColor:'#fff',
+            pointHoverBorderColor:'rgba(166,139,109,1)'
+          }]
+        },
+        options:{
+          responsive:true, maintainAspectRatio:false,
+          scales:{ r:{
+            angleLines:{color:'rgba(0,0,0,.08)'}, grid:{color:'rgba(0,0,0,.08)'},
+            pointLabels:{font:{size:12,weight:'bold'}, color:'#333'},
+            ticks:{beginAtZero:true, max:10, stepSize:2, backdropColor:'transparent', color:'#666'}
+          }},
+          plugins:{legend:{display:false}}
+        }
+      });
+    }
+    function renderSkillFilters(){
+      const filters = document.getElementById('skill-filters');
+      const details = document.getElementById('skill-details');
+      filters.innerHTML=''; details.innerHTML='';
+      cvData.skills.forEach((s,idx)=>{
+        const b=document.createElement('button');
+        b.className='pill text-sm hover:bg-[var(--brand)] hover:text-white transition';
+        b.textContent=s.category; b.dataset.index=idx; filters.appendChild(b);
+        const box=document.createElement('div');
+        box.className='hidden p-4 bg-white rounded-lg shadow'; box.id=`skill-detail-${idx}`;
+        box.innerHTML=`<h4 class="font-bold text-lg mb-2">${s.category}</h4>
+                       <div class="flex flex-wrap gap-2">${s.details.map(d=>`<span class="pill text-gray-700">${d}</span>`).join('')}</div>`;
+        details.appendChild(box);
+      });
+      const btns=filters.querySelectorAll('button');
+      btns.forEach(btn=>{
+        btn.addEventListener('click',()=>{
+          btns.forEach(x=>x.classList.remove('bg-[var(--brand)]','text-white'));
+          btn.classList.add('bg-[var(--brand)]','text-white');
+          document.querySelectorAll('#skill-details>div').forEach(d=>d.classList.add('hidden'));
+          document.getElementById(`skill-detail-${btn.dataset.index}`).classList.remove('hidden');
+        });
+      });
+      if(btns.length) btns[0].click();
+    }
+    function renderTimeline(container,data){
+      container.innerHTML='';
+      data.forEach(item=>{
+        const wrap=document.createElement('div');
+        wrap.className='timeline-item mb-8 pl-8 relative cursor-pointer';
+        const detailsHTML=(item.details?.length)?`<div class="details-content mt-2 text-gray-600">
+          <ul class="list-disc list-inside space-y-1">${item.details.map(d=>`<li>${d}</li>`).join('')}</ul></div>`:'';
+        wrap.innerHTML=`<div class="p-4 rounded-lg shadow-md hover:shadow-lg transition bg-white border-l-4 border-l-[var(--brand)]">
+          <p class="text-sm font-medium text-[var(--brand)]">${item.date}</p>
+          <h4 class="text-lg font-bold mt-1 text-gray-800">${item.title}</h4>
+          <p class="text-md text-gray-600">${item.company}</p>${detailsHTML}</div>`;
+        container.appendChild(wrap);
+        if(item.details?.length){wrap.addEventListener('click',()=>wrap.querySelector('.details-content').classList.toggle('open'));}
+      });
+    }
+
+    /* ================= Gemini API ================= */
+    const apiKeyGemini = "AIzaSyBgZ9Ift5fatMr4XmhzWMjBhtxREjW6trg";
+    async function fetchWithBackoff(url, options, retries=3, delay=800){
+      try{ const r=await fetch(url,options); if(!r.ok) throw new Error(`HTTP ${r.status}`); return await r.json();}
+      catch(e){ if(retries>0 && /429|rate/i.test(e.message)){await new Promise(res=>setTimeout(res,delay)); return fetchWithBackoff(url,options,retries-1,delay*1.6);} throw e;}
+    }
+
+    /* ====== Heuristique: deviner société / titre / adresse depuis la description ====== */
+    function guessFromJD(jd, lang){
+      const text = (jd||'').trim();
+      let company = '';
+      let title = '';
+
+      const mTitle = text.match(/(?:intitul[ée]|poste|position|title)\s*[:\-]\s*([^\n]{3,80})/i);
+      if(mTitle) title = mTitle[1].trim();
+
+      const mComp = text.match(/(?:nom\s+de\s+l['’]entreprise|entreprise|soci[ée]t[ée]|company|organisation)\s*[:\-]\s*([^\n]{2,80})/i);
+      if(mComp) company = mComp[1].trim();
+
+      if(!company){
+        const mChez = text.match(/\b(?:chez|pour|for)\s+([A-Z][\w&\- ']{2,40})/i);
+        if(mChez) company = mChez[1].trim();
+      }
+
+      let addr = '';
+      const lines = text.split(/\n+/);
+      for(const line of lines){
+        if(/\b\d{5}\b/.test(line)) { addr = line.trim(); break; }
+      }
+
+      if(!company) company = (lang==='en'?'Your company':'Votre entreprise');
+      if(!title)   title   = (lang==='en'?'Cybersecurity Engineer':'Ingénieur Cybersécurité');
+
+      return { companyName: company, jobTitle: title, companyAddr: addr };
+    }
+
+    /* ================= Lettre de motivation (FR/EN) ================= */
+    const coverLetterBtn = document.getElementById('generateCoverLetterBtn');
+    const downloadPdfBtn = document.getElementById('downloadPdfBtn');
+    const copyLetterBtn = document.getElementById('copyLetterBtn');
+    const coverLetterOutput = document.getElementById('coverLetterOutput');
+    const lmLangSelect = document.getElementById('lmLang');
+    let __lastLM = null;
+
+    function deOrD(job){ return /^[aeiouhàâäéèêëiïîoôöuùûü]/i.test(job.trim()) ? "d’" : "de "; }
+    function sanitizeLM(raw){
+      if(!raw) return "";
+      return raw
+        .replace(/<\/?p>/gi,'')
+        .replace(/\[[^\]]*\]/g,"")
+        .replace(/\*+/g,"")
+        .replace(/^-{2,}.*$/gmi,"")
+        .replace(/^\s*(note|remarque|important|disclaimer|attention|nb)\b.*$/gmi,"")
+        .replace(/^\s*objet\s*:.*$/gmi,"")
+        .replace(/^\s*(madame|monsieur|dear)[^\n]*$/gmi,"")
+        .replace(/,\s*le/gi," ")
+        .replace(/\n{3,}/g,"\n\n")
+        .trim();
+    }
+    function lmLocaleParts(lang, jobTitle){
+      if(lang==='en'){
+        return {
+          service:"Recruitment Team",
+          subject:`Subject: Application for the position of ${jobTitle}`,
+          salutation:"Dear Hiring Manager,",
+          closing:"Sincerely,",
+          date:new Date().toLocaleDateString('en-GB',{day:'numeric', month:'long', year:'numeric'}),
+          aPrefix:"At "
+        };
+      }
+      const prep = deOrD(jobTitle);
+      return {
+        service:"Service Recrutement",
+        subject:`Objet : Candidature au poste ${prep}${jobTitle}`,
+        salutation:"Madame, Monsieur,",
+        closing:"Cordialement,",
+        date:new Date().toLocaleDateString('fr-FR',{day:'numeric', month:'long', year:'numeric'}),
+        aPrefix:"À "
+      };
+    }
+
+    coverLetterBtn?.addEventListener('click', async ()=>{
+      let companyName=(document.getElementById('companyName').value||'').trim();
+      let jobTitle=(document.getElementById('jobTitle').value||'').trim();
+      const jobDescription=(document.getElementById('jobDescription').value||'').trim();
+      const lmBtnSpinner = document.getElementById('lmBtnSpinner');
+      const lmBtnText = document.getElementById('lmBtnText');
+      const lang = lmLangSelect.value || 'fr';
+
+      if(!companyName || !jobTitle){
+        const guess = guessFromJD(jobDescription, lang);
+        if(!companyName) companyName = guess.companyName;
+        if(!jobTitle) jobTitle = guess.jobTitle;
+        var companyAddr = guess.companyAddr || '';
+      } else {
+        var companyAddr = '';
+      }
+
+      coverLetterBtn.disabled=true; lmBtnSpinner.classList.remove('hidden'); lmBtnText.textContent= lang==='en'?'Generating…':'Génération…';
+      coverLetterOutput.innerHTML=`<p class="text-center text-gray-500">${lang==='en'?'Generating…':'Génération en cours…'}</p>`;
+
+      const cvText = `
+Name: ${meBase.name}
+Phone: ${meBase.phone}
+Email: ${meBase.email}
+LinkedIn: ${meBase.linkedin}
+Summary: ${lang === 'fr' ? meBase.profileSummaryFr : meBase.profileSummaryEn}
+Experiences: ${meBase.experiences.map(e=>`${lang === 'fr' ? e.roleFr : e.roleEn} @ ${e.company} (${e.dates}): ${(lang === 'fr' ? e.bulletsFr : e.bulletsEn).join(' ')}`).join('; ')}
+Skills: ${Object.values(meBase.skills).flat().join(', ')}
+Education: ${(lang === 'fr' ? meBase.educationFr : meBase.educationEn).join('; ')}
+Certifications: ${lang === 'fr' ? meBase.certsFr : meBase.certsEn}
+`.trim();
+
+      const prompt = (lang==='en'
+        ? `Write ONLY the <body>...</body> (no header/signature) of a professional cover letter in ENGLISH for "${jobTitle}" at "${companyName}".
+- 3–5 compact paragraphs aligned to "${jobTitle}" at "${companyName}". Use job hints to adapt (do NOT copy).
+- Focus on Azure/Intune, M365 Security, SCCM, GPO, Zero Trust, vulnerability mgmt, ISO 27001/GDPR, PowerShell/Bash, L2/L3 support
+CANDIDATE:
+${cvText}
+HINTS:
+${jobDescription || '—'}`
+        : `Rédige UNIQUEMENT le <body>...</body> (sans en-tête/signature) d'une lettre de motivation en FRANÇAIS pour le poste "${jobTitle}" chez "${companyName}".
+- 3–5 paragraphes courts alignés sur "${jobTitle}" chez "${companyName}". Ne copie pas le descriptif.
+- Mets en avant : Azure/Intune, M365 Security, SCCM, GPO, Zero Trust, vulnérabilités, ISO 27001/RGPD, PowerShell/Bash, Support N2/N3
+CANDIDAT :
+${cvText}
+INDICES :
+${jobDescription || '—'}` );
+
+      try{
+        const payload={contents:[{parts:[{text:prompt}]}]};
+        const apiUrl=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKeyGemini}`;
+        const result = await fetchWithBackoff(apiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+        let raw = result?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const match = raw.match(/<body>([\s\S]*?)<\/body>/i);
+        let body = sanitizeLM(match ? match[1] : raw);
+        if(!body){
+          body = lang==='en'
+            ? `My interest in the ${jobTitle} role at ${companyName} is a natural step...`
+            : `Mon intérêt pour le poste de ${jobTitle} chez ${companyName} s’inscrit dans la continuité...`;
+        }
+
+        const city="Choisy-le-Roi";
+        const loc = lmLocaleParts(lang, jobTitle);
+
+        __lastLM = {
+          lang, name: meBase.name,
+          contactLines: [
+            "Choisy-le-Roi (94600)",
+            meBase.phone,
+            meBase.email,
+            meBase.linkedin
+          ],
+          companyName, companyAddr, jobTitle, city, dateStr: loc.date,
+          subject: loc.subject,
+          service: loc.service,
+          salutation: loc.salutation, closing: loc.closing, body,
+          signature: meBase.name,
+          aPrefix: loc.aPrefix
+        };
+
+        const rightBlock = [loc.service, companyName, ...(companyAddr? [companyAddr] : [])].join('\n');
+        const headerBlock = (lang==='en')
+          ? `${meBase.name}
+Phone: ${meBase.phone}
+Email: ${meBase.email}
+LinkedIn: ${meBase.linkedin}
+
+${rightBlock}
+
+${loc.aPrefix}${city}, ${loc.date}
+
+${loc.subject}
+
+${loc.salutation}
+
+${body}
+
+${loc.closing}
+
+${meBase.name}`
+          : `${meBase.name}
+Téléphone : ${meBase.phone}
+Email : ${meBase.email}
+Profil LinkedIn : ${meBase.linkedin}
+
+${rightBlock}
+
+${loc.aPrefix}${city}, le ${loc.date}
+
+${loc.subject}
+
+${loc.salutation}
+
+${body}
+
+${loc.closing}
+
+${meBase.name}`;
+
+        coverLetterOutput.innerHTML = `<pre class="letter-pre">${headerBlock}</pre>`;
+        downloadPdfBtn.disabled=false; copyLetterBtn.disabled=false;
+
+      }catch(e){
+        console.error(e);
+        coverLetterOutput.innerHTML = `<p class="text-center text-red-600">${lang==='en'?'Generation failed.':'Échec de la génération.'}</p>`;
+      }finally{
+        coverLetterBtn.disabled=false; lmBtnSpinner.classList.add('hidden'); lmBtnText.textContent= lang==='en'?'Generate letter ✨':'Générer la lettre ✨';
+      }
+    });
+
+    // PDF LM — header 2 colonnes + signature à droite
+    function buildLmStyledPdf(lm){
+      const bodyParas = lm.body.replace(/\n{3,}/g,"\n\n").split(/\n\s*\n/).map(p=>p.trim()).filter(Boolean);
+      const rightStack = [
+        {text: lm.service, color:'#5B4636'},
+        {text: lm.companyName, bold:true, color:'#5B4636'},
+        ...(lm.companyAddr ? lm.companyAddr.split(/\n+/).map(l=>({text:l})) : [])
+      ];
+      const hair = {canvas:[{type:'line', x1:0, y1:0, x2:515, y2:0, lineWidth:1, lineColor:'#E6DDD2'}], margin:[0,6,0,10]};
+      return {
+        pageSize:'A4', pageMargins:[40,36,40,36],
+        defaultStyle:{font:'Roboto',fontSize:10.5,lineHeight:1.24,color:'#222'},
+        content: [
+          {canvas:[{type:'line', x1:0, y1:0, x2:515, y2:0, lineWidth:3, lineColor:'#A68B6D'}], margin:[0,0,0,10]},
+          {
+            columns:[
+              { width:'*', stack:[
+                  {text: lm.name, bold:true, fontSize:12, color:'#5B4636'},
+                  ...lm.contactLines.map(t=>({text:t}))
+                ]
+              },
+              { width:'auto', alignment:'right', stack:rightStack, margin:[0,28,0,0]}
+            ], columnGap:15
+          },
+          hair,
+          {text: (lm.lang==='en'? `${lm.aPrefix}${lm.city}, ${lm.dateStr}` : `${lm.aPrefix}${lm.city}, le ${lm.dateStr}`), margin:[0,0,0,8]},
+          {text: lm.subject, bold:true, color:'#A68B6D', margin:[0,0,0,10]},
+          {text: lm.salutation, margin:[0,0,0,8]},
+          ...bodyParas.map(p=>({text:p, margin:[0,0,0,6]})),
+          {text: lm.closing, margin:[0,12,0,2], alignment:'right'},
+          {text: lm.signature, bold:true, alignment:'right'}
+        ]
+      };
+    }
+    document.getElementById('downloadPdfBtn')?.addEventListener('click',()=>{
+      if(__lastLM){
+        const doc = buildLmStyledPdf(__lastLM);
+        pdfMake.createPdf(doc).download(`Lettre_de_motivation_${new Date().toISOString().slice(0,10)}.pdf`);
+      }else{
+        const t = (coverLetterOutput.innerText||'').trim();
+        if(!t || /apparaîtra ici|will appear here/i.test(t)){ alert('Générez d’abord la lettre.'); return; }
+        const paras = t.replace(/\n{3,}/g,"\n\n").split(/\n\s*\n/).map(p=>p.trim()).filter(Boolean);
+        const docFallback = { pageSize:'A4', pageMargins:[40,36,40,36], defaultStyle:{font:'Roboto',fontSize:10.5,lineHeight:1.2,color:'#111'}, content: paras.map(p=>({text:p, margin:[0,0,0,6]})) };
+        pdfMake.createPdf(docFallback).download(`Lettre_de_motivation_${new Date().toISOString().slice(0,10)}.pdf`);
+      }
+    });
+    document.getElementById('copyLetterBtn')?.addEventListener('click', async ()=>{
+      let txt = '';
+      if(__lastLM){
+        const loc = __lastLM;
+        const rightBlock = [loc.service, loc.companyName, ...(loc.companyAddr? [loc.companyAddr] : [])].join('\n');
+        txt = `${meBase.name}
+Phone: ${meBase.phone}
+Email: ${meBase.email}
+LinkedIn: ${meBase.linkedin}
+
+${rightBlock}
+
+${loc.aPrefix}${loc.city}, ${loc.dateStr}
+
+${loc.subject}
+
+${loc.salutation}
+
+${loc.body}
+
+${loc.closing}
+
+${loc.signature}`;
+      }else{
+        txt = (coverLetterOutput.innerText||'').trim();
+      }
+      try{
+        await navigator.clipboard.writeText(txt);
+        const old = copyLetterBtn.textContent;
+        copyLetterBtn.textContent = (__lastLM?.lang==='en'?'Copied!':'Copié !');
+        setTimeout(()=> copyLetterBtn.textContent = (__lastLM?.lang==='en'?'Copy text':'Copier le texte'), 1200);
+      }catch(err){
+        alert('Impossible de copier automatiquement. Sélectionnez le texte et copiez-le manuellement.');
+      }
+    });
+
+    /* ================= Questions d’entretien ================= */
+    const expSelect = document.getElementById('experienceSelect');
+    const qBtn=document.getElementById('generateQuestionsBtn');
+    (function populateExp(){
+      if(!expSelect) return;
+      meBase.experiences.forEach((e,i)=>{
+        const opt=document.createElement('option');
+        opt.value=i; opt.textContent=`${e.roleFr} — ${e.company} (${e.dates})`;
+        expSelect?.appendChild(opt);
+      });
+    })();
+
+    function beautifyInterviewText(raw){
+      const cleaned = (raw||'')
+        .replace(/\r/g,'')
+        .replace(/[*_`]/g,'')
+        .replace(/^#{1,6}\s*/gm,'')
+        .replace(/[“”«»]/g,'"')
+        .replace(/[’]/g,"'")
+        .replace(/^\s*"+|"+\s*$/gm,'')
+        .trim();
+
+      const pairs = [];
+      const re = /(?:^|\n)\s*(?:\d+[\.\)]\s*)?(?:Q(?:uestion)?|Q)\s*[:\-]?\s*(.+?)\s*(?:\n+|\s{2,})(?:R(?:é|e)ponse|A(?:nswer)?|A)\s*[:\-]?\s*([\s\S]*?)(?=\n\s*(?:\d+[\.\)]\s*)?(?:Q(?:uestion)?|Q)\s*[:\-]?|$)/gi;
+      let m; while((m = re.exec(cleaned)) !== null){ pairs.push({ q: m[1].trim().replace(/^"+|"+$/g,''), a: m[2].trim() }); }
+
+      if(pairs.length===0){
+        const parts = cleaned.split(/\n{2,}/).map(s=>s.trim()).filter(Boolean);
+        for(let i=0;i<parts.length;i++){
+          const p = parts[i];
+          if(/[?？]\s*$/.test(p) && i+1<parts.length){
+            pairs.push({ q: p.replace(/^[-•]+\s*/,'').replace(/^"+|"+$/g,''), a: parts[i+1] });
+            i++;
+          }
+        }
+      }
+      if(pairs.length===0){ pairs.push({ q:"Questions & réponses", a:cleaned }); }
+
+      const wrap = document.createElement('div'); wrap.className='qa-wrap';
+      pairs.forEach(({q,a})=>{
+        const item = document.createElement('div'); item.className='qa-item';
+        const qEl = document.createElement('div'); qEl.className='qa-q'; qEl.textContent = q;
+        const aEl = document.createElement('div'); aEl.className='qa-a';
+        const aClean = a.replace(/^"+|"+$/g,'').replace(/^#{1,6}\s*/gm,'').replace(/^\s*(Q(?:uestion)?|R(?:é|e)ponse|A(?:nswer)?)\s*[:\-]?\s*/gmi,'').trim();
+        if(/(^|\n)\s*[-•]/.test(aClean)){
+          const ul = document.createElement('ul');
+          aClean.split(/\n+/).forEach(line=>{
+            const t = line.replace(/^\s*[-•]\s*/,'').replace(/^"+|"+$/g,'').trim();
+            if(t){ const li=document.createElement('li'); li.textContent=t; ul.appendChild(li); }
+          });
+          aEl.appendChild(ul);
+        }else{
+          aEl.textContent = aClean;
+        }
+        item.appendChild(qEl); item.appendChild(aEl); wrap.appendChild(item);
+      });
+      return wrap;
+    }
+
+    qBtn?.addEventListener('click', async ()=>{
+      const idx = expSelect.value;
+      const qBtnSpinner = document.getElementById('qBtnSpinner');
+      const qBtnText = document.getElementById('qBtnText');
+      const out = document.getElementById('questionsOutput');
+      const lang = document.getElementById('lmLang').value || 'fr';
+      if(idx===""){ out.innerHTML=`<p class="text-center text-red-600">${lang==='en'?'Please select an experience.':'Sélectionnez une expérience.'}</p>`; return; }
+      const e = meBase.experiences[idx];
+
+      qBtnSpinner.classList.remove('hidden'); qBtnText.textContent=lang==='en'?'Generating…':'Génération…'; out.innerHTML=`<p class="text-center text-gray-500">${lang==='en'?'Generating…':'Génération en cours…'}</p>`;
+      const prompt = `
+Generate 3 common interview questions and concise sample answers (Action + Tools + Result) for a cybersecurity role.
+Use ${lang === 'en' ? 'English' : 'French'}.
+Experience:
+- ${lang === 'en' ? e.roleEn : e.roleFr} — ${e.company} — ${e.city} — ${e.dates}
+Missions: ${(lang === 'en' ? e.bulletsEn : e.bulletsFr).join(' ')}
+      `;
+      try{
+        const payload={contents:[{parts:[{text:prompt}]}]};
+        const apiUrl=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKeyGemini}`;
+        const r = await fetchWithBackoff(apiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+        let txt = r?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        txt = txt.replace(/\*+/g,'');
+        out.innerHTML = `<div class="qa-wrap">${beautifyInterviewText(txt).innerHTML}</div>`;
+      }catch(err){
+        console.error(err); out.innerHTML=`<p class="text-center text-red-600">${lang==='en'?'Generation failed.':'Échec de la génération.'}</p>`;
+      }finally{
+        qBtnSpinner.classList.add('hidden'); qBtnText.textContent=lang==='en'?'Generate questions ✨':'Générer les questions ✨';
+      }
+    });
+
+    /* ================= PITCH (Gemini) ================= */
+    const pitchBtn = document.getElementById('generatePitchBtn');
+    const pitchBtnSpinner = document.getElementById('pitchBtnSpinner');
+    const pitchBtnText = document.getElementById('pitchBtnText');
+    const pitchOut = document.getElementById('pitchOutput');
+    const copyPitchBtn = document.getElementById('copyPitchBtn');
+
+    pitchBtn?.addEventListener('click', async ()=>{
+      const lang = (document.getElementById('pitchLang')?.value)||'fr';
+      pitchBtn.disabled = true; pitchBtnSpinner.classList.remove('hidden'); pitchBtnText.textContent = lang==='en'?'Generating…':'Génération…';
+      pitchOut.innerHTML = `<p class="text-center text-gray-500">${lang==='en'?'Generating…':'Génération en cours…'}</p>`;
+      const prompt = (lang==='en'
+        ? `Write a concise elevator pitch (2–4 sentences) in English for a junior cybersecurity/cloud engineer profile. Emphasize hybrid environments (Azure/Intune, M365 Security, SCCM, GPO), Zero Trust mindset, vulnerability management, and hands-on scripting (PowerShell/Bash). Name: ${meBase.name}.`
+        : `Rédige un pitch d’ascenseur (2–4 phrases) en français pour un profil junior cybersécurité/cloud. Mets en avant les environnements hybrides (Azure/Intune, M365 Security, SCCM, GPO), l'approche Zero Trust, la gestion des vulnérabilités, et l’automatisation (PowerShell/Bash). Nom : ${meBase.name}.`);
+      try{
+        const payload={contents:[{parts:[{text:prompt}]}]};
+        const apiUrl=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKeyGemini}`;
+        const r = await fetchWithBackoff(apiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+        let txt = r?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        txt = txt.replace(/[*_`]/g,'').trim();
+        if(!txt) txt = (lang==='en'?'Cybersecurity engineer with a hands-on mindset in hybrid environments, combining Azure/Intune, M365 Security and SCCM/GPO with scripting to turn security strategy into measurable results.':'Ingénieur cybersécurité à l’aise en environnements hybrides, combinant Azure/Intune, M365 Security et SCCM/GPO, avec une approche pragmatique et orientée résultats grâce au scripting.');
+        pitchOut.textContent = txt;
+        copyPitchBtn.disabled = false;
+      }catch(e){
+        console.error(e); pitchOut.innerHTML = `<p class="text-center text-red-600">${lang==='en'?'Generation failed.':'Échec de la génération.'}</p>`;
+      }finally{
+        pitchBtn.disabled = false; pitchBtnSpinner.classList.add('hidden'); pitchBtnText.textContent = (lang==='en'?'Generate pitch':'Générer le pitch');
+      }
+    });
+
+    copyPitchBtn?.addEventListener('click', async ()=>{
+      const txt = (pitchOut.innerText||'').trim();
+      if(!txt) return;
+      try{ await navigator.clipboard.writeText(txt);
+        const old = copyPitchBtn.textContent;
+        copyPitchBtn.textContent = 'Copié !';
+        setTimeout(()=> copyPitchBtn.textContent = 'Copier le pitch', 1200);
+      }catch(e){ alert('Impossible de copier automatiquement.'); }
+    });
+
+    /* ================= Générateur CV ATS (1 page, rempli au max) ================= */
+
+    // Compactage intelligent du seul "Profil" (pas d’ellipsis)
+    function smartCompactProfile(text, est){
+      const clean = (text||'').replace(/\s+/g,' ').trim();
+      if(!clean) return clean;
+
+      let target = 420;
+      if(est>3000) target = 340;
+      if(est>3600) target = 260;
+      if(est>4200) target = 200;
+
+      if(clean.length <= target) return clean;
+
+      const sentences = clean.match(/[^.!?]+[.!?]?/g) || [clean];
+      let acc = '';
+      for(const s of sentences){
+        if((acc + s).trim().length <= target){ acc += s + ' '; } else { break; }
+      }
+      acc = acc.trim();
+      if(!acc){
+        acc = clean.slice(0, target).replace(/\s+\S*$/,'').trim();
+      }
+      return acc.replace(/[;,:-]\s*$/,'').replace(/\.\s*$/,'') + '.';
+    }
+
+    function baseProfile(type, contract, lang){
+      const titleMap={
+        admin: lang==="fr"?"Administrateur Systèmes & Réseaux":"Systems & Network Administrator",
+        sec:   lang==="fr"?"Ingénieur Cybersécurité":"Cybersecurity Engineer",
+        cloud: lang==="fr"?"Consultant Sécurité Cloud":"Cloud Security Consultant"
+      };
+      const baseTitle = titleMap[type];
+      const title = (contract==="Alternance")
+        ? (lang==="fr" ? `${baseTitle} — Recherche Alternance` : `${baseTitle} — Seeking Apprenticeship`)
+        : baseTitle;
+
+      const looking=(lang==="fr")?(contract==="Alternance"?"Recherche une alternance":"Recherche un CDI")
+                                   :(contract==="Alternance"?"Seeking an apprenticeship":"Open to a permanent role");
+      const profile=(lang==="fr")
+        ? `Ingénieur cybersécurité orienté environnements hybrides (Azure/Intune, Microsoft 365 Security, SCCM, GPO), gestion d’endpoints et conformité (ISO 27001/RGPD). ${looking} en ${baseTitle}.`
+        : `Cybersecurity engineer focused on hybrid environments (Azure/Intune, Microsoft 365 Security, SCCM, GPO), endpoint management and compliance (ISO 27001/GDPR). ${looking} as ${baseTitle}.`;
+
+      const langLine=(lang==="fr")
+        ? "Français — Natif | Anglais — Courant (professionnel)"
+        : "French — Native | English — Fluent (professional)";
+
+      const hobbies = (lang==="fr"
+        ? ["Golf","Football","Voyages","Événementiel"]
+        : ["Golf","Football (Soccer)","Travel","Event management"]);
+
+      const xpData = meBase.experiences.map(e => ({
+        company: e.company, city: e.city, dates: e.dates,
+        role: lang === 'fr' ? e.roleFr : e.roleEn,
+        bullets: (lang === 'fr' ? e.bulletsFr : e.bulletsEn).slice(0,4)
+      }));
+      const eduData = (lang === 'fr' ? meBase.educationFr : meBase.educationEn);
+      const certsData = (lang === 'fr' ? meBase.certsFr : meBase.certsEn);
+
+      return sanitizeCv({
+        title,
+        contact: `${meBase.city}`,
+        profile: profile,
+        skills: JSON.parse(JSON.stringify(meBase.skills)),
+        xp: xpData,
+        education: eduData,
+        certs: certsData,
+        langLine,
+        hobbies
+      });
+    }
+
+    async function adaptCvWithAI(cv, jd, lang){
+      if(!jd.trim()) return sanitizeCv(cv);
+
+      const instruction = `
+You are a CV writing assistant. You receive a CV (JSON) and a job description (text). Goal: ADAPT the CV AS CLOSELY AS POSSIBLE to the description, WITHOUT inventing experiences, staying aligned with a junior cybersecurity/cloud profile (Azure/Intune/M365/SCCM/GPO/Entra ID).
+Constraints:
+- One A4 page, ATS-friendly, no emoji/icons.
+- Keep company names, dates, titles.
+- Rephrase bullets (Action + Tool + Result), add relevant keywords.
+- Do NOT copy the job description verbatim.
+- Respond ONLY with a VALID JSON.
+Format:
+{"profile":"","skills":{"cloud":[],"sec":[],"sys":[],"auto":[],"tools":[]},"xp":[{"bullets":[]},{"bullets":[]},{"bullets":[]},{"bullets":[]}]}
+CV=${JSON.stringify(cv)}
+JD=${jd}
+LANG=${lang}`.trim();
+
+      const apiUrl=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKeyGemini}`;
+      try{
+        const r = await fetchWithBackoff(apiUrl,{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify({ contents:[{ parts:[{ text: instruction }]}] })});
+        let txt = r?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        txt = txt.replace(/```json|```/g,'').trim();
+        const first = txt.indexOf('{'); const last = txt.lastIndexOf('}');
+        if(first !== -1 && last !== -1) txt = txt.slice(first, last+1);
+        const json = JSON.parse(txt);
+
+        if(json.profile) cv.profile = json.profile;
+        if(json.skills){ for(const k of ["cloud","sec","sys","auto","tools"]) if(Array.isArray(json.skills[k]) && json.skills[k].length) cv.skills[k]=json.skills[k]; }
+        if(Array.isArray(json.xp)){ json.xp.forEach((x,i)=>{ if(cv.xp[i] && Array.isArray(x.bullets) && x.bullets.length) cv.xp[i].bullets = x.bullets.slice(0,4); }); }
+      }catch(e){ console.warn("AI adaptation ignored (fallback).", e); }
+      return sanitizeCv(cv);
+    }
+
+    // Build CV PDF — styleMode: 'auto' | 'compact' | 'expanded' + scale (zoom global)
+    function buildCvPdf(cv, lang="fr", styleMode='auto', scale=1){
+      const est = (cv.profile?.length||0)+(cv.certs?.length||0)+(cv.langLine?.length||0)
+                + (cv.hobbies||[]).join(" ").length
+                + (cv.education||[]).join(" ").length
+                + (cv.xp||[]).map(x=>x.role+x.company+x.city+x.dates+(x.bullets||[]).join(" ")).join(" ").length
+                + Object.values(cv.skills).flat().join(" ").length;
+
+      let fontSize, headSize, titleSize, lineH, margins;
+      if(styleMode==='compact'){
+        fontSize=9.0; headSize=18.0; titleSize=11.8; lineH=1.04; margins=[16,12,16,12];
+      }else if(styleMode==='expanded'){
+        fontSize=11.4; headSize=22.5; titleSize=15.2; lineH=1.26; margins=[30,26,30,28];
+      }else{
+        if(est < 1900){ fontSize=11.4; headSize=22.5; titleSize=15.2; lineH=1.26; margins=[30,26,30,28]; }
+        else if(est < 2200){ fontSize=11.1; headSize=22.0; titleSize=14.8; lineH=1.22; margins=[28,24,28,26]; }
+        else if(est < 2600){ fontSize=10.8; headSize=21.2; titleSize=14.4; lineH=1.18; margins=[26,22,26,24]; }
+        else if(est < 3000){ fontSize=10.5; headSize=20.6; titleSize=14.0; lineH=1.15; margins=[24,20,24,22]; }
+        else if(est < 3400){ fontSize=10.1; headSize=19.8; titleSize=13.4; lineH=1.12; margins=[22,18,22,18]; }
+        else if(est < 3800){ fontSize=9.8; headSize=19.2; titleSize=12.8; lineH=1.08; margins=[20,16,20,16]; }
+        else if(est < 4300){ fontSize=9.4; headSize=18.6; titleSize=12.4; lineH=1.06; margins=[18,14,18,14]; }
+        else { fontSize=9.0; headSize=18.0; titleSize=11.8; lineH=1.04; margins=[16,12,16,12]; }
+      }
+
+      // ➜ applique un zoom global (remplir sans dépasser 1 page)
+      fontSize   = +(fontSize   * scale).toFixed(2);
+      headSize   = +(headSize   * scale).toFixed(2);
+      titleSize  = +(titleSize  * scale).toFixed(2);
+      lineH      = +(1 + (lineH - 1) * (0.8 + 0.2 * scale)).toFixed(3);
+      margins    = margins.map(m => Math.max(12, Math.round(m * (0.95 + 0.05*scale))));
+
+      const profileText = smartCompactProfile(cv.profile, est);
+      const H = t => ({text:t,color:'#A68B6D',bold:true,fontSize:Math.max(10.6, fontSize+0.6),margin:[0,6,0,3]});
+      const thin = {canvas:[{type:'line',x1:0,y1:0,x2:515,y2:0,lineWidth:0.7,lineColor:'#E6DDD2'}], margin:[0,2,0,6]};
+
+      const skillsGrid = {
+        columns:[
+          {width:'*', stack:[
+            {text:(lang==='fr'?'Architecture & Cloud':'Architecture & Cloud'), bold:true, color:'#5B4636', margin:[0,0,0,1]},
+            {text:(cv.skills.cloud||[]).join(", "), alignment:'justify'},
+            {text:(lang==='fr'?'Cybersécurité':'Cybersecurity'), bold:true, color:'#5B4636', margin:[0,5,0,1]},
+            {text:(cv.skills.sec||[]).join(", "), alignment:'justify'}
+          ]},
+          {width:'*', stack:[
+            {text:(lang==='fr'?'Systèmes & Réseaux':'Systems & Networks'), bold:true, color:'#5B4636', margin:[0,0,0,1]},
+            {text:(cv.skills.sys||[]).join(", "), alignment:'justify'},
+            {text:(lang==='fr'?'Automatisation & Outils':'Automation & Tools'), bold:true, color:'#5B4636', margin:[0,5,0,1]},
+            {text:([...(cv.skills.auto||[]),...(cv.skills.tools||[])]).join(", "), alignment:'justify'}
+          ]}
+        ],
+        columnGap:14, margin:[0,0,0,0]
+      };
+      function xpBlock(x){
+        const header = {text:`${x.company} — ${x.city} — ${x.role} | ${x.dates}`, margin:[0,0.5,0,1], bold:true};
+        const bullets = (x.bullets||[]).map(b=>({text:`- ${cleanBullet(b)}`, margin:[0,0,0,0.4], alignment:'justify'}));
+        return [header, ...bullets];
+      }
+
+      const content = [
+        {text:meBase.name, fontSize:headSize, bold:true, alignment:'center', margin:[0,0,0,0]},
+        {text:cv.title, fontSize:titleSize, color:'#A68B6D', bold:true, alignment:'center', margin:[0,1,0,3]},
+        {text:`${meBase.city}`, bold:true, margin:[0,0,0,4], alignment:'center'},
+        thin,
+        H(lang==='fr'?'Profil':'Profile'),
+        {text:profileText, margin:[0,0,0,2], alignment:'justify'},
+        H(lang==='fr'?'Compétences clés':'Key Skills'),
+        skillsGrid,
+        H(lang==='fr'?'Expériences professionnelles':'Professional Experience'),
+        ...cv.xp.flatMap(xpBlock),
+        H(lang==='fr'?'Formation':'Education'),
+        {ul:(cv.education||[]).map(e=>stripMd(e)), margin:[0,0,0,1]},
+        H(lang==='fr'?'Certifications':'Certifications'),
+        {text:cv.certs, margin:[0,0,0,1], alignment:'justify'},
+        H(lang==='fr'?'Langues':'Languages'),
+        {text:cv.langLine}
+      ];
+      if(Array.isArray(cv.hobbies) && cv.hobbies.length){
+        content.push(H(lang==='fr'?'Centres d’intérêt / Hobbies':'Interests'));
+        content.push({text:cv.hobbies.join(" • "), margin:[0,0,0,1]});
+      }
+
+      return { pageSize:'A4', pageMargins:margins, defaultStyle:{font:'Roboto',fontSize,lineHeight:lineH,color:'#222'}, content };
+    }
+
+    // ==== Outils PDF pour tester/compter les pages et télécharger
+    function pdfMakeToBlob(docDef){
+      return new Promise(resolve => pdfMake.createPdf(docDef).getBlob(resolve));
+    }
+    async function countPagesFromBlob(blob){
+      const ab = await blob.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: ab }).promise;
+      const n = pdf.numPages;
+      pdf.destroy();
+      return n;
+    }
+    function downloadBlob(blob, filename){
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename; a.click();
+      setTimeout(()=> URL.revokeObjectURL(url), 15000);
+    }
+
+    // ==== Génération: cherche automatiquement le meilleur "scale" (rempli sans dépasser 1 page)
+    const cvBtn = document.getElementById('generateCvBtn');
+    cvBtn.addEventListener('click', async ()=>{
+      const type=document.getElementById('cvType').value;
+      const contract=document.getElementById('cvContract').value;
+      const lang=document.getElementById('cvLang').value;
+      const jd=document.getElementById('cvJD').value||"";
+      const spinner=document.getElementById('cvBtnSpinner');
+      const text=document.getElementById('cvBtnText');
+
+      spinner.classList.remove('hidden'); text.textContent="Génération…"; cvBtn.disabled=true;
+
+      try{
+        let cv = baseProfile(type, contract, lang);
+        cv = await adaptCvWithAI(cv, jd, lang);
+
+        document.getElementById('cvPreview').innerHTML = `
+          <div><strong>${meBase.name}</strong> — <span class="text-[var(--brand)] font-semibold">${cv.title}</span></div>
+          <div class="text-[13px] mt-1">${cv.contact}</div>
+          <div class="hair my-3"></div>
+          <div class="text-[13px]"><strong>${lang==='fr'?'Profil':'Profile'}.</strong> ${cv.profile}</div>
+        `;
+
+        // Cherche le "scale" optimal → 1 page
+        let low = 0.80, high = 1.60;
+
+        // test initial 1.00
+        let testDoc = buildCvPdf(cv, lang, 'auto', 1.00);
+        let testBlob = await pdfMakeToBlob(testDoc);
+        let pages = await countPagesFromBlob(testBlob);
+
+        let bestBlob = null, bestScale = 1.00;
+
+        if (pages > 1) {
+          // trop long → on va réduire
+          high = 1.00;
+        } else {
+          // ça tient → on essaie d'agrandir pour remplir
+          low = 1.00;
+          bestBlob = testBlob;
+          bestScale = 1.00;
+        }
+
+        for (let i=0;i<8;i++){
+          const mid = +(((low + high) / 2)).toFixed(3);
+          const doc = buildCvPdf(cv, lang, 'auto', mid);
+          const blob = await pdfMakeToBlob(doc);
+          const n = await countPagesFromBlob(blob);
+
+          if (n > 1) {
+            // déborde, réduit
+            high = mid - 0.01;
+          } else {
+            // tient → sauvegarde et tente plus grand
+            bestBlob = blob;
+            bestScale = mid;
+            low = mid + 0.01;
+          }
+          if (high - low < 0.01) break;
+        }
+
+        if (!bestBlob) {
+          const fallbackDoc = buildCvPdf(cv, lang, 'auto', 0.80);
+          bestBlob = await pdfMakeToBlob(fallbackDoc);
+        }
+
+        const file = `CV_Abdoul_Aziz_KANE_${new Date().toISOString().slice(0,10)}.pdf`;
+        downloadBlob(bestBlob, file);
+
+      }catch(e){
+        console.error(e);
+        alert("Échec de génération du CV. Réessayez.");
+      }finally{
+        spinner.classList.add('hidden'); text.textContent="Générer le CV (PDF)"; cvBtn.disabled=false;
+      }
+    });
+
+    /* ================= INIT ================= */
+    document.addEventListener('DOMContentLoaded',()=>{
+      renderRadarChart();
+      renderSkillFilters();
+      renderTimeline(document.getElementById('experience-timeline'), cvData.professionalExperience);
+      renderTimeline(document.getElementById('education-timeline'), cvData.education);
+
+      // Peupler le select Expériences pour Q&A
+      const experienceSelect = document.getElementById('experienceSelect');
+      if(experienceSelect){
+        experienceSelect.innerHTML = '<option value="">-- Choisissez une expérience --</option>';
+        meBase.experiences.forEach((e,i)=>{
+          const opt=document.createElement('option');
+          opt.value=i; opt.textContent=`${e.roleFr} — ${e.company} (${e.dates})`;
+          experienceSelect.appendChild(opt);
+        });
+      }
+
+      // Rafraîchir la grille des certifs selon la langue
+      function renderCertifications() {
+        const certsGrid = document.getElementById('certifications-grid');
+        if(!certsGrid) return;
+        certsGrid.innerHTML = '';
+        const lang = document.getElementById('cvLang').value || 'fr';
+        const certsList = (lang === 'fr' ? meBase.certsFr : meBase.certsEn).split(' • ');
+        certsList.forEach(cert => {
+          const d = document.createElement('div');
+          d.className = 'bg-white p-3 rounded-lg shadow-md text-center flex items-center justify-center hover:shadow-lg transition';
+          d.innerHTML = `<p class="font-semibold text-gray-700 text-sm md:text-base">${cert}</p>`;
+          certsGrid.appendChild(d);
+        });
+      }
+      renderCertifications();
+      document.getElementById('cvLang')?.addEventListener('change', renderCertifications);
+    });
+  </script>
+</body>
+</html>
