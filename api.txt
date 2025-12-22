@@ -1,0 +1,18 @@
+SMTP et API
+Serveur SMTP
+smtp-relay.brevo.com
+Port
+587
+Connexion
+9c1210001@smtp-brevo.com
+STARTTLS
+key: bskt8NcPaWFVZUh
+
+firebase functions:config:set smtp.host="smtp-relay.brevo.com"
+firebase functions:config:set smtp.port="587"
+firebase functions:config:set smtp.secure="false"
+firebase functions:config:set smtp.user="9c1210001@smtp-brevo.com"
+firebase functions:config:set smtp.pass="bskt8NcPaWFVZUh"
+firebase functions:config:set smtp.from='"Assistant IA" <aakane0105@gmail.com>'
+firebase functions:config:set smtp.from='"Assistant IA" <no-reply@tondomaine.com>'
+firebase functions:config:set smtp.from='"Assistant IA" <no-reply@assistant-ia-v4.com>'

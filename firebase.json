@@ -1,0 +1,42 @@
+{
+  "hosting": {
+    "site": "assistant-ia-v4",
+    "public": "out",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "/api/interview",
+        "function": "interview"
+      },
+      {
+        "source": "/api/extractProfile",
+        "function": "extractProfile"
+      },
+      {
+        "source": "/api/polar/webhook",
+        "function": "polarWebhook"
+      },
+      {
+        "source": "/api/jobs",
+        "function": "jobs"
+      },
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ],
+    "cleanUrls": true,
+    "trailingSlash": false
+  },
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "functions": {
+    "source": "functions"
+  }
+}

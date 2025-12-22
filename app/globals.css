@@ -1,0 +1,301 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* =========================
+   Thème global
+   ========================= */
+:root {
+  --bg: #020617;              /* fond général */
+  --bg-soft: #020617;         /* blocs soft */
+  --card-elevated: #020617;   /* cartes en relief */
+  --ink: #f9fafb;             /* texte principal */
+  --muted: #9ca3af;           /* texte secondaire */
+  --brand: #60a5fa;           /* bleu principal */
+  --brandDark: #1d4ed8;       /* bleu plus foncé */
+  --border: #1f2933;          /* gris pour les bordures */
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(circle at top, #020617 0, #020617 40%, #000 100%);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Inter",
+    sans-serif;
+}
+
+/* Pour que les sections soient bien fluides sur mobile */
+body {
+  overscroll-behavior-y: none;
+}
+
+/* =========================
+   Scrollbar globale (droite)
+   ========================= */
+
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--brand) transparent;
+}
+
+/* Chrome / Edge / Safari */
+*::-webkit-scrollbar {
+  width: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-image: linear-gradient(
+    to bottom,
+    var(--brand),
+    var(--brandDark)
+  );
+  border-radius: 9999px;
+}
+
+/* Barre de progression en haut */
+.scroll-progress-bar {
+  border-radius: 9999px;
+}
+
+/* =========================
+   Utilitaires UI
+   ========================= */
+
+.glass {
+  background: radial-gradient(circle at top left, rgba(148, 163, 184, 0.16), transparent 55%),
+    rgba(15, 23, 42, 0.92);
+  backdrop-filter: blur(18px);
+}
+
+/* Bouton primaire */
+.btn-primary {
+  @apply inline-flex items-center justify-center px-4 py-2 rounded-full text-xs sm:text-sm font-medium;
+  background-image: linear-gradient(to right, var(--brand), var(--brandDark));
+  color: white;
+  box-shadow: 0 10px 30px rgba(37, 99, 235, 0.4);
+  transition: transform 0.12s ease-out, box-shadow 0.12s ease-out,
+    filter 0.12s ease-out;
+}
+
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 32px rgba(37, 99, 235, 0.6);
+  filter: brightness(1.05);
+}
+
+.btn-primary:active {
+  transform: translateY(0);
+  box-shadow: 0 8px 20px rgba(37, 99, 235, 0.4);
+}
+
+/* Bouton secondaire */
+.btn-secondary {
+  @apply inline-flex items-center justify-center px-4 py-2 rounded-full text-xs sm:text-sm font-medium border;
+  border-color: rgba(148, 163, 184, 0.5);
+  background: rgba(15, 23, 42, 0.8);
+  color: var(--ink);
+  transition: background-color 0.12s ease-out, border-color 0.12s ease-out,
+    color 0.12s ease-out;
+}
+
+.btn-secondary:hover {
+  border-color: var(--brand);
+  color: white;
+}
+
+/* Petites helpers pour cartes etc. */
+.card-border {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 0.75rem;
+}
+
+/* Lien hover subtil */
+.link-soft {
+  color: var(--muted);
+  transition: color 0.12s ease-out;
+}
+
+.link-soft:hover {
+  color: var(--ink);
+}
+
+/* Pour éviter un flash de scroll bar trop claire au load */
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Scrollbar verticale (container principal) */
+main::-webkit-scrollbar {
+  width: 6px;
+}
+
+main::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+main::-webkit-scrollbar-thumb {
+  background: var(--brand);
+  border-radius: 999px;
+}
+
+main {
+  scrollbar-width: thin;               /* Firefox */
+  scrollbar-color: var(--brand) transparent;
+}
+
+/* =========================
+   FORM CONTROLS (inputs / selects / textareas)
+   ========================= */
+
+/* Champs de base */
+.input,
+textarea.input,
+textarea.textarea,
+select.select-brand {
+  width: 100%;
+  border-radius: 0.75rem;
+  border: 1px solid var(--border);
+  background-color: var(--bg-soft);
+  color: var(--ink);
+  font-size: 0.875rem;
+  padding: 0.45rem 0.7rem;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease,
+    background-color 0.15s ease, color 0.15s ease;
+}
+
+/* Placeholders visibles */
+.input::placeholder,
+textarea.input::placeholder,
+textarea.textarea::placeholder {
+  color: var(--muted);
+  opacity: 1;
+}
+
+/* Focus state */
+.input:focus,
+textarea.input:focus,
+textarea.textarea:focus,
+select.select-brand:focus {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--brand) 60%, transparent);
+  background-color: #020617;
+}
+
+/* Textarea : redimension verticale seulement */
+textarea.input,
+textarea.textarea {
+  resize: vertical;
+  min-height: 3rem;
+}
+
+/* Select sur fond un peu différent */
+select.select-brand {
+  background-color: rgba(15, 23, 42, 0.9);
+  padding-right: 2rem;
+  appearance: none;
+}
+
+/* =========================
+   BADGES / CARTES / TOGGLE
+   ========================= */
+
+.badge-muted {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 9999px;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background-color: rgba(15, 23, 42, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  color: var(--muted);
+}
+
+/* Carte soft (used for LM / Pitch preview) */
+.card-soft {
+  background: rgba(15, 23, 42, 0.92);
+}
+
+/* Simple toggle checkbox (si tu ne l’as pas déjà) */
+.toggle-checkbox {
+  width: 1rem;
+  height: 1rem;
+  border-radius: 0.3rem;
+  border: 1px solid var(--border);
+  background-color: #020617;
+  accent-color: var(--brand);
+}
+
+/* =========================
+   LOADER SPINNER
+   ========================= */
+
+.loader {
+  border-radius: 9999px;
+  border: 2px solid var(--border);
+  border-top-color: var(--brand);
+  width: 1.1rem;
+  height: 1.1rem;
+  animation: spin-loader 0.7s linear infinite;
+}
+
+@keyframes spin-loader {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* =========================
+   BANDEAU "L’IA prépare tes documents…"
+   (optionnel, mais utile si tu utilises une classe dédiée)
+   ========================= */
+
+.assistant-loading-bar {
+  border-radius: 9999px;
+  backdrop-filter: blur(10px);
+}
+/* app/globals.css */
+
+/* Assure toi que html / body remplissent bien la hauteur */
+html,
+body {
+  height: 100%;
+}
+
+body {
+  min-height: 100%;
+  /* évite les comportements bizarres de scroll sur mobile */
+  overscroll-behavior-y: contain;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Empêche tout débordement horizontal global */
+html,
+body {
+  overflow-x: hidden;
+}
+
+/* Si tu utilises #__next (pages router) : garde ça, sinon tu peux l'ignorer */
+#__next {
+  min-height: 100%;
+}
+
+/* Tu peux garder ici toutes tes classes custom :
+   .glass, .btn-primary, .badge-muted, etc. */
+.grecaptcha-badge {
+  visibility: hidden; /* ou display:none; mais visibility est plus “soft” */
+}

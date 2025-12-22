@@ -1,0 +1,74 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.isAdmin == true ||
+        request.auth.token.email == "aakane0105@gmail.com"
+      );
+    }
+
+    // --- COLLECTION users ---
+    match /users/{userId} {
+      // L'utilisateur peut lire/écrire uniquement SON doc
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+
+      // L'admin peut tout lire/écrire
+      allow read, write: if isAdmin();
+    }
+
+    // --- COLLECTION profiles ---
+    match /profiles/{userId} {
+      // L'utilisateur gère son profil
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+
+      // Admin peut tout lire/écrire
+      allow read, write: if isAdmin();
+    }
+
+    // --- COLLECTION applications ---
+    match /applications/{appId} {
+      // Création d'une candidature : userId dans le doc = auth.uid
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid;
+
+      // Lecture / update / delete par le propriétaire
+      allow read, update, delete: if isSignedIn()
+        && resource.data.userId == request.auth.uid;
+
+      // Admin : lecture/écriture si besoin (stats, corrections, etc.)
+      allow read, write: if isAdmin();
+    }
+
+    // --- COLLECTION usageLogs ---
+    match /usageLogs/{logId} {
+      // 1) logs normaux d'un user connecté (LM, CV, etc.)
+      // 2) logs d'échec de connexion (auth_failed) AVANT login (pas d'auth)
+      allow create: if
+        (
+          isSignedIn() &&
+          request.resource.data.userId == request.auth.uid
+        )
+        ||
+        (
+          !isSignedIn() &&
+          request.resource.data.action == "auth_failed"
+        );
+
+      // lecture / modif / suppression : admin uniquement
+      allow read, update, delete: if isAdmin();
+    }
+
+    // --- CATCH-ALL ADMIN ---
+    match /{document=**} {
+      allow read, write: if isAdmin();
+    }
+  }
+}
