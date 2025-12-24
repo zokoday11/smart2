@@ -134,13 +134,26 @@ context/
 functions/
   index.js
   package.json
+  recaptcha-interview.js
 hooks/
   useAdminGuard.ts
   useUserCredits.ts
   useUserProfile.ts
 lib/
+  pdf/
+    templates/
+      cvAts.ts
+      letter.ts
+      types.ts
+    colors.ts
+    fitOnePage.ts
+    generateCvLm.ts
+    lmPrompt.ts
+    mergePdfs.ts
+    pdfmakeClient.ts
   server/
     credits.ts
+  apiClient.ts
   auth.ts
   credits.ts
   firebase.ts
@@ -160,8 +173,8 @@ public/
   manifest.webmanifest
 types/
   cv.ts
-.env.local
 .firebaserc
+.gitignore
 api.txt
 firebase.json
 firestore.indexes.json
@@ -170,7 +183,6 @@ next-env.d.ts
 next.config.mjs
 package.json
 postcss.config.js
-serviceAccountKey.json
 setAdmin.js
 syncAuthUsersToFirestore.js
 tailwind.config.js
@@ -179,97 +191,1278 @@ tsconfig.json
 
 # Files
 
+## File: functions/recaptcha-interview.js
+````javascript
+"use strict";
+
+const functions = require("firebase-functions");
+const admin = require("firebase-admin");
+const { RecaptchaEnterpriseServiceClient } = require("@google-cloud/recaptcha-enterprise");
+
+// Init Admin
+if (!admin.apps.length) admin.initializeApp();
+
+const recaptchaClient = new RecaptchaEnterpriseServiceClient();
+
+/* ============================
+   CORS (Hosting + localhost)
+   ============================ */
+function setCors(req, res) {
+  const origin = req.headers.origin || "";
+  const allowed = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://assistant-ia-v4.web.app",
+    "https://assistant-ia-v4.firebaseapp.com",
+  ];
+
+  if (allowed.includes(origin)) {
+    res.set("Access-Control-Allow-Origin", origin);
+  } else {
+    // (Option) tu peux mettre ton domaine custom ici si tu en as un
+    // res.set("Access-Control-Allow-Origin", "https://tondomaine.com");
+  }
+
+  res.set("Vary", "Origin");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+/* ============================
+   reCAPTCHA config
+   ============================ */
+function getRecaptchaConfig() {
+  const cfg = (functions.config && functions.config() && functions.config().recaptcha) || {};
+  const projectId = cfg.project_id || process.env.RECAPTCHA_PROJECT_ID || "";
+  const siteKey = cfg.site_key || process.env.RECAPTCHA_SITE_KEY || "";
+  const thresholdRaw = cfg.threshold || process.env.RECAPTCHA_THRESHOLD || "0.5";
+
+  const threshold = Number(thresholdRaw);
+  return {
+    projectId,
+    siteKey,
+    threshold: Number.isFinite(threshold) ? threshold : 0.5,
+  };
+}
+
+function getClientIp(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf.trim()) return xf.split(",")[0].trim();
+  return (
+    req.ip ||
+    (req.connection && req.connection.remoteAddress) ||
+    (req.socket && req.socket.remoteAddress) ||
+    ""
+  );
+}
+
+function normalizeAction(action) {
+  return String(action || "").trim().toLowerCase();
+}
+
+/**
+ * Vérifie un token reCAPTCHA Enterprise
+ */
+async function verifyRecaptchaToken({ token, expectedAction, req }) {
+  const { projectId, siteKey, threshold } = getRecaptchaConfig();
+
+  // Si pas configuré, on ne bloque pas (mais on log)
+  if (!projectId || !siteKey) {
+    console.warn("[recaptcha] NOT CONFIGURED -> bypass (projectId/siteKey missing)");
+    return { ok: true, bypass: true, score: null, threshold };
+  }
+
+  if (!token) return { ok: false, reason: "missing_token" };
+
+  const userIp = getClientIp(req);
+  const userAgent = String(req.headers["user-agent"] || "");
+
+  const parent = `projects/${projectId}`;
+
+  const [assessment] = await recaptchaClient.createAssessment({
+    parent,
+    assessment: {
+      event: {
+        token,
+        siteKey,
+        expectedAction: expectedAction || undefined,
+        userAgent: userAgent || undefined,
+        userIpAddress: userIp || undefined,
+      },
+    },
+  });
+
+  const tokenProps = assessment && assessment.tokenProperties;
+  if (!tokenProps || tokenProps.valid !== true) {
+    return {
+      ok: false,
+      reason: "invalid_token",
+      invalidReason: tokenProps ? tokenProps.invalidReason : null,
+    };
+  }
+
+  // Action check (reCAPTCHA est case-sensitive)
+  if (expectedAction && tokenProps.action && String(tokenProps.action) !== String(expectedAction)) {
+    return {
+      ok: false,
+      reason: "action_mismatch",
+      expected: expectedAction,
+      got: tokenProps.action,
+    };
+  }
+
+  const score =
+    assessment &&
+    assessment.riskAnalysis &&
+    typeof assessment.riskAnalysis.score === "number"
+      ? assessment.riskAnalysis.score
+      : null;
+
+  if (typeof score === "number" && score < threshold) {
+    return { ok: false, reason: "low_score", score, threshold };
+  }
+
+  return { ok: true, score, threshold };
+}
+
+/* ============================
+   1) Endpoint public: /recaptchaVerify
+   ============================ */
+exports.recaptchaVerify = functions
+  .region("europe-west1")
+  .https.onRequest(async (req, res) => {
+    setCors(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    if (req.method !== "POST") {
+      return res.status(405).json({ ok: false, reason: "method_not_allowed" });
+    }
+    if (!req.is("application/json")) {
+      return res.status(400).json({ ok: false, reason: "invalid_content_type" });
+    }
+
+    try {
+      const { token, action } = req.body || {};
+      const expectedAction = normalizeAction(action);
+
+      if (!token || !expectedAction) {
+        return res.status(400).json({ ok: false, reason: "missing_token_or_action" });
+      }
+
+      const r = await verifyRecaptchaToken({ token, expectedAction, req });
+
+      if (!r.ok) {
+        return res.status(401).json({ ok: false, reason: r.reason, details: r });
+      }
+
+      return res.status(200).json({ ok: true, score: r.score ?? null });
+    } catch (e) {
+      console.error("recaptchaVerify error:", e);
+      return res.status(500).json({ ok: false, reason: "server_error" });
+    }
+  });
+
+/* ============================
+   2) Cloud Function: interview (protégée par reCAPTCHA)
+   ============================ */
+exports.interview = functions
+  .region("europe-west1")
+  .https.onRequest(async (req, res) => {
+    setCors(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "method_not_allowed" });
+    }
+    if (!req.is("application/json")) {
+      return res.status(400).json({ error: "invalid_content_type" });
+    }
+
+    try {
+      const body = req.body || {};
+
+      // ✅ on accepte plusieurs noms côté front
+      const token =
+        body.recaptchaToken ||
+        body.token ||
+        (body.recaptcha && body.recaptcha.token) ||
+        null;
+
+      // ✅ action: on force une convention stable
+      // IMPORTANT : le front doit générer un token avec CETTE action
+      const expectedAction = normalizeAction(body.recaptchaAction || body.actionName || "interview");
+
+      if (!token) {
+        return res.status(403).json({
+          error: "reCAPTCHA failed",
+          details: "token_missing_or_invalid",
+          expectedAction,
+        });
+      }
+
+      const r = await verifyRecaptchaToken({ token, expectedAction, req });
+      if (!r.ok) {
+        return res.status(403).json({
+          error: "reCAPTCHA failed",
+          details: r.reason,
+          score: r.score ?? null,
+          expectedAction,
+          extra: r,
+        });
+      }
+
+      // ✅ Ici, tu continues TON code interview (Gemini / sessions / credits etc.)
+      // Pour que ça compile direct, je renvoie juste un OK:
+      // Remplace cette partie par ton handler actuel (start/answer) si tu l’as déjà ici.
+
+      return res.status(200).json({ ok: true, message: "interview OK", score: r.score ?? null });
+    } catch (e) {
+      console.error("interview error:", e);
+      return res.status(500).json({ error: "internal_error" });
+    }
+  });
+````
+
+## File: lib/pdf/templates/cvAts.ts
+````typescript
+// src/lib/pdf/templates/cvAts.ts
+import type { PdfColors } from "../colors";
+
+export type CvDocModel = {
+  name: string;
+  title: string;
+  contactLine: string;
+  profile: string;
+
+  skills: {
+    cloud?: string[];
+    sec?: string[];
+    sys?: string[];
+    auto?: string[];
+    tools?: string[];
+    soft?: string[];
+  };
+
+  xp: Array<{
+    company: string;
+    city?: string;
+    role: string;
+    dates: string;
+    bullets: string[];
+  }>;
+
+  education: string[];
+  certs?: string;
+  langLine?: string;
+  hobbies?: string[];
+};
+
+function stripMd(s: string) {
+  return String(s || "")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .replace(/`(.*?)`/g, "$1")
+    .replace(/\[(.*?)\]\(.*?\)/g, "$1")
+    .trim();
+}
+
+function cleanBullet(s: string) {
+  return stripMd(s).replace(/^[•\-–]\s*/, "").trim();
+}
+
+function smartCompactProfile(profile: string, est: number) {
+  const p = stripMd(profile);
+  // petit “compact” si beaucoup de contenu (même idée que ton HTML auto) :contentReference[oaicite:3]{index=3}
+  if (est > 3600 && p.length > 420) return p.slice(0, 420).replace(/\s+\S*$/, "…");
+  if (est > 3000 && p.length > 480) return p.slice(0, 480).replace(/\s+\S*$/, "…");
+  return p;
+}
+
+// CV A4 1 page — style auto/compact/expanded + scale (zoom global)
+export function buildCvAtsPdf(
+  cv: CvDocModel,
+  lang: "fr" | "en",
+  colors: PdfColors,
+  styleMode: "auto" | "compact" | "expanded" = "auto",
+  scale = 1
+) {
+  const est =
+    (cv.profile?.length || 0) +
+    (cv.certs?.length || 0) +
+    (cv.langLine?.length || 0) +
+    (cv.hobbies || []).join(" ").length +
+    (cv.education || []).join(" ").length +
+    (cv.xp || [])
+      .map((x) => (x.role || "") + (x.company || "") + (x.city || "") + (x.dates || "") + (x.bullets || []).join(" "))
+      .join(" ").length +
+    Object.values(cv.skills || {})
+      .flat()
+      .join(" ").length;
+
+  let fontSize: number, headSize: number, titleSize: number, lineH: number, margins: number[];
+
+  if (styleMode === "compact") {
+    fontSize = 9.0; headSize = 18.0; titleSize = 11.8; lineH = 1.04; margins = [16, 12, 16, 12];
+  } else if (styleMode === "expanded") {
+    fontSize = 11.4; headSize = 22.5; titleSize = 15.2; lineH = 1.26; margins = [30, 26, 30, 28];
+  } else {
+    if (est < 1900) { fontSize = 11.4; headSize = 22.5; titleSize = 15.2; lineH = 1.26; margins = [30, 26, 30, 28]; }
+    else if (est < 2200) { fontSize = 11.1; headSize = 22.0; titleSize = 14.8; lineH = 1.22; margins = [28, 24, 28, 26]; }
+    else if (est < 2600) { fontSize = 10.8; headSize = 21.2; titleSize = 14.4; lineH = 1.18; margins = [26, 22, 26, 24]; }
+    else if (est < 3000) { fontSize = 10.5; headSize = 20.6; titleSize = 14.0; lineH = 1.15; margins = [24, 20, 24, 22]; }
+    else if (est < 3400) { fontSize = 10.1; headSize = 19.8; titleSize = 13.4; lineH = 1.12; margins = [22, 18, 22, 18]; }
+    else if (est < 3800) { fontSize = 9.8; headSize = 19.2; titleSize = 12.8; lineH = 1.08; margins = [20, 16, 20, 16]; }
+    else if (est < 4300) { fontSize = 9.4; headSize = 18.6; titleSize = 12.4; lineH = 1.06; margins = [18, 14, 18, 14]; }
+    else { fontSize = 9.0; headSize = 18.0; titleSize = 11.8; lineH = 1.04; margins = [16, 12, 16, 12]; }
+  }
+
+  // zoom global
+  fontSize = +(fontSize * scale).toFixed(2);
+  headSize = +(headSize * scale).toFixed(2);
+  titleSize = +(titleSize * scale).toFixed(2);
+  lineH = +(1 + (lineH - 1) * (0.8 + 0.2 * scale)).toFixed(3);
+  margins = margins.map((m) => Math.max(12, Math.round(m * (0.95 + 0.05 * scale))));
+
+  const profileText = smartCompactProfile(cv.profile, est);
+
+  const H = (t: string) => ({
+    text: t,
+    color: colors.brand,
+    bold: true,
+    fontSize: Math.max(10.6, fontSize + 0.6),
+    margin: [0, 6, 0, 3],
+  });
+
+  const thin = {
+    canvas: [{ type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 0.7, lineColor: colors.border }],
+    margin: [0, 2, 0, 6],
+  };
+
+  const s = cv.skills || {};
+  const skillsGrid = {
+    columns: [
+      {
+        width: "*",
+        stack: [
+          { text: lang === "fr" ? "Architecture & Cloud" : "Architecture & Cloud", bold: true, color: colors.muted, margin: [0, 0, 0, 1] },
+          { text: (s.cloud || []).join(", "), alignment: "justify" },
+
+          { text: lang === "fr" ? "Cybersécurité" : "Cybersecurity", bold: true, color: colors.muted, margin: [0, 5, 0, 1] },
+          { text: (s.sec || []).join(", "), alignment: "justify" },
+
+          { text: lang === "fr" ? "Soft skills" : "Soft skills", bold: true, color: colors.muted, margin: [0, 5, 0, 1] },
+          { text: (s.soft || []).join(", "), alignment: "justify" },
+        ],
+      },
+      {
+        width: "*",
+        stack: [
+          { text: lang === "fr" ? "Systèmes & Réseaux" : "Systems & Networks", bold: true, color: colors.muted, margin: [0, 0, 0, 1] },
+          { text: (s.sys || []).join(", "), alignment: "justify" },
+
+          { text: lang === "fr" ? "Automatisation & Outils (IA/API)" : "Automation & Tools (AI/API)", bold: true, color: colors.muted, margin: [0, 5, 0, 1] },
+          { text: ([...(s.auto || []), ...(s.tools || [])]).join(", "), alignment: "justify" },
+        ],
+      },
+    ],
+    columnGap: 14,
+  };
+
+  function xpBlock(x: CvDocModel["xp"][number]) {
+    const header = {
+      text: `${x.company}${x.city ? " — " + x.city : ""} — ${x.role} | ${x.dates}`,
+      margin: [0, 0.5, 0, 1],
+      bold: true,
+    };
+    const bullets = (x.bullets || []).map((b) => ({
+      text: `- ${cleanBullet(b)}`,
+      margin: [0, 0, 0, 0.4],
+      alignment: "justify",
+    }));
+    return [header, ...bullets];
+  }
+
+  const content: any[] = [
+    { text: cv.name, fontSize: headSize, bold: true, alignment: "center", margin: [0, 0, 0, 0] },
+    { text: cv.title, fontSize: titleSize, color: colors.brand, bold: true, alignment: "center", margin: [0, 1, 0, 3] },
+    { text: stripMd(cv.contactLine), bold: true, margin: [0, 0, 0, 4], alignment: "center" },
+    thin,
+
+    H(lang === "fr" ? "Profil" : "Profile"),
+    { text: profileText, margin: [0, 0, 0, 2], alignment: "justify" },
+
+    H(lang === "fr" ? "Compétences clés" : "Key Skills"),
+    skillsGrid,
+
+    H(lang === "fr" ? "Expériences professionnelles" : "Professional Experience"),
+    ...(cv.xp || []).flatMap(xpBlock),
+
+    H(lang === "fr" ? "Formation" : "Education"),
+    { ul: (cv.education || []).map((e) => stripMd(e)), margin: [0, 0, 0, 1] },
+
+    H(lang === "fr" ? "Certifications" : "Certifications"),
+    { text: stripMd(cv.certs || ""), margin: [0, 0, 0, 1], alignment: "justify" },
+
+    H(lang === "fr" ? "Langues" : "Languages"),
+    { text: stripMd(cv.langLine || "") },
+  ];
+
+  if (Array.isArray(cv.hobbies) && cv.hobbies.length) {
+    content.push(H(lang === "fr" ? "Centres d’intérêt / Hobbies" : "Interests"));
+    content.push({ text: cv.hobbies.join(" • "), margin: [0, 0, 0, 1] });
+  }
+
+  return {
+    pageSize: "A4",
+    pageMargins: margins,
+    defaultStyle: { font: "Roboto", fontSize, lineHeight: lineH, color: colors.ink },
+    content,
+  };
+}
+````
+
+## File: lib/pdf/templates/letter.ts
+````typescript
+// lib/pdf/templates/letter.ts
+import type { PdfColors } from "../colors";
+export type { PdfColors } from "../colors";
+
+export type LmModel = {
+  lang: "fr" | "en";
+  name: string;
+  contactLines: string[];
+  service: string;
+  companyName: string;
+  companyAddr?: string;
+  city: string;
+  dateStr: string;
+  subject: string;
+  salutation: string;
+  body: string; // corps uniquement
+  closing: string;
+  signature: string;
+};
+
+function splitParas(text: string) {
+  return (text || "")
+    .replace(/\n{3,}/g, "\n\n")
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
+
+const DEFAULT_COLORS: PdfColors = {
+  brand: "#2563eb",
+  brandDark: "#1e40af",
+  ink: "#0f172a",
+  muted: "#475569",
+  border: "#e2e8f0",
+  bgSoft: "#f1f5f9",
+  hair: "#cbd5e1",
+};
+
+export function buildLmStyledPdf(lm: LmModel, colors: PdfColors, scale = 1) {
+  const bodyParas = splitParas(lm.body);
+
+  const baseFs = 10.5 * scale;
+  const nameFs = 12 * scale;
+
+  const brandColor = colors.brand || DEFAULT_COLORS.brand;
+  const mutedColor = colors.muted || DEFAULT_COLORS.muted;
+  const hairColor = colors.hair || DEFAULT_COLORS.hair;
+  const inkColor = colors.ink || DEFAULT_COLORS.ink;
+
+  const rightStack: any[] = [
+    { text: lm.service, color: mutedColor },
+    { text: lm.companyName, bold: true, color: mutedColor },
+    ...(lm.companyAddr ? lm.companyAddr.split(/\n+/).map((l) => ({ text: l })) : []),
+  ];
+
+  const hair = {
+    canvas: [
+      {
+        type: "line",
+        x1: 0,
+        y1: 0,
+        x2: 515,
+        y2: 0,
+        lineWidth: 1,
+        lineColor: hairColor,
+      },
+    ],
+    margin: [0, 6, 0, 10],
+  };
+
+  const dateLine =
+    lm.lang === "en" ? `At ${lm.city}, ${lm.dateStr}` : `À ${lm.city}, le ${lm.dateStr}`;
+
+  return {
+    pageSize: "A4",
+    pageMargins: [40, 36, 40, 36],
+    defaultStyle: {
+      font: "Roboto",
+      fontSize: baseFs,
+      lineHeight: 1.24,
+      color: inkColor,
+    },
+    content: [
+      // barre brand
+      {
+        canvas: [
+          { type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 3, lineColor: brandColor },
+        ],
+        margin: [0, 0, 0, 10],
+      },
+
+      // header 2 colonnes
+      {
+        columns: [
+          {
+            width: "*",
+            stack: [
+              { text: lm.name, bold: true, fontSize: nameFs, color: mutedColor },
+              ...(lm.contactLines || []).map((t) => ({ text: t })),
+            ],
+          },
+          {
+            width: "auto",
+            alignment: "right",
+            stack: rightStack,
+            margin: [0, 28, 0, 0],
+          },
+        ],
+        columnGap: 15,
+      },
+
+      hair,
+
+      { text: dateLine, margin: [0, 0, 0, 8] },
+      { text: lm.subject, bold: true, color: brandColor, margin: [0, 0, 0, 10] },
+      { text: lm.salutation, margin: [0, 0, 0, 8] },
+
+      ...bodyParas.map((p) => ({ text: p, margin: [0, 0, 0, 6] })),
+
+      { text: lm.closing, margin: [0, 12, 0, 2], alignment: "right" },
+      { text: lm.signature, bold: true, alignment: "right" },
+    ],
+  };
+}
+
+/**
+ * ✅ Fallback qui accepte:
+ * - un LmModel (structuré)
+ * - OU un string (texte brut) => pour ton appel generateCvLm.ts
+ *
+ * Exemples:
+ * buildLmFallbackPdf(params.lmTextFallback || "", colors, scale)
+ * buildLmFallbackPdf(lmModel, colors, scale)
+ */
+export function buildLmFallbackPdf(text: string, colors: PdfColors, scale?: number): any;
+export function buildLmFallbackPdf(lm: LmModel, colors: PdfColors, scale?: number): any;
+export function buildLmFallbackPdf(text: string, scale?: number): any;
+export function buildLmFallbackPdf(lm: LmModel, scale?: number): any;
+export function buildLmFallbackPdf(
+  first: string | LmModel,
+  second?: PdfColors | number,
+  third?: number
+) {
+  const colors: PdfColors =
+    typeof second === "object" && second ? second : DEFAULT_COLORS;
+
+  const scale =
+    typeof second === "number" ? second : typeof third === "number" ? third : 1;
+
+  // Si on a un modèle structuré -> on garde le rendu exact
+  if (typeof first === "object" && first) {
+    return buildLmStyledPdf(first, colors, scale);
+  }
+
+  // Sinon texte brut (string)
+  const rawText = String(first || "");
+  const paras = splitParas(rawText);
+
+  const brandColor = colors.brand || DEFAULT_COLORS.brand;
+  const hairColor = colors.hair || DEFAULT_COLORS.hair;
+  const inkColor = colors.ink || DEFAULT_COLORS.ink;
+
+  const baseFs = 10.5 * scale;
+
+  return {
+    pageSize: "A4",
+    pageMargins: [40, 36, 40, 36],
+    defaultStyle: {
+      font: "Roboto",
+      fontSize: baseFs,
+      lineHeight: 1.26,
+      color: inkColor,
+    },
+    content: [
+      // barre brand
+      {
+        canvas: [
+          { type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 3, lineColor: brandColor },
+        ],
+        margin: [0, 0, 0, 10],
+      },
+      // ligne fine
+      {
+        canvas: [
+          { type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 1, lineColor: hairColor },
+        ],
+        margin: [0, 0, 0, 12],
+      },
+      // texte brut en paragraphes
+      ...(paras.length ? paras : [""]).map((p) => ({ text: p, margin: [0, 0, 0, 7] })),
+    ],
+  };
+}
+````
+
+## File: lib/pdf/templates/types.ts
+````typescript
+// src/lib/pdf/templates/types.ts
+export type Lang = "fr" | "en";
+
+export type CvDocModel = {
+  name: string;
+  title: string;
+  contact: string; // "Paris | +33... | mail | linkedin"
+  profile: string;
+
+  skills: {
+    cloud?: string[];
+    sec?: string[];
+    sys?: string[];
+    auto?: string[];
+    tools?: string[];
+    soft?: string[];
+  };
+
+  xp: Array<{
+    company: string;
+    city?: string;
+    role: string;
+    dates: string;
+    bullets: string[];
+  }>;
+
+  education: string[];
+  certs: string;
+  langLine: string;
+  hobbies?: string[];
+};
+
+export type LmModel = {
+  lang: Lang;
+  name: string;
+  contactLines: string[]; // ["Téléphone: ...", "Email: ..."]
+  service: string;
+  companyName: string;
+  companyAddr?: string; // multi-line
+  city: string;
+  dateStr: string;
+  aPrefix: string; // "À " (FR) / "At " (EN)
+  subject: string;
+  salutation: string;
+  body: string; // paragraphes séparés par \n\n
+  closing: string;
+  signature: string;
+};
+````
+
+## File: lib/pdf/colors.ts
+````typescript
+// lib/pdf/colors.ts
+export type PdfColors = {
+  brand: string;
+  brandDark: string;
+  ink: string;
+  muted: string;
+  border: string;
+  bgSoft: string;
+  hair: string; // ✅ requis par letter.ts
+};
+
+function clamp(n: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, n));
+}
+
+function normalizeHex(hex: string) {
+  let h = (hex || "").trim();
+  if (!h.startsWith("#")) h = `#${h}`;
+  if (h.length === 4) {
+    // #RGB -> #RRGGBB
+    h = `#${h[1]}${h[1]}${h[2]}${h[2]}${h[3]}${h[3]}`;
+  }
+  if (!/^#[0-9a-fA-F]{6}$/.test(h)) return "#2563eb";
+  return h.toLowerCase();
+}
+
+function hexToRgb(hex: string) {
+  const h = normalizeHex(hex).slice(1);
+  return {
+    r: parseInt(h.slice(0, 2), 16),
+    g: parseInt(h.slice(2, 4), 16),
+    b: parseInt(h.slice(4, 6), 16),
+  };
+}
+
+function rgbToHex(r: number, g: number, b: number) {
+  const to = (x: number) =>
+    clamp(Math.round(x), 0, 255).toString(16).padStart(2, "0");
+  return `#${to(r)}${to(g)}${to(b)}`;
+}
+
+function darken(hex: string, amount = 28) {
+  const { r, g, b } = hexToRgb(hex);
+  return rgbToHex(r - amount, g - amount, b - amount);
+}
+
+export function makePdfColors(brandHex: string): PdfColors {
+  const brand = normalizeHex(brandHex);
+  return {
+    brand,
+    brandDark: darken(brand, 28),
+
+    ink: "#0f172a", // slate-900
+    muted: "#475569", // slate-600
+    border: "#e2e8f0", // slate-200
+    bgSoft: "#f1f5f9", // slate-100
+    hair: "#cbd5e1", // slate-300 (ligne fine)
+  };
+}
+````
+
+## File: lib/pdf/fitOnePage.ts
+````typescript
+// src/lib/pdf/fitOnePage.ts
+import { PDFDocument } from "pdf-lib";
+import { pdfMakeToBlob } from "./pdfmakeClient";
+
+export async function countPdfPages(blob: Blob): Promise<number> {
+  const ab = await blob.arrayBuffer();
+  const pdf = await PDFDocument.load(ab);
+  return pdf.getPageCount();
+}
+
+export async function fitOnePage(
+  buildDoc: (scale: number) => any,
+  opts?: { min?: number; max?: number; iterations?: number; initial?: number }
+): Promise<{ blob: Blob; bestScale: number }> {
+  const min = opts?.min ?? 0.8;
+  const max = opts?.max ?? 1.6;
+  const iterations = opts?.iterations ?? 8;
+  const initial = opts?.initial ?? 1.0;
+
+  let low = min;
+  let high = max;
+
+  // test initial
+  let bestBlob: Blob | null = null;
+  let bestScale = initial;
+
+  let testBlob = await pdfMakeToBlob(buildDoc(initial));
+  let pages = await countPdfPages(testBlob);
+
+  if (pages > 1) {
+    high = initial;
+  } else {
+    bestBlob = testBlob;
+    low = initial;
+  }
+
+  for (let i = 0; i < iterations; i++) {
+    const mid = +(((low + high) / 2)).toFixed(3);
+    const blob = await pdfMakeToBlob(buildDoc(mid));
+    const n = await countPdfPages(blob);
+
+    if (n > 1) {
+      high = mid - 0.01;
+    } else {
+      bestBlob = blob;
+      bestScale = mid;
+      low = mid + 0.01;
+    }
+    if (high - low < 0.01) break;
+  }
+
+  if (!bestBlob) {
+    bestBlob = await pdfMakeToBlob(buildDoc(min));
+    bestScale = min;
+  }
+
+  return { blob: bestBlob, bestScale };
+}
+````
+
+## File: lib/pdf/generateCvLm.ts
+````typescript
+// src/lib/pdf/generateCvLm.ts
+import { makePdfColors } from "./colors";
+import { fitOnePage } from "./fitOnePage";
+import { mergePdfBlobs } from "./mergePdfs";
+import { downloadBlob } from "./pdfmakeClient";
+import { buildCvAtsPdf, type CvDocModel } from "./templates/cvAts";
+import { buildLmStyledPdf, buildLmFallbackPdf, type LmModel } from "./templates/letter";
+
+export async function generateAndDownloadCvLmPdf(params: {
+  brandHex: string;
+  cv: CvDocModel;
+  cvLang: "fr" | "en";
+  // LM: soit modèle structuré, soit texte brut
+  lm?: LmModel;
+  lmTextFallback?: string;
+  filename?: string;
+}) {
+  const colors = makePdfColors(params.brandHex);
+
+  // 1) CV -> fit 1 page
+  const cvFit = await fitOnePage((scale) =>
+    buildCvAtsPdf(params.cv, params.cvLang, colors, "auto", scale)
+  );
+
+  // 2) LM -> fit 1 page
+  const lmFit = await fitOnePage((scale) => {
+    if (params.lm) return buildLmStyledPdf(params.lm, colors, scale);
+    return buildLmFallbackPdf(params.lmTextFallback || "", colors, scale);
+  }, { min: 0.85, max: 1.6, iterations: 6, initial: 1.0 });
+
+  // 3) fusion (2 pages)
+  const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
+
+  downloadBlob(merged, params.filename || `CV_LM_${new Date().toISOString().slice(0, 10)}.pdf`);
+}
+````
+
+## File: lib/pdf/lmPrompt.ts
+````typescript
+// src/lib/pdf/lmPrompt.ts
+
+type LmPromptParams = {
+  lang: "fr" | "en";
+  cvText: string; // buildProfileContextForIA(profile)
+  jobTitle?: string;
+  companyName?: string;
+  jobDescription?: string;
+  constraints?: {
+    minWords?: number; // default 170
+    maxWords?: number; // default 240
+  };
+};
+
+/**
+ * Prompt "corps de LM" : domaine-agnostique, basé CV + fiche de poste.
+ * Sortie demandée: JSON { "body": "..." } (body = texte brut avec paragraphes séparés par \n\n)
+ */
+export function buildLmBodyPrompt(p: LmPromptParams): string {
+  const lang = p.lang ?? "fr";
+  const jobTitle = (p.jobTitle || "").trim();
+  const companyName = (p.companyName || "").trim();
+  const jobDescription = (p.jobDescription || "").trim();
+  const minWords = p.constraints?.minWords ?? 170;
+  const maxWords = p.constraints?.maxWords ?? 240;
+
+  const safeJobTitle = jobTitle || (lang === "en" ? "the role" : "le poste");
+  const safeCompany = companyName || (lang === "en" ? "your company" : "votre entreprise");
+  const safeJD = jobDescription || "—";
+
+  if (lang === "en") {
+    return `
+You are a senior career coach and recruiter.
+
+TASK:
+Write ONLY the BODY of a professional cover letter tailored to the job, using ONLY the candidate info provided.
+It must work for ANY domain (tech, admin, sales, healthcare, etc.) by extracting key requirements from the job description and matching them to the candidate profile.
+
+INPUTS:
+- Job title: ${safeJobTitle}
+- Company: ${safeCompany}
+- Job description:
+${safeJD}
+
+- Candidate profile (source of truth):
+${p.cvText}
+
+STRICT RULES:
+- DO NOT invent facts, employers, degrees, tools, dates, metrics.
+- If a detail is missing, write generically (e.g., "I have delivered impactful projects") without fake numbers.
+- Output MUST be STRICT JSON only:
+{ "body": "..." }
+- "body" must be plain text with paragraphs separated by ONE blank line (\n\n).
+- No header, no address, no subject line, no greeting, no signature, no bullets, no emojis.
+
+CONTENT GUIDANCE (domain-agnostic):
+- 3 to 5 short paragraphs.
+1) Motivation for ${safeJobTitle} at ${safeCompany} + a credible hook based on the profile.
+2) Match 3–5 requirements from the job description to relevant skills/experience from the profile.
+3) Mention 1–2 concrete contributions/achievements from the candidate’s experience (only if present), otherwise describe typical contributions.
+4) How the candidate will contribute in the first months (methods, collaboration, outcomes).
+5) Polite closing inviting to discuss.
+
+LENGTH:
+Between ${minWords} and ${maxWords} words.
+Return the JSON now.
+`.trim();
+  }
+
+  // FR
+  return `
+Tu es un coach carrières senior et recruteur.
+
+MISSION :
+Rédige UNIQUEMENT le CORPS d’une lettre de motivation professionnelle, parfaitement adaptée au poste, en utilisant UNIQUEMENT les informations du candidat fournies.
+Le prompt doit fonctionner pour TOUS les domaines (tech, administratif, commercial, santé, etc.) : tu extrais les exigences de la fiche de poste et tu les relies au profil.
+
+ENTRÉES :
+- Intitulé du poste : ${safeJobTitle}
+- Entreprise : ${safeCompany}
+- Fiche de poste / description :
+${safeJD}
+
+- Profil candidat (source de vérité) :
+${p.cvText}
+
+RÈGLES STRICTES :
+- N’invente rien (entreprises, diplômes, outils, dates, chiffres).
+- Si une info manque, reste générique ("j’ai contribué à des projets à impact") sans métriques inventées.
+- Réponds OBLIGATOIREMENT en JSON STRICT, sans texte autour :
+{ "body": "..." }
+- "body" = texte brut avec paragraphes séparés par UNE ligne vide (\n\n).
+- Pas d’en-tête, pas d’adresses, pas d’objet, pas de formule d’appel, pas de signature, pas de listes à puces, pas d’émojis.
+
+DIRECTIVE CONTENU (multi-domaines) :
+- 3 à 5 paragraphes courts.
+1) Motivation pour ${safeJobTitle} chez ${safeCompany} + accroche crédible basée sur le profil.
+2) Fais le lien entre 3–5 attentes de la fiche de poste et les compétences/expériences du CV.
+3) Cite 1–2 contributions/réalisations concrètes SI elles existent dans le CV, sinon décris des apports typiques (qualité, rigueur, coordination, relation client, etc.).
+4) Explique comment le candidat contribuera dans les premiers mois (méthode, collaboration, résultats).
+5) Conclusion polie ouvrant sur un entretien.
+
+LONGUEUR :
+Entre ${minWords} et ${maxWords} mots.
+Retourne le JSON maintenant.
+`.trim();
+}
+````
+
+## File: lib/pdf/mergePdfs.ts
+````typescript
+// src/lib/pdf/mergePdfs.ts
+import { PDFDocument } from "pdf-lib";
+
+/**
+ * Merge plusieurs PDFs (Blob) en un seul PDF (Blob).
+ * Compatible Next.js / TS: évite le type Uint8Array<ArrayBufferLike> non accepté par BlobPart.
+ */
+export async function mergePdfBlobs(blobs: Blob[]): Promise<Blob> {
+  const merged = await PDFDocument.create();
+
+  for (const b of blobs) {
+    const ab = await b.arrayBuffer();
+    const pdf = await PDFDocument.load(ab);
+
+    const pages = await merged.copyPages(pdf, pdf.getPageIndices());
+    for (const p of pages) merged.addPage(p);
+  }
+
+  const bytes = await merged.save();
+
+  // ✅ Cast sûr pour BlobPart (ArrayBuffer-backed)
+  const safeBytes = new Uint8Array(bytes);
+
+  return new Blob([safeBytes], { type: "application/pdf" });
+}
+````
+
+## File: lib/pdf/pdfmakeClient.ts
+````typescript
+// src/lib/pdf/pdfmakeClient.ts
+let cached: any | null = null;
+
+function buildVfsFromModule(mod: any) {
+  if (!mod) return null;
+
+  // Cas classique: { pdfMake: { vfs: {...} } }
+  const classic =
+    mod?.pdfMake?.vfs ??
+    mod?.default?.pdfMake?.vfs ??
+    mod?.default?.vfs ??
+    mod?.vfs;
+
+  if (classic && typeof classic === "object") return classic;
+
+  // ✅ Ton cas: le module expose directement les fichiers Roboto-*.ttf
+  // Ex: { "Roboto-Regular.ttf": "base64...", ..., default: {...} }
+  const candidate = typeof mod === "object" ? mod : null;
+  if (!candidate) return null;
+
+  const vfs: Record<string, string> = {};
+
+  for (const [k, v] of Object.entries(candidate)) {
+    if (k === "default") continue;
+    if (!k.toLowerCase().endsWith(".ttf")) continue;
+    if (typeof v !== "string") continue;
+    vfs[k] = v;
+  }
+
+  // Certains bundlers mettent les .ttf dans default
+  const def = candidate?.default;
+  if (def && typeof def === "object") {
+    for (const [k, v] of Object.entries(def)) {
+      if (!k.toLowerCase().endsWith(".ttf")) continue;
+      if (typeof v !== "string") continue;
+      vfs[k] = v;
+    }
+  }
+
+  return Object.keys(vfs).length ? vfs : null;
+}
+
+export async function getPdfMake() {
+  if (cached) return cached;
+
+  const pdfMakeMod: any = await import("pdfmake/build/pdfmake");
+  const pdfMake = pdfMakeMod.default ?? pdfMakeMod;
+
+  const fontsMod: any = await import("pdfmake/build/vfs_fonts");
+  const vfs = buildVfsFromModule(fontsMod);
+
+  if (!vfs) {
+    console.error("vfs_fonts module keys:", Object.keys(fontsMod || {}));
+    console.error("vfs_fonts.default keys:", Object.keys(fontsMod?.default || {}));
+    throw new Error("pdfmake vfs_fonts introuvable (vfs).");
+  }
+
+  pdfMake.vfs = vfs;
+
+  pdfMake.fonts = {
+    Roboto: {
+      normal: "Roboto-Regular.ttf",
+      bold: "Roboto-Medium.ttf",
+      italics: "Roboto-Italic.ttf",
+      bolditalics: "Roboto-MediumItalic.ttf",
+    },
+  };
+
+  cached = pdfMake;
+  return pdfMake;
+}
+
+export async function pdfMakeToBlob(docDef: any): Promise<Blob> {
+  const pdfMake = await getPdfMake();
+  return new Promise((resolve) => pdfMake.createPdf(docDef).getBlob(resolve));
+}
+
+export function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 15000);
+}
+````
+
+## File: lib/apiClient.ts
+````typescript
+"use client";
+
+import { API_BASE, tryGetRecaptchaToken } from "@/lib/recaptcha";
+
+type JsonHeaders = Record<string, string>;
+
+function normalizePath(path: string) {
+  return (path || "").replace(/^\/+/, "");
+}
+
+function buildRecaptchaError(action: string) {
+  return new Error(
+    `reCAPTCHA indisponible pour l’action "${action}". ` +
+      `Vérifie : (1) NEXT_PUBLIC_RECAPTCHA_SITE_KEY, (2) script chargé, (3) adblock, (4) domaine autorisé côté Google.`
+  );
+}
+
+export async function postJsonWithRecaptcha<T>(
+  path: string,
+  action: string,
+  body: any,
+  extraHeaders: JsonHeaders = {}
+): Promise<T> {
+  const token = await tryGetRecaptchaToken(action);
+  if (!token) throw buildRecaptchaError(action);
+
+  const res = await fetch(`${API_BASE}/${normalizePath(path)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Recaptcha-Token": token,
+      ...extraHeaders,
+    },
+    body: JSON.stringify({
+      ...body,
+      recaptchaToken: token, // ✅ compatible avec ton backend
+      recaptchaAction: action,
+    }),
+    cache: "no-store",
+  });
+
+  const text = await res.text();
+  let data: any = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // si le backend renvoie pas du JSON
+  }
+
+  if (!res.ok) {
+    const msg =
+      (data && (data.error || data.message)) ||
+      text ||
+      `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+
+  return data as T;
+}
+
+export async function postBlobWithRecaptcha(
+  path: string,
+  action: string,
+  body: any,
+  extraHeaders: JsonHeaders = {}
+): Promise<Blob> {
+  const token = await tryGetRecaptchaToken(action);
+  if (!token) throw buildRecaptchaError(action);
+
+  const res = await fetch(`${API_BASE}/${normalizePath(path)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Recaptcha-Token": token,
+      ...extraHeaders,
+    },
+    body: JSON.stringify({
+      ...body,
+      recaptchaToken: token,
+      recaptchaAction: action,
+    }),
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    let data: any = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {}
+    const msg =
+      (data && (data.error || data.message)) ||
+      text ||
+      `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+
+  return await res.blob();
+}
+````
+
 ## File: .firebase/hosting.b3V0.cache
 ````
-tech.txt,1766223612383,c06929675c718dade87617718ea24733344b1ab79a75b3f11ed9c9b5887c734a
-signup.txt,1766223612384,6a208204e71373e7ec3c137cf801f59175df6fb71bec342b8817bae1a75cd431
-manifest.webmanifest,1766223611196,b125a9afb1b3c4b81daaf5442dd9d589e2367c37c2fd3305fa23247173975337
-signup.html,1766223612380,f7357d7a32880bb5c7112063d9c24780b44f73fa529907bd3021acd7a0786f9c
-login.html,1766223612379,6e3c11e4d9765a11ba51549ddfc40a769064b9784d878a3aaffce4fb320d2388
-forgot-password.txt,1766223612384,08ba7a8e07a0a8dd8411608a028173b90402a9a6877856bc6489f58af95ba994
-index.txt,1766223612383,b6ad54c0162d5be64d03b4d06dd4e3908e54153826119f9496b25b2b5e9dbfd6
-login.txt,1766223612383,8832aaed79a8dd1d1c40ac15fd5dd5dfe369ca53f998aa4b5399757d164b5509
-assistance-candidature.txt,1766223612384,cc52c1f960f79b8d01d8544222dfa341e6f3fd7a81c7053537297093509730ff
-forgot-password.html,1766223612379,e836b23b12e9d554eafa5dc10fbb12ba7419d6f04cd7cc61283efc13023c2a56
-tech.html,1766223612379,41bcbd865ce2ebeafeadc8485f095582d477ef9919a3aa97de983fa00197ef03
-app.txt,1766223612384,64e006c64558521a6b2cb875ab4c8f8cc4442b7f1531f527b56aa53fc7878d67
-app.html,1766223612380,85c9f13f974c5fea60d49f5ab5f45c0883ab9e0c3fa1eabe6b50b51232b95520
-admin.txt,1766223612381,e4ffe2773d972c9cb898d7249b581bdb41cac5c19c496e6964a1af039c510030
-404.html,1766223611965,a6ac7cff23e13922b20c5674be9e507c1d2009b8da794d211fafb2996cccb356
-admin.html,1766223612376,314792363434c005b301495c4303c863bbfc2517807a5a0e99283d92fca1a716
-debug/polar.txt,1766223612381,ed875d6c84d72bb95eeb4b1600b08551be8ee06d4f19ea5513f6de5ca49605b1
-debug/polar.html,1766223612377,70d61524d01038fcacd54a73e033c67b44daf605ed046ac5e851b12b332b5323
-auth/verify-email.txt,1766223612380,2fa3e3130d3a804f32af0c461706b3f0e0ce876297f90268814a9834c261abf1
-app/tracker.html,1766223612378,be57c20725ecc286d1809ca72a850e6c05433c5c9605f88a5750aaa318d71aec
-auth/verify-email.html,1766223612375,320d84d75c11797dcce535e8b5a0fa67705cef0d95c590a5e7ea7ec08967f4a1
-app/tracker.txt,1766223612383,f108523e998dbca8fce28ed06f4b8f65977015fc1a31267ce9a55eaf1e44587c
-app/settings.html,1766223612378,2cabdf2a810eccb81fe7b6f644557c7a644f1e52e7125b7772b3a1d505c99e08
-app/settings.txt,1766223612382,4ba7b0d7fae135771f5d59ebd1f703c118c2995e69dcf63fdaa962387675ae44
-app/pitch.txt,1766223612383,e0476dd0f6d769c52c7bf6c959a7ca66024e701b2fc5210b420d5a54ddae7d0d
-app/pitch.html,1766223612377,04b8f32eda1be930e8ff879bde89fca3d3820c7490499203f7f697f99c1b8338
-app/lm.txt,1766223612382,4c88b7be3bcb5d3a6e1080ee381976425598f3c3f22a9e4ee9dae2abe6c5e78f
-app/lm.html,1766223612377,3ef282c4ae44a74f0232187d6cc8695b8059b77aa4b25ec99dd201aeb8185835
-app/interview.txt,1766223612383,3e3fbfa657b4b5b85fbe207e61ede3d6c5d5355e944d87e5d912c67a8fd74471
-app/history.txt,1766223612384,da687c2a8c5a07ba796d7143c28a42279c2639688f28eb2a19dd682421e35c1a
-app/interview.html,1766223612378,6b742a05285cce9e02465c1fcac97cef6815e15af36aa572137e9e7098bff34f
-app/cv.txt,1766223612381,5e4ef1f75684531f9162476044ff81ee6a5c207a1b197738efb72d73ff7026b2
-app/history.html,1766223612380,6939756f95ddaad95a44ef9143d191d287b6e6e70e82b638306d22c302469a71
-app/cv.html,1766223612376,ae002d8e451bb5ddbe2b3d5b6d04d05c1674d3f70a24fbb9243be728db365cf5
-app/credits.txt,1766223612381,ac433d78002f499967d955d8c4587e9db99e7a1df2b7e0dda61073aeac7c6d10
-app/credits.html,1766223612377,bcba3063357a4c0e64f797d51dfc8699d0d9d282ffecb2e0913845ec8c3b9a0a
-app/apply.html,1766223612375,32279eae5474f626340d4341c6fceff6e9e00dde9bcebf330df40cf26d26eb39
-app/apply.txt,1766223612380,91d26fc2ec75f0116a35daeb6613932231d812e8b7efe4f7f2e8cf81b8aa486c
-assistance-candidature.html,1766223612380,af97bc1fc1899ef73e378f961e3b6f9f5a3f401f3c011a6d5a2edcdd4d357e9d
-index.html,1766223612379,bef740516134e02824d2cc5f563856fafad1d141886506968e8b2340d51aaef0
-api/polar/test,1766223612378,35d1b34b7807696b8413c672871fcf26b35d968667e349dfbe811cedc67ac17a
-admin/logs.txt,1766223612381,39cab3fae3383426278ed43c19c854356ceb893556a043fb479e0e2f9127073c
-admin/login.txt,1766223612382,4f1fece10a0af95f44279caaa66e1d3c2f50754a8c7806a78488365b1676fff2
-admin/logs.html,1766223612376,891c26f32b41ce1031bc844ce4e53a1f7ef5b4ff2ff4bae1ae70dacb83f670fd
-_next/static/css/57fd5f904f4111d7.css,1766223611178,172ce9d553d95887b09135dc6fe3164cc05c4ee3faed3b64273c32ead296738a
-_next/static/chunks/main-app-7466cb2517b2ac24.js,1766223611177,3dad6f439d8b157d2427b4087aaeff0fef56e1e1041ee3b5f0fad10bf506a92d
-admin/login.html,1766223612377,8effedaba8a1f1d12861055fcb2bd94a058a5ce447b23b07b8dac81e89a0eb58
-_next/static/chunks/webpack-03f7c6bc932ce1e3.js,1766223611177,219ca515b71e6f5157cf2be9e7c5ef5500867d0db4e6e5e0efc2f95786ce32ef
-_next/static/chunks/polyfills-42372ed130431b0a.js,1766223611178,67dee1c02c6a6700d63b5c1898cf2df618101a68a395db469192763d24925a23
-_next/static/chunks/648-a41745ebae293ba3.js,1766223611169,d08de5f20a30c50b96e1cb68dfbec730d23ae67cba384f345e34c09b6adddaf3
-_next/static/chunks/pages/_error-7ba65e1336b92748.js,1766223611181,0402d6340a70945d851b2d22e156d955fbee54c1d8ec8b379f35fd464a8d08bf
-_next/static/chunks/276-a01f3bf27c64a121.js,1766223611167,7959269d2568322cb0a6253c58e7242b54d27d373aa32b7b0c05474bf95e8fd1
-_next/static/chunks/pages/_app-72b849fbd24ac258.js,1766223611181,dae29acdf0128939e571909a9228115276818bce739f4d0f98c1da8ed68ba91d
-_next/static/chunks/app/not-found-a7d2e025cdaae076.js,1766223611179,8ec8fde655d80c0e5d37c7714dac9911aa99f5add99e26b2820f5afcda111b2a
-_next/static/chunks/app/page-2cb43cd786a135b3.js,1766223611179,005704db2d8038cf89ed2990bf49600a72ed1e06bab8c27c410a6e391b1d2231
-_next/static/chunks/app/layout-4b9561a229a596fc.js,1766223611181,0c53b31434c9b9491b1db2a45a447193c182cd5eee0754e19418bcadce76eb76
-_next/static/chunks/app/tech/page-cc145f1ea41d0f3b.js,1766223611184,9782dc820a4127292f16e053f0bcc1695227f9ba956897623c527946b7b8fdc5
-_next/static/chunks/app/signup/page-415d35620f5a8925.js,1766223611184,23a69dc0e5be865291fefc093d134779c918bef51b683c33c9b2d39280c61adc
-_next/static/chunks/app/login/page-c06e2b6ded9b49f3.js,1766223611184,67b1ba5beb488bc4f537a597c44233d67135bcc1566758ab79c5117628478a01
-_next/static/chunks/app/forgot-password/page-1e8246d3701842f8.js,1766223611183,c5c00836a859da9166998b632679fa0ace77fb105034f37d6d863730aa0a7159
-_next/static/chunks/main-76e1bcb595671093.js,1766223611175,bbcdc180a07d600a7f8dcfa6d3267afdec0b918f9bc722e4764b72782a68d238
-_next/static/chunks/app/debug/polar/page-49599eb8d5dda592.js,1766223611188,eae0b7def982e0bf3068fde94e7f0f34defeceee17e2646fb7a9cb846c72169e
-_next/static/chunks/app/assistance-candidature/page-f38626f0664fd689.js,1766223611183,81d9766776f30fbac7fbd008ba3ab85a44d797761bc1a6972d105a47c69f101f
-_next/static/chunks/app/auth/verify-email/page-76a5806573e2ffe6.js,1766223611190,6b22e7525d83798f87b4b2b1d90798e6972b3edc575929ee1352938bfa718515
-_next/static/chunks/app/app/layout-a7a5ce754bd1ad16.js,1766223611182,47da4ba9f8b5600fd9cb70eb46bf190b3ea02b503488dfb3560c83c2a3d7b7b8
-_next/static/chunks/app/app/tracker/page-51ccc58e2af34ece.js,1766223611187,0b68abda42bcfe86ea7274e10859d1964851010b96b165ed852ecfd58ae16571
-_next/static/chunks/app/app/page-b641c52499f8e749.js,1766223611183,f79254300ae18826e790c276848a5aa9223b69f41cb2b8516b8841a1e43a435b
-_next/static/chunks/app/app/settings/page-954eb241eae96c3b.js,1766223611191,a65265b14afa8476fb7b78ff2f3f18b8989aec6b6b50f4b02960185d8fca1d76
-_next/static/chunks/app/app/pitch/page-a42bf5337283b380.js,1766223611186,8bb08510d6cd6129e33e6ec8e6fbd346c590b1fce79e8c3fd1af1c8492f985d1
-_next/static/chunks/app/app/lm/page-f4f00a550e788f79.js,1766223611189,0485551045e1af86f61c5888bb4135463b53f65cbac218bb2399a234fd0f8de2
-_next/static/chunks/app/app/history/page-b44f1b622671fb6b.js,1766223611186,2b50c7db092b6dc9ae36249d114bd85396746f0b795a72f18bc9e9432fdd325b
-_next/static/chunks/app/app/cv/page-492c1c2b5ea110d3.js,1766223611185,27b93316c1ef03d32314815e1199788b00fbc1166d05264ad35be6c9b1aed703
-_next/static/chunks/app/app/interview/page-40c5ab747064b228.js,1766223611188,16f0b930bd092ef2df8ab52ed0055b3302bd2d38656127a0bd302aa93a63c2c9
-_next/static/chunks/app/app/credits/page-da7b638bc6a4dc63.js,1766223611186,b354374892ff09c7b40b3f46a63c8c22a7f71c29267d087cef7b69db4ca914c9
-_next/static/chunks/app/app/apply/page-4b1674fce4aea889.js,1766223611188,ade9f6c59cd78012d78ce2f721ae446a30017dfdb3bbf86207d3ad0e0e558572
-_next/static/chunks/app/admin/page-35b010b882f8dea6.js,1766223611181,8bc2d31560e4e32b0c29fd167e4bda2a4c421fdbf15a83fe5ad1253555f62b2a
-_next/static/chunks/app/admin/logs/page-22e44ce20ea54b75.js,1766223611186,554379c156358ee21df7e2bad9172a59004c4a34179d606eec21ae1da9d2e808
-_next/static/chunks/app/admin/login/page-2e6925e9ae333b95.js,1766223611185,b90b810232b2619ad3be8ca04464545ed5bee12883d847e4577c1320ac8f4e14
-_next/static/chunks/app/_not-found/page-7494094633467ef3.js,1766223611181,dcfa115b285fc1e7d920913e1a0464349f8c270c107df17678afbcaee62abec0
-_next/static/08GGivBeUcLdBWsncvPYC/_ssgManifest.js,1766223611166,02dbc1aeab6ef0a6ff2ff9a1643158cf9bb38929945eaa343a3627dee9ba6778
-_next/static/08GGivBeUcLdBWsncvPYC/_buildManifest.js,1766223611166,f46b17d6e2e887329d388286773626796e64b52f4cd965c9b0fe037e97f3ad58
-_next/static/chunks/ebf8faf4-eb27ebf8c37d4d67.js,1766223611172,a107c6566fbc2f52b78a30e52b2ae3b7b84b0da4ffe8d15f24849c217e372a5d
-_next/static/chunks/941-da853eb9ae4bc965.js,1766223611170,f4b97a2711ed98aa8723dcc66969fec23e3ebc576ff38e09fd1f1cd10bd20a82
-_next/static/chunks/810-039b9229cc1a2fae.js,1766223611170,2f29a61132b062dab1e63516e7337a67aede0bce268795b569dfccfc5c400bab
-_next/static/chunks/600-2ae2ab76ace4e875.js,1766223611168,ea47caf34ad27d1a524604c65a1c0ecc0f6fb1f64426749920e60ac529a33563
-_next/static/chunks/framework-aec844d2ccbe7592.js,1766223611173,36f12099915a78862f76158596a2aac7e86dd87ba94f4d3b896a7749c5e4c9d6
-_next/static/chunks/fd9d1056-b4129a380d1be68f.js,1766223611173,8b73f2ae4babb3d70adf200a16329555cd03b390ca97f3fa3368428ebc73c549
-_next/static/chunks/7508b87c-2affb3ad7b55ab3d.js,1766223611169,798ec3d71f923e838d157bf4dd01e76244b35e1c9634e28e77c89c9df89a676d
-_next/static/chunks/ca377847-044365abace2608d.js,1766223611171,c6e43c770559cc5ee6605295131dc3e9de57d9fda82d7043e9b70b2f97bc8002
+tech.txt,1766516748973,3cc77dc7579ee301c79c58a1da5d988087fb019c57e0d78f73a119a26fc00a4d
+tech.html,1766516748967,70478536984048f8c6baf85a4058f211be215908aa302b25aaed9a52c5f222ac
+signup.txt,1766516748973,67d7b353b52eddfad89558b7f87fa0ed0a8b9d01d3ac4a26af8f5c46c0aaaec0
+signup.html,1766516748966,13a430bdcfa6a23c937d07424d9976cba1c378d7fba5af9d709247d55dbae711
+manifest.webmanifest,1766516747523,b125a9afb1b3c4b81daaf5442dd9d589e2367c37c2fd3305fa23247173975337
+login.txt,1766516748972,caa566efee024b3a35054ae05a6f221d8495f025d7f380ea77aff75eb5fb3d5e
+login.html,1766516748966,d3998e585966bec43ed93623d16627486f69f8fab60f572b28cae0418e40727f
+index.txt,1766516748972,b0952ef67cb6b99e6c2afeaba613ffad79cb81f327adcc17ba2d877afab592dc
+index.html,1766516748965,9b9072f01f7c7b5092cee0c56e4e838dc370c49d1045768f26997eea029c3b26
+forgot-password.txt,1766516748971,88c0dd789a3046334a7199dcfcc9854cfc2551f6e0a3d67bde03695847b139c7
+forgot-password.html,1766516748964,c7999480bd7f5ecd38846e31c73bbc5a4d85cbdd954181b7b45e85e724dbcad9
+assistance-candidature.txt,1766516748972,571b66de82c739ba22388b13fa2683eeae37641c1f05ae600f98f1b66317d7b8
+assistance-candidature.html,1766516748964,497d9247344cccd26da023e712845771c7462cde598b6fe5e82f9c1d6435265c
+app.txt,1766516748972,7850b8a9e9ba265b34809ed488fba35e5e68db7e503f661eb1ac59a346b9067a
+app.html,1766516748966,73a6efe79ce7b661efb9f95998c80a538a98e79b73297ddf15162766e1fa4f58
+admin.txt,1766516748970,f803e183918a3f2766bc90dd598061cee600d5c7ee28285e0baf519cfd6cf810
+admin.html,1766516748962,e27231a563db9416d934f284b9a06cf556c887632aad85a59678fdbc833e139d
+404.html,1766516748361,0626120cd6599b9be504fa03b62df50001f4d6b7ad6f8cb18f42ef5bff48a7f3
+debug/polar.txt,1766516748967,162c79c96a088d3835c7deff2f7ee56b4824f4ff666e9cc3950531bb47524fc4
+debug/polar.html,1766516748960,9c12de9b764a377658e9776ec0b1b788f9a210cdbad24e04cb26a23b14ad27ac
+auth/verify-email.txt,1766516748967,63b1366132c2b0e2c175635e0649c2db808d8ec7667749d2639f53b758e377c7
+auth/verify-email.html,1766516748960,2f2ee707b9bc799fd433a74e7cb6dc81852665f6465c45576704e0988b31b106
+app/tracker.txt,1766516748970,18126b57901f775004395836548f7a73751e83b18b81872442dee1c87370dc22
+app/tracker.html,1766516748963,30b6204034b11845cb893ff05443198864a7adb00070b9adb7dd2ec98b08bcb3
+app/settings.txt,1766516748973,ccef11346e1bbd3e3b7ae52f767cba6a1aa6d92d4fcfd3793593ee8b7d9ccde9
+app/settings.html,1766516748966,5266df0af37d8fa6709cc6d2c863bbe4ab89b08efcac97998501d65a9b3d7b7b
+app/pitch.txt,1766516748969,36f5315cfc294be3857aa266a1740f5221496df763e9778ec8725bffd1a03544
+app/pitch.html,1766516748962,d6a772b420bd301d88a2ca95ae58b8e8cef8f1066b195f6141c8c37d3ecb53bf
+app/lm.txt,1766516748972,ab8e094152014d928f4b1837948edf892f04ac8a19b3a353a6ad42582165eb2f
+app/lm.html,1766516748964,e1ff1821ef676c6bba3853b7351d77bae4a3d321d16d9266707ecd3b0bf1f180
+app/interview.txt,1766516748971,fe4689f8802db6b00679134b9ee6b202e9e5f04e9f4bdc8cb6f1fa5920467554
+app/interview.html,1766516748964,f58af150bc197f2fd5351b159b958ad7c3d3a6b7f0aef7b7786cece06b0249f1
+app/history.txt,1766516748969,3d99fecc6e8369deb2ac7ff03c4b17d90cde33080bbc48ca2ca6cb30c8515953
+app/history.html,1766516748962,e13c02f140849dbd105464a044416fd5cecaf07c72d7f3cc9f9be4f1a2d5789a
+app/cv.txt,1766516748971,ae59d2a5c6c8bc3d41dca902c3119ff1dc33b3aeb63bef75758cf15824c15d58
+app/cv.html,1766516748964,6527edd251c87b7ca2c2310a42dca7da53e14ecb664b1e3d287d6616514f81c1
+app/credits.txt,1766516748968,24d4978dee084c63c1cbb323155cd4c70f6d02ca243de961f90d7e6b467f71fe
+app/credits.html,1766516748961,3cc63222ed5df58478beb80f7efb773c4d3b47f4af69d398f621ff2b2208e337
+app/apply.txt,1766516748969,8ea0c8e96099d408f8d6335b00bfa7124ac76c0c6c83be7dccd9dddfc4190d81
+app/apply.html,1766516748961,71be18f951c8b9bdf78fa5ffd11e7d108a8b6ef4ef461e65298d54e759f3f5e4
+api/polar/test,1766516748967,35d1b34b7807696b8413c672871fcf26b35d968667e349dfbe811cedc67ac17a
+admin/logs.txt,1766516748968,4193cfac968d950cd1d60e21536d13877be82d5fda4b328877374dcf3ffb6bbf
+admin/logs.html,1766516748961,7d85f1598fa19eb04fd7f41d2319e17fca3b8c1d30c79ba2e78bae763e7b8d1a
+admin/login.txt,1766516748966,fc9efe2a6fb3cbc9a59bc9c9a6f15f8407bc4554cb41a0b9a83ad59717910c6a
+admin/login.html,1766516748959,b77fe6a483e5cc895e0545a8dfa15d00ad77e642c37809d773749102a7da8e24
+_next/static/css/faac00ea2ad55afa.css,1766516747505,6d7858f4fcc4e1e9989a644e8cf8a19bb627645fdf7cac7bb293cc4e6ae1ada3
+_next/static/chunks/webpack-94aa307a0c675022.js,1766516747501,39d51b0f67df400cf90160e3e74e56e3b3ac0d30af506085df8bee1092e91cab
+_next/static/chunks/polyfills-42372ed130431b0a.js,1766516747505,67dee1c02c6a6700d63b5c1898cf2df618101a68a395db469192763d24925a23
+_next/static/chunks/main-app-7466cb2517b2ac24.js,1766516747498,3dad6f439d8b157d2427b4087aaeff0fef56e1e1041ee3b5f0fad10bf506a92d
+_next/static/chunks/main-76e1bcb595671093.js,1766516747504,bbcdc180a07d600a7f8dcfa6d3267afdec0b918f9bc722e4764b72782a68d238
+_next/static/chunks/framework-aec844d2ccbe7592.js,1766516747501,36f12099915a78862f76158596a2aac7e86dd87ba94f4d3b896a7749c5e4c9d6
+_next/static/chunks/fd9d1056-b4129a380d1be68f.js,1766516747498,8b73f2ae4babb3d70adf200a16329555cd03b390ca97f3fa3368428ebc73c549
+_next/static/chunks/ebf8faf4-eb27ebf8c37d4d67.js,1766516747497,a107c6566fbc2f52b78a30e52b2ae3b7b84b0da4ffe8d15f24849c217e372a5d
+_next/static/chunks/ca377847-044365abace2608d.js,1766516747496,c6e43c770559cc5ee6605295131dc3e9de57d9fda82d7043e9b70b2f97bc8002
+_next/static/chunks/941-da853eb9ae4bc965.js,1766516747494,f4b97a2711ed98aa8723dcc66969fec23e3ebc576ff38e09fd1f1cd10bd20a82
+_next/static/chunks/810-039b9229cc1a2fae.js,1766516747488,2f29a61132b062dab1e63516e7337a67aede0bce268795b569dfccfc5c400bab
+_next/static/chunks/7508b87c-2affb3ad7b55ab3d.js,1766516747486,798ec3d71f923e838d157bf4dd01e76244b35e1c9634e28e77c89c9df89a676d
+_next/static/chunks/648-a41745ebae293ba3.js,1766516747483,d08de5f20a30c50b96e1cb68dfbec730d23ae67cba384f345e34c09b6adddaf3
+_next/static/chunks/63b94182.662a1bbff33f68c9.js,1766516747489,86c28eeebf9d1883bb5afe89168408b3ccf891d873e2ac67eec46ef5baa42a41
+_next/static/chunks/600-2ae2ab76ace4e875.js,1766516747480,ea47caf34ad27d1a524604c65a1c0ecc0f6fb1f64426749920e60ac529a33563
+_next/static/chunks/5493da1b.e7544b77cf3a7468.js,1766516747486,76cae2b4134f6f89522b80ad97b81eb8b093f50a047c7faa2e0512533d603784
+_next/static/chunks/500-c984c19836bde651.js,1766516747477,94a6d0ca98e707e577d1f1b6336dcdf87e35f2c1be72c787845aad3abfdab19b
+_next/static/chunks/323-54d09e3358a73f44.js,1766516747481,2aae14a1d235667a06206f344a3f76216206cb0f4697ccc38edc1923e27c5d58
+_next/static/chunks/276-a01f3bf27c64a121.js,1766516747479,7959269d2568322cb0a6253c58e7242b54d27d373aa32b7b0c05474bf95e8fd1
+_next/static/chunks/pages/_error-7ba65e1336b92748.js,1766516747506,0402d6340a70945d851b2d22e156d955fbee54c1d8ec8b379f35fd464a8d08bf
+_next/static/chunks/pages/_app-72b849fbd24ac258.js,1766516747506,dae29acdf0128939e571909a9228115276818bce739f4d0f98c1da8ed68ba91d
+_next/static/chunks/app/page-04078e5e4ba66b1d.js,1766516747506,fd845f84ec7c187a3bb3e82cd5a690aa75f0b4ca0c53a65495ea449a96c15991
+_next/static/chunks/app/not-found-74a90fc08ab9437a.js,1766516747506,8ec8fde655d80c0e5d37c7714dac9911aa99f5add99e26b2820f5afcda111b2a
+_next/static/chunks/app/layout-9e322ebc6c69974b.js,1766516747505,57a38ab6c6c143610c4c5c55fe368f60c5aed79c207f486eb9d75bf8763d6394
+_next/static/chunks/app/tech/page-cc145f1ea41d0f3b.js,1766516747515,9782dc820a4127292f16e053f0bcc1695227f9ba956897623c527946b7b8fdc5
+_next/static/chunks/app/signup/page-8c48925c3f3c52ca.js,1766516747512,636d7396bfba3179391c46dc2cadcfe85fcd5c9955e05cb88622170aa8b44f23
+_next/static/chunks/app/login/page-8a1f8646938577f8.js,1766516747512,45da851b1c759ecdc39470f681d20a1f67bd96b97ce88568df91a0aff4ca6696
+_next/static/chunks/app/forgot-password/page-7ba7f56b957b3ead.js,1766516747512,59c307ab28b715a638e9ac9d484b2d73ac8bd3b271b1db0fb16ce4716a556865
+_next/static/chunks/app/debug/polar/page-e28997809c70dae8.js,1766516747519,eae0b7def982e0bf3068fde94e7f0f34defeceee17e2646fb7a9cb846c72169e
+_next/static/chunks/app/auth/verify-email/page-c03af4984154988e.js,1766516747519,6b22e7525d83798f87b4b2b1d90798e6972b3edc575929ee1352938bfa718515
+_next/static/chunks/app/assistance-candidature/page-f38626f0664fd689.js,1766516747510,81d9766776f30fbac7fbd008ba3ab85a44d797761bc1a6972d105a47c69f101f
+_next/static/chunks/app/app/page-3d33f0691cc7052c.js,1766516747512,f79254300ae18826e790c276848a5aa9223b69f41cb2b8516b8841a1e43a435b
+_next/static/chunks/app/app/layout-7aa6ad0f76d78662.js,1766516747509,47da4ba9f8b5600fd9cb70eb46bf190b3ea02b503488dfb3560c83c2a3d7b7b8
+_next/static/chunks/app/app/tracker/page-8f13d48cb47ca503.js,1766516747519,0b68abda42bcfe86ea7274e10859d1964851010b96b165ed852ecfd58ae16571
+_next/static/chunks/app/app/settings/page-654d883b731b8e6b.js,1766516747518,a65265b14afa8476fb7b78ff2f3f18b8989aec6b6b50f4b02960185d8fca1d76
+_next/static/chunks/app/app/pitch/page-a42bf5337283b380.js,1766516747517,8bb08510d6cd6129e33e6ec8e6fbd346c590b1fce79e8c3fd1af1c8492f985d1
+_next/static/chunks/app/app/lm/page-a1057059c1ffab1f.js,1766516747518,34ed764c2ca1bf552158c78b6a6350f2cdd4411a752d4d7b3661952c6d1772f2
+_next/static/chunks/app/app/interview/page-5d2b46a3565c14fc.js,1766516747517,e004acddbc6b4612633faad87f187fd7fccee1994dfd7a383d0134b3ba6e8e69
+_next/static/chunks/app/app/history/page-b44f1b622671fb6b.js,1766516747516,2b50c7db092b6dc9ae36249d114bd85396746f0b795a72f18bc9e9432fdd325b
+_next/static/chunks/app/app/cv/page-492c1c2b5ea110d3.js,1766516747517,27b93316c1ef03d32314815e1199788b00fbc1166d05264ad35be6c9b1aed703
+_next/static/chunks/app/app/credits/page-afe0ce4cf8da1f59.js,1766516747516,7572d8149de19adcb718582a8fbe62aacc563f5bf5998fc4683b678a5ad3af9c
+_next/static/chunks/app/app/apply/page-cf0ee0e768561642.js,1766516747516,1b88d79376396f77cdfb2520e7eec3848bd4533744dcf0d4638c8768c5073c5f
+_next/static/chunks/app/admin/page-f161718d3c048788.js,1766516747509,8bc2d31560e4e32b0c29fd167e4bda2a4c421fdbf15a83fe5ad1253555f62b2a
+_next/static/chunks/app/admin/logs/page-e8c5c4ae49457b18.js,1766516747515,554379c156358ee21df7e2bad9172a59004c4a34179d606eec21ae1da9d2e808
+_next/static/chunks/app/admin/login/page-d0fa36fddfc7acd4.js,1766516747515,b90b810232b2619ad3be8ca04464545ed5bee12883d847e4577c1320ac8f4e14
+_next/static/chunks/app/_not-found/page-7494094633467ef3.js,1766516747508,dcfa115b285fc1e7d920913e1a0464349f8c270c107df17678afbcaee62abec0
+_next/static/IlA4IUG3fQpM1zdQiAMyW/_ssgManifest.js,1766516747501,02dbc1aeab6ef0a6ff2ff9a1643158cf9bb38929945eaa343a3627dee9ba6778
+_next/static/IlA4IUG3fQpM1zdQiAMyW/_buildManifest.js,1766516747503,f46b17d6e2e887329d388286773626796e64b52f4cd965c9b0fe037e97f3ad58
 ````
 
 ## File: .firebase/hosting.Lm5leHQ.cache
@@ -2493,15 +3686,19 @@ import {
   InterviewChannel,
   HistoryItem,
 } from "@/lib/interviewPrompt";
-import {
-  verifyUserAndCredits,
-  consumeCredit,
-} from "@/lib/server/credits";
+import { verifyUserAndCredits, consumeCredit } from "@/lib/server/credits";
 
 export const runtime = "nodejs";
 
-// ---- Sessions en mémoire (DEV) ---- //
+/**
+ * ✅ reCAPTCHA OFF par défaut
+ * -> Active uniquement si INTERVIEW_REQUIRE_RECAPTCHA=true
+ */
+const REQUIRE_RECAPTCHA =
+  (process.env.INTERVIEW_REQUIRE_RECAPTCHA || "").toLowerCase().trim() ===
+  "true";
 
+// ---- Sessions en mémoire (DEV) ---- //
 type InterviewSession = {
   userId: string;
   createdAt: string;
@@ -2521,25 +3718,134 @@ type InterviewSession = {
 const memorySessions = new Map<string, InterviewSession>();
 
 function createSessionId() {
-  return Math.random().toString(36).slice(2);
+  try {
+    // @ts-ignore
+    return crypto.randomUUID();
+  } catch {
+    return Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+  }
+}
+
+function purgeOldSessions(maxAgeMs = 1000 * 60 * 60 * 6) {
+  const now = Date.now();
+  for (const [sid, s] of memorySessions.entries()) {
+    const t = Date.parse(s.lastUpdated || s.createdAt);
+    if (!Number.isNaN(t) && now - t > maxAgeMs) memorySessions.delete(sid);
+  }
+}
+
+// ---------------- reCAPTCHA (Enterprise via CF recaptchaVerify) ----------------
+type RecaptchaVerifyResult =
+  | { ok: true; score?: number }
+  | { ok: false; reason: string; score?: number };
+
+function stripTrailingSlash(s: string) {
+  return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+
+function getApiBaseServer(): string {
+  return stripTrailingSlash(
+    process.env.CLOUD_FUNCTIONS_BASE_URL ||
+      process.env.API_BASE_URL ||
+      "https://europe-west1-assistant-ia-v4.cloudfunctions.net"
+  );
+}
+
+async function verifyRecaptchaEnterpriseViaCF(
+  token: string,
+  action: string
+): Promise<RecaptchaVerifyResult> {
+  const base = getApiBaseServer();
+  try {
+    const res = await fetch(`${base}/recaptchaVerify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, action: (action || "").trim() }),
+      cache: "no-store",
+    });
+
+    const data: any = await res.json().catch(() => null);
+
+    if (!res.ok || !data?.ok) {
+      return {
+        ok: false,
+        reason: String(data?.reason || data?.error || "recaptcha_failed"),
+        score: typeof data?.score === "number" ? data.score : undefined,
+      };
+    }
+
+    return {
+      ok: true,
+      score: typeof data?.score === "number" ? data.score : undefined,
+    };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || "network_error" };
+  }
 }
 
 // ---- Handler principal ---- //
-
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const { action } = body;
+    purgeOldSessions();
 
-    // ---------- DÉMARRER L'ENTRETIEN ---------- //
+    const body = await req.json().catch(() => null);
+    if (!body || typeof body !== "object") {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
+
+    const { action } = body as any;
+
+    // ✅ token peut venir de plusieurs endroits (selon ton front)
+    const recaptchaToken =
+      (body as any)?.recaptchaToken ||
+      (body as any)?.token ||
+      (body as any)?.recaptcha?.token ||
+      null;
+
+    const recaptchaAction =
+      (body as any)?.recaptchaAction ||
+      (body as any)?.recaptcha?.action ||
+      "interview";
+
+    // ✅ reCAPTCHA (optionnel)
+    if (REQUIRE_RECAPTCHA) {
+      if (!recaptchaToken || typeof recaptchaToken !== "string") {
+        return NextResponse.json(
+          {
+            error: "reCAPTCHA failed",
+            details: "token_missing_or_invalid",
+            requireRecaptcha: true,
+            expectedAction: recaptchaAction,
+          },
+          { status: 403 }
+        );
+      }
+
+      const rec = await verifyRecaptchaEnterpriseViaCF(
+        recaptchaToken,
+        recaptchaAction
+      );
+
+      if (!rec.ok) {
+        return NextResponse.json(
+          {
+            error: "reCAPTCHA failed",
+            details: rec.reason,
+            score: rec.score ?? null,
+            requireRecaptcha: true,
+            expectedAction: recaptchaAction,
+          },
+          { status: 403 }
+        );
+      }
+    }
+
+    // ---------- START ---------- //
     if (action === "start") {
-      const { userId, jobDesc, cvSummary, mode, channel, level } = body;
+      const { userId, jobDesc, cvSummary, mode, channel, level } = body as any;
 
       if (!userId) {
-        return NextResponse.json(
-          { error: "Missing userId" },
-          { status: 400 }
-        );
+        return NextResponse.json({ error: "Missing userId" }, { status: 400 });
       }
 
       const user = await verifyUserAndCredits(userId);
@@ -2551,7 +3857,6 @@ export async function POST(req: NextRequest) {
       }
 
       const nowIso = new Date().toISOString();
-
       const safeMode = (mode || "mixed") as string;
       const safeChannel = (channel || "written") as InterviewChannel;
       const safeLevel = (level || "junior") as InterviewLevel;
@@ -2589,16 +3894,11 @@ export async function POST(req: NextRequest) {
       let parsed: any;
       try {
         parsed = JSON.parse(llmResponseText);
-      } catch (err) {
-        console.error("JSON parse error (start):", err, llmResponseText);
-        return NextResponse.json(
-          { error: "LLM response parse error" },
-          { status: 500 }
-        );
+      } catch {
+        parsed = { next_question: "Parlez-moi de vous.", short_analysis: null };
       }
 
-      const firstQuestion =
-        parsed.next_question || "Parlez-moi de vous.";
+      const firstQuestion = parsed.next_question || "Parlez-moi de vous.";
 
       const historyItem: HistoryItem = {
         role: "interviewer",
@@ -2623,9 +3923,9 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // ---------- RÉPONDRE À UNE QUESTION ---------- //
+    // ---------- ANSWER ---------- //
     if (action === "answer") {
-      const { userId, sessionId, userMessage, channel, step } = body;
+      const { userId, sessionId, userMessage, channel, step } = body as any;
 
       if (!userId || !sessionId || !userMessage?.trim()) {
         return NextResponse.json(
@@ -2644,22 +3944,14 @@ export async function POST(req: NextRequest) {
 
       const session = memorySessions.get(sessionId);
       if (!session) {
-        return NextResponse.json(
-          { error: "Session not found" },
-          { status: 404 }
-        );
+        return NextResponse.json({ error: "Session not found" }, { status: 404 });
       }
 
       if (session.userId !== userId) {
-        return NextResponse.json(
-          { error: "Forbidden" },
-          { status: 403 }
-        );
+        return NextResponse.json({ error: "Forbidden" }, { status: 403 });
       }
 
-      const history = Array.isArray(session.history)
-        ? [...session.history]
-        : [];
+      const history = Array.isArray(session.history) ? [...session.history] : [];
 
       history.push({
         role: "candidate",
@@ -2668,7 +3960,7 @@ export async function POST(req: NextRequest) {
       });
 
       const nextStep =
-        typeof step === "number"
+        typeof step === "number" && Number.isFinite(step)
           ? step
           : (session.currentStep || 1) + 1;
 
@@ -2687,12 +3979,13 @@ export async function POST(req: NextRequest) {
       let parsed: any;
       try {
         parsed = JSON.parse(llmResponseText);
-        } catch (err) {
-        console.error("JSON parse error (answer):", err, llmResponseText);
-        return NextResponse.json(
-          { error: "LLM response parse error" },
-          { status: 500 }
-        );
+      } catch {
+        parsed = {
+          next_question: "Merci. Peux-tu illustrer avec un exemple concret ?",
+          short_analysis: "",
+          final_summary: null,
+          final_score: null,
+        };
       }
 
       const nextQuestion =
@@ -2706,12 +3999,10 @@ export async function POST(req: NextRequest) {
         createdAt: new Date().toISOString(),
       });
 
-      const nowIso = new Date().toISOString();
-
       const updated: InterviewSession = {
         ...session,
         history,
-        lastUpdated: nowIso,
+        lastUpdated: new Date().toISOString(),
         currentStep: nextStep,
       };
 
@@ -2734,29 +4025,18 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    return NextResponse.json(
-      { error: "Unknown action" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Unknown action" }, { status: 400 });
   } catch (err) {
     console.error("Interview API error:", err);
-    return NextResponse.json(
-      { error: "Internal error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Internal error" }, { status: 500 });
   }
 }
 
 // ---- APPEL GEMINI ---- //
-
 async function callLLM(prompt: string): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
-    console.warn(
-      "[Interview] GEMINI_API_KEY manquant → fallback démo."
-    );
-    // 👉 ici tu peux renvoyer une réponse “fake” simple
     return JSON.stringify({
       next_question:
         "Mode démo : peux-tu me résumer ton expérience la plus récente en lien avec ce poste ?",
@@ -2767,50 +4047,31 @@ async function callLLM(prompt: string): Promise<string> {
     });
   }
 
-  // 🔴 ICI tu choisis le modèle 2.5
-  const model =
-    process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
-
+  const modelRaw = process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
+  const model = modelRaw.startsWith("models/") ? modelRaw : `models/${modelRaw}`;
   const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
 
-  const payload = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: prompt }],
-      },
-    ],
-  };
+  const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
   if (!resp.ok) {
-    const errorText = await resp.text();
+    const errorText = await resp.text().catch(() => "");
     console.error("Gemini error (interview):", resp.status, errorText);
-
-    // Si c’est un 429 (quota dépassé), tu peux retourner un JSON “fallback”
-    if (resp.status === 429) {
-      console.warn("[Interview] Quota Gemini dépassé → fallback démo.");
-      return JSON.stringify({
-        next_question:
-          "Mode démo (quota dépassé) : peux-tu me raconter un de tes projets dont tu es fièr(e) ?",
-        short_analysis:
-          "Le quota de l’API Gemini est dépassé. Ceci est un scénario d’entretien simulé.",
-        final_summary: null,
-        final_score: null,
-      });
-    }
-
-    throw new Error("Gemini call failed");
+    return JSON.stringify({
+      next_question:
+        "Je n'arrive pas à joindre l’IA. Donne-moi : contexte / actions / résultats (STAR).",
+      short_analysis: `Fallback Gemini HTTP ${resp.status}`,
+      final_summary: null,
+      final_score: null,
+    });
   }
 
-  const data = await resp.json();
+  const data = await resp.json().catch(() => null);
 
   const textRaw: string =
     data?.candidates?.[0]?.content?.parts
@@ -2819,13 +4080,15 @@ async function callLLM(prompt: string): Promise<string> {
       .trim() || "";
 
   if (!textRaw) {
-    throw new Error("Empty Gemini response");
+    return JSON.stringify({
+      next_question: "Peux-tu préciser ?",
+      short_analysis: "",
+      final_summary: null,
+      final_score: null,
+    });
   }
 
-  const text = textRaw.trim();
-
-  // On laisse Gemini renvoyer directement un JSON ; le parse se fait dans le handler
-  return text;
+  return textRaw.trim();
 }
 ````
 
@@ -5682,32 +6945,28 @@ export default function InterviewPage() {
 
 ## File: app/app/lm/page.tsx
 ````typescript
+// app/app/lm/page.tsx
 "use client";
 
 import { logUsage } from "@/lib/logUsage";
-import { useEffect, useState, FormEvent } from "react";
+import { useEffect, useMemo, useState, FormEvent } from "react";
 import { motion } from "framer-motion";
 import { auth, db } from "@/lib/firebase";
 import { onAuthStateChanged } from "firebase/auth";
-import {
-  doc,
-  getDoc,
-  collection,
-  addDoc,
-  serverTimestamp,
-} from "firebase/firestore";
+import { doc, getDoc, collection, addDoc, serverTimestamp } from "firebase/firestore";
+
+// ✅ PDF (génération locale, rendu identique à tes HTML pdfmake)
+import { makePdfColors } from "@/lib/pdf/colors";
+import { fitOnePage } from "@/lib/pdf/fitOnePage";
+import { mergePdfBlobs } from "@/lib/pdf/mergePdfs";
+import { downloadBlob } from "@/lib/pdf/pdfmakeClient";
+import { buildCvAtsPdf, type CvDocModel } from "@/lib/pdf/templates/cvAts";
+import { buildLmStyledPdf, type LmModel } from "@/lib/pdf/templates/letter";
 
 // --- TYPES ---
 
-type CvSkillsSection = {
-  title: string;
-  items: string[];
-};
-
-type CvSkills = {
-  sections: CvSkillsSection[];
-  tools: string[];
-};
+type CvSkillsSection = { title: string; items: string[] };
+type CvSkills = { sections: CvSkillsSection[]; tools: string[] };
 
 type CvExperience = {
   company: string;
@@ -5757,31 +7016,384 @@ type CvProfile = {
 
 type Lang = "fr" | "en";
 
-// 🔗 ENDPOINTS CLOUD FUNCTIONS
+// 🔗 ENDPOINT (texte IA LM + pitch uniquement)
 const LETTER_AND_PITCH_URL =
   "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
 
-const GENERATE_CV_API =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateCvPdf";
+// =============================
+// ✅ reCAPTCHA Enterprise (client)
+// =============================
 
-const GENERATE_CV_LM_ZIP_API =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateCvLmZip";
+const RECAPTCHA_SITE_KEY = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY || "";
+let recaptchaLoadPromise: Promise<void> | null = null;
 
-const GENERATE_LM_PDF_API =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterPdf";
+function loadRecaptchaEnterprise(siteKey: string): Promise<void> {
+  if (typeof window === "undefined") {
+    return Promise.reject(new Error("reCAPTCHA: window indisponible (SSR)."));
+  }
+  if ((window as any).grecaptcha?.enterprise) return Promise.resolve();
+  if (recaptchaLoadPromise) return recaptchaLoadPromise;
+
+  recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
+    const existing = document.querySelector(
+      'script[data-recaptcha-enterprise="true"]'
+    ) as HTMLScriptElement | null;
+
+    if (existing) {
+      const t = window.setInterval(() => {
+        if ((window as any).grecaptcha?.enterprise) {
+          window.clearInterval(t);
+          resolve();
+        }
+      }, 50);
+
+      window.setTimeout(() => {
+        window.clearInterval(t);
+        if (!(window as any).grecaptcha?.enterprise) {
+          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
+        }
+      }, 6000);
+      return;
+    }
+
+    const s = document.createElement("script");
+    s.src = `https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(
+      siteKey
+    )}`;
+    s.async = true;
+    s.defer = true;
+    s.setAttribute("data-recaptcha-enterprise", "true");
+
+    s.onload = () => {
+      const t = window.setInterval(() => {
+        if ((window as any).grecaptcha?.enterprise) {
+          window.clearInterval(t);
+          resolve();
+        }
+      }, 50);
+
+      window.setTimeout(() => {
+        window.clearInterval(t);
+        if (!(window as any).grecaptcha?.enterprise) {
+          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
+        }
+      }, 6000);
+    };
+
+    s.onerror = () =>
+      reject(new Error("Impossible de charger reCAPTCHA Enterprise."));
+    document.head.appendChild(s);
+  });
+
+  return recaptchaLoadPromise;
+}
+
+async function getRecaptchaToken(action: string): Promise<string> {
+  if (!RECAPTCHA_SITE_KEY) {
+    throw new Error("reCAPTCHA: NEXT_PUBLIC_RECAPTCHA_SITE_KEY manquante.");
+  }
+
+  await loadRecaptchaEnterprise(RECAPTCHA_SITE_KEY);
+
+  const g = (window as any).grecaptcha;
+  if (!g?.enterprise?.ready || !g?.enterprise?.execute) {
+    throw new Error(
+      "reCAPTCHA Enterprise indisponible (grecaptcha.enterprise manquant)."
+    );
+  }
+
+  await new Promise<void>((resolve) => g.enterprise.ready(() => resolve()));
+  const token = await g.enterprise.execute(RECAPTCHA_SITE_KEY, { action });
+
+  if (!token || typeof token !== "string") {
+    throw new Error("reCAPTCHA: token vide.");
+  }
+  return token;
+}
+
+// =============================
+// ✅ Helpers (texte & PDF locaux)
+// =============================
+
+function safeText(v: any) {
+  return String(v ?? "").trim();
+}
+
+function buildContactLine(p: CvProfile) {
+  const parts: string[] = [];
+  if (p.city) parts.push(safeText(p.city));
+  if (p.phone) parts.push(safeText(p.phone));
+  if (p.email) parts.push(safeText(p.email));
+  if (p.linkedin) parts.push(safeText(p.linkedin));
+  return parts.filter(Boolean).join(" | ");
+}
+
+function categorizeSkills(profile: CvProfile) {
+  const cloud: string[] = [];
+  const sec: string[] = [];
+  const sys: string[] = [];
+  const auto: string[] = [];
+  const tools: string[] = [];
+  const soft: string[] = Array.isArray(profile.softSkills) ? profile.softSkills : [];
+
+  const sections = profile.skills?.sections || [];
+  for (const s of sections) {
+    const title = (s?.title || "").toLowerCase();
+    const items = (s?.items || []).filter(Boolean);
+
+    const pushAll = (arr: string[], vals: string[]) => vals.forEach((x) => arr.push(x));
+
+    if (title.includes("cloud") || title.includes("azure") || title.includes("aws") || title.includes("gcp")) {
+      pushAll(cloud, items);
+    } else if (title.includes("sécu") || title.includes("secu") || title.includes("security") || title.includes("cyber")) {
+      pushAll(sec, items);
+    } else if (
+      title.includes("réseau") ||
+      title.includes("reseau") ||
+      title.includes("system") ||
+      title.includes("système") ||
+      title.includes("sys")
+    ) {
+      pushAll(sys, items);
+    } else if (title.includes("autom") || title.includes("devops") || title.includes("ia") || title.includes("api")) {
+      pushAll(auto, items);
+    } else {
+      pushAll(tools, items);
+    }
+  }
+
+  const extraTools = Array.isArray(profile.skills?.tools) ? profile.skills.tools : [];
+  extraTools.forEach((t) => tools.push(t));
+
+  const uniq = (arr: string[]) => Array.from(new Set(arr.map((x) => safeText(x)).filter(Boolean)));
+
+  return {
+    cloud: uniq(cloud),
+    sec: uniq(sec),
+    sys: uniq(sys),
+    auto: uniq(auto),
+    tools: uniq(tools),
+    soft: uniq(soft),
+  };
+}
+
+function profileToCvDocModel(profile: CvProfile, params: { targetJob: string; contract: string }): CvDocModel {
+  const titleParts: string[] = [];
+  if (params.targetJob?.trim()) titleParts.push(params.targetJob.trim());
+  if (params.contract?.trim()) titleParts.push(params.contract.trim());
+  const title = titleParts.length ? titleParts.join(" — ") : (profile.contractType || "Candidature");
+
+  const skills = categorizeSkills(profile);
+
+  const xp = (profile.experiences || []).map((x) => ({
+    company: safeText(x.company),
+    city: safeText(x.location || ""),
+    role: safeText(x.role),
+    dates: safeText(x.dates),
+    bullets: Array.isArray(x.bullets) ? x.bullets.map(safeText).filter(Boolean) : [],
+  }));
+
+  const educationLines =
+    Array.isArray(profile.educationShort) && profile.educationShort.length
+      ? profile.educationShort.map(safeText).filter(Boolean)
+      : (profile.education || []).map((e) => {
+          const a = safeText(e.degree);
+          const b = safeText(e.school);
+          const c = safeText(e.dates);
+          const d = safeText(e.location || "");
+          return [a, b, c, d].filter(Boolean).join(" — ");
+        });
+
+  return {
+    name: safeText(profile.fullName) || safeText(profile.email) || "Candidat",
+    title,
+    contactLine: buildContactLine(profile),
+    profile: safeText(profile.profileSummary),
+    skills,
+    xp,
+    education: educationLines,
+    certs: safeText(profile.certs),
+    langLine: safeText(profile.langLine),
+    hobbies: Array.isArray(profile.hobbies) ? profile.hobbies.map(safeText).filter(Boolean) : [],
+  };
+}
+
+// --- Pour que l’IA écrive une VRAIE lettre (expériences, résultats, outils) ---
+function buildCandidateHighlights(profile: CvProfile) {
+  const topXp = (profile.experiences || []).slice(0, 3).map((xp, i) => {
+    const bullets = (xp.bullets || []).slice(0, 4).map((b) => `- ${b}`).join("\n");
+    return `EXP${i + 1}: ${xp.role} @ ${xp.company} (${xp.dates}${xp.location ? `, ${xp.location}` : ""})
+${bullets}`;
+  });
+
+  const skillLines = (profile.skills?.sections || [])
+    .slice(0, 4)
+    .map((s) => `${s.title}: ${(s.items || []).slice(0, 10).join(", ")}`);
+
+  const tools = (profile.skills?.tools || []).slice(0, 18);
+
+  return `
+CANDIDATE_NAME: ${profile.fullName}
+SUMMARY: ${profile.profileSummary}
+
+TOP_EXPERIENCES:
+${topXp.join("\n\n")}
+
+KEY_SKILLS:
+${skillLines.join("\n")}
+
+TOOLS:
+${tools.join(", ")}
+
+CERTS: ${profile.certs}
+LANGS: ${profile.langLine}
+`.trim();
+}
+
+function buildJobDescWithInstructions(args: {
+  jobDescription: string;
+  lang: Lang;
+  jobTitle: string;
+  companyName: string;
+  jobLink: string;
+  profile: CvProfile;
+}) {
+  const base = (args.jobDescription || "").trim();
+
+  const instrFR = `
+---
+INSTRUCTIONS IMPORTANTES (à respecter):
+- Rédige une lettre de motivation PERSONNALISÉE et crédible.
+- Utilise explicitement 2 à 3 expériences ci-dessous (réalisations / responsabilités).
+- Mets en avant compétences + outils pertinents pour le poste.
+- Adapte le discours à l'entreprise "${args.companyName}" et au poste "${args.jobTitle}".
+- Ton: professionnel, concret, pas de blabla.
+- Longueur: 220 à 320 mots (≈ 1 page A4).
+- Structure: 3 à 4 paragraphes.
+- Termine par une phrase d’appel à entretien.
+- IMPORTANT: Retourne UNIQUEMENT le CORPS de la lettre (pas d’en-tête, pas d’adresse, pas de signature).
+
+OFFRE_URL: ${args.jobLink || "(non fournie)"}
+
+PROFIL (à utiliser):
+${buildCandidateHighlights(args.profile)}
+`.trim();
+
+  const instrEN = `
+---
+IMPORTANT INSTRUCTIONS:
+- Write a REAL, tailored cover letter (credible, specific).
+- Explicitly use 2–3 experiences below (achievements/responsibilities).
+- Highlight relevant skills + tools for the role.
+- Adapt to company "${args.companyName}" and role "${args.jobTitle}".
+- Tone: professional, concrete, no fluff.
+- Length: 220–320 words (~1 A4 page).
+- Structure: 3–4 paragraphs.
+- End with a clear interview call-to-action.
+- IMPORTANT: Return ONLY the BODY (no header, no address, no signature).
+
+JOB_URL: ${args.jobLink || "(not provided)"}
+
+PROFILE (use it):
+${buildCandidateHighlights(args.profile)}
+`.trim();
+
+  const injected = args.lang === "fr" ? instrFR : instrEN;
+  if (!base) return injected;
+  return `${base}\n\n${injected}`;
+}
+
+function extractBodyFromLetterText(letterText: string, lang: Lang, fullName: string) {
+  const raw = safeText(letterText);
+  if (!raw) return "";
+
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return raw;
+
+  const first = lines[0].toLowerCase();
+  const isGreeting =
+    (lang === "fr" && (first.startsWith("madame") || first.startsWith("bonjour"))) ||
+    (lang === "en" && (first.startsWith("dear") || first.startsWith("hello")));
+
+  if (isGreeting) lines.shift();
+
+  while (lines.length) {
+    const last = lines[lines.length - 1].toLowerCase();
+    if (
+      last.includes("cordialement") ||
+      last.includes("bien cordialement") ||
+      last.includes("salutations") ||
+      last.includes("sincerely") ||
+      last.includes("best regards") ||
+      last.includes("kind regards")
+    ) {
+      lines.pop();
+      continue;
+    }
+    if (fullName && last.includes(fullName.toLowerCase())) {
+      lines.pop();
+      continue;
+    }
+    break;
+  }
+
+  const body = lines.join("\n\n").trim();
+  return body || raw;
+}
+
+function buildLmModel(profile: CvProfile, lang: Lang, companyName: string, jobTitle: string, letterText: string): LmModel {
+  const name = safeText(profile.fullName) || "Candidat";
+  const contactLines: string[] = [];
+  if (profile.phone) contactLines.push(lang === "fr" ? `Téléphone : ${safeText(profile.phone)}` : `Phone: ${safeText(profile.phone)}`);
+  if (profile.email) contactLines.push(lang === "fr" ? `Email : ${safeText(profile.email)}` : `Email: ${safeText(profile.email)}`);
+  if (profile.linkedin) contactLines.push(lang === "fr" ? `LinkedIn : ${safeText(profile.linkedin)}` : `LinkedIn: ${safeText(profile.linkedin)}`);
+
+  const city = safeText(profile.city) || "Paris";
+  const dateStr =
+    lang === "fr"
+      ? new Date().toLocaleDateString("fr-FR")
+      : new Date().toLocaleDateString("en-GB");
+
+  const subject =
+    lang === "fr"
+      ? `Objet : Candidature – ${jobTitle || "poste"}`
+      : `Subject: Application – ${jobTitle || "role"}`;
+
+  const salutation = lang === "fr" ? "Madame, Monsieur," : "Dear Hiring Manager,";
+  const closing = lang === "fr" ? "Cordialement," : "Sincerely,";
+
+  const body = extractBodyFromLetterText(letterText, lang, name);
+
+  return {
+    lang,
+    name,
+    contactLines,
+    service: lang === "fr" ? "Service Recrutement" : "Recruitment Team",
+    companyName: safeText(companyName) || (lang === "fr" ? "Entreprise" : "Company"),
+    companyAddr: "",
+    city,
+    dateStr,
+    subject,
+    salutation,
+    body: body || safeText(letterText),
+    closing,
+    signature: name,
+  };
+}
+
+// =============================
+// PAGE
+// =============================
 
 export default function AssistanceCandidaturePage() {
   // --- PROFIL CV IA ---
-
   const [userId, setUserId] = useState<string | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [profile, setProfile] = useState<CvProfile | null>(null);
   const [loadingProfile, setLoadingProfile] = useState(true);
 
   // Bandeau global "IA en cours"
-  const [globalLoadingMessage, setGlobalLoadingMessage] = useState<
-    string | null
-  >(null);
+  const [globalLoadingMessage, setGlobalLoadingMessage] = useState<string | null>(null);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
@@ -5811,43 +7423,25 @@ export default function AssistanceCandidaturePage() {
             profileSummary: data.profileSummary || "",
             city: data.city || "",
             address: data.address || "",
-            contractType:
-              data.contractType || data.contractTypeStandard || "",
+            contractType: data.contractType || data.contractTypeStandard || "",
             contractTypeStandard: data.contractTypeStandard || "",
             contractTypeFull: data.contractTypeFull || "",
             primaryDomain: data.primaryDomain || "",
-            secondaryDomains: Array.isArray(data.secondaryDomains)
-              ? data.secondaryDomains
-              : [],
-            softSkills: Array.isArray(data.softSkills)
-              ? data.softSkills
-              : [],
+            secondaryDomains: Array.isArray(data.secondaryDomains) ? data.secondaryDomains : [],
+            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
             drivingLicense: data.drivingLicense || "",
             vehicle: data.vehicle || "",
             skills: {
-              sections: Array.isArray(data.skills?.sections)
-                ? data.skills.sections
-                : [],
-              tools: Array.isArray(data.skills?.tools)
-                ? data.skills.tools
-                : [],
+              sections: Array.isArray(data.skills?.sections) ? data.skills.sections : [],
+              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
             },
-            experiences: Array.isArray(data.experiences)
-              ? data.experiences
-              : [],
-            education: Array.isArray(data.education)
-              ? data.education
-              : [],
-            educationShort: Array.isArray(data.educationShort)
-              ? data.educationShort
-              : [],
+            experiences: Array.isArray(data.experiences) ? data.experiences : [],
+            education: Array.isArray(data.education) ? data.education : [],
+            educationShort: Array.isArray(data.educationShort) ? data.educationShort : [],
             certs: data.certs || "",
             langLine: data.langLine || "",
             hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
-            updatedAt:
-              typeof data.updatedAt === "number"
-                ? data.updatedAt
-                : undefined,
+            updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : undefined,
           };
 
           setProfile(loadedProfile);
@@ -5864,8 +7458,7 @@ export default function AssistanceCandidaturePage() {
     return () => unsub();
   }, []);
 
-  // --- ÉTATS CV IA (1 page) ---
-
+  // --- ÉTATS CV IA ---
   const [cvTargetJob, setCvTargetJob] = useState("");
   const [cvTemplate, setCvTemplate] = useState("ats");
   const [cvLang, setCvLang] = useState<Lang>("fr");
@@ -5879,8 +7472,10 @@ export default function AssistanceCandidaturePage() {
   const [cvStatus, setCvStatus] = useState<string | null>(null);
   const [cvError, setCvError] = useState<string | null>(null);
 
-  // --- ÉTATS LETTRE DE MOTIVATION ---
+  // ✅ Couleur PDF (rouge par défaut)
+  const [pdfBrand, setPdfBrand] = useState("#ef4444"); // 🔴 rouge
 
+  // --- ÉTATS LETTRE DE MOTIVATION ---
   const [lmLang, setLmLang] = useState<Lang>("fr");
   const [companyName, setCompanyName] = useState("");
   const [jobTitle, setJobTitle] = useState("");
@@ -5894,21 +7489,18 @@ export default function AssistanceCandidaturePage() {
   const [lmPdfError, setLmPdfError] = useState<string | null>(null);
 
   // --- ÉTATS PITCH ---
-
   const [pitchLang, setPitchLang] = useState<Lang>("fr");
   const [pitchText, setPitchText] = useState("");
   const [pitchLoading, setPitchLoading] = useState(false);
   const [pitchError, setPitchError] = useState<string | null>(null);
   const [pitchCopied, setPitchCopied] = useState(false);
 
-  // --- MAIL DE CANDIDATURE (objet + corps) ---
-
+  // --- MAIL ---
   const [recruiterName, setRecruiterName] = useState("");
   const [emailPreview, setEmailPreview] = useState("");
   const [subjectPreview, setSubjectPreview] = useState("");
 
-  // --- DERIVÉS POUR AFFICHAGE HEADER & BANDEAUX ---
-
+  // --- DERIVÉS ---
   const visibilityLabel = userId ? "Associé à ton compte" : "Invité";
 
   const miniHeadline =
@@ -5918,16 +7510,13 @@ export default function AssistanceCandidaturePage() {
 
   const profileName = profile?.fullName || userEmail || "Profil non détecté";
 
-  const targetedJob =
-    jobTitle || cvTargetJob || "Poste cible non renseigné";
+  const targetedJob = jobTitle || cvTargetJob || "Poste cible non renseigné";
   const targetedCompany = companyName || "Entreprise non renseignée";
 
-  // --- HELPER : création auto dans /applications ---
-
+  // --- Auto create /applications ---
   type GenerationKind = "cv" | "cv_lm" | "lm" | "pitch";
 
   const autoCreateApplication = async (kind: GenerationKind) => {
-    // Si la case n'est pas cochée -> on ne fait rien
     if (!cvAutoCreate) return;
     if (!userId || !profile) return;
 
@@ -5937,7 +7526,6 @@ export default function AssistanceCandidaturePage() {
         userId,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-        // Infos poste : on prend d'abord ce qui vient de l'étape LM, sinon Etape CV
         company: companyName || "",
         jobTitle: jobTitle || cvTargetJob || "",
         jobLink: jobLink || cvJobLink || "",
@@ -5952,188 +7540,188 @@ export default function AssistanceCandidaturePage() {
       });
     } catch (e) {
       console.error("Erreur création entrée suivi de candidature :", e);
-      // On ne bloque pas l’UX si le suivi plante
     }
   };
 
-  // --- ACTIONS CV ---
+  // =============================
+  // ✅ Génération IA (lettre / pitch)
+  // =============================
+
+  const generateCoverLetterText = async (lang: Lang): Promise<string> => {
+    if (!profile) throw new Error("Profil manquant.");
+    if (!jobTitle && !jobDescription) {
+      throw new Error("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
+    }
+
+    const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
+
+    // ✅ injection pour forcer une VRAIE lettre (expériences, outils, concret)
+    const enrichedJobDescription = buildJobDescWithInstructions({
+      jobDescription,
+      lang,
+      jobTitle,
+      companyName,
+      jobLink,
+      profile,
+    });
+
+    const resp = await fetch(LETTER_AND_PITCH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        profile,
+        jobTitle,
+        companyName,
+        jobDescription: enrichedJobDescription,
+        lang,
+        recaptchaToken,
+      }),
+    });
+
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const msg = (json && json.error) || "Erreur pendant la génération de la lettre de motivation.";
+      throw new Error(msg);
+    }
+
+    const coverLetter = typeof json.coverLetter === "string" ? json.coverLetter.trim() : "";
+    if (!coverLetter) throw new Error("Lettre vide renvoyée par l'API.");
+    return coverLetter;
+  };
+
+  // =============================
+  // ✅ PDF locaux (CV + LM)
+  // =============================
+
+  const colors = useMemo(() => makePdfColors(pdfBrand), [pdfBrand]);
 
   const handleGenerateCv = async () => {
     if (!profile) {
-      setCvError(
-        "Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF."
-      );
+      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
       return;
     }
 
     setCvError(null);
     setCvStatus(null);
     setCvLoading(true);
-    setGlobalLoadingMessage("L’IA prépare ton CV 1 page…");
+    setGlobalLoadingMessage("Mise en page du CV (1 page)…");
 
     try {
-      const res = await fetch(GENERATE_CV_API, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          profile,
-          targetJob: cvTargetJob,
-          template: cvTemplate,
-          lang: cvLang,
-          contract: cvContract,
-          jobLink: cvJobLink,
-          jobDescription: cvJobDesc,
-          autoCreate: cvAutoCreate,
-        }),
-      });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || "Erreur serveur lors de la génération du CV.");
+      if (cvTemplate !== "ats") {
+        setCvStatus("Note : génération locale disponible en ATS (sobre) pour le moment.");
       }
 
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "cv-ia.pdf";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url);
+      const cvModel: CvDocModel = profileToCvDocModel(profile, {
+        targetJob: cvTargetJob,
+        contract: cvContract,
+      });
 
-      setCvStatus("CV généré et téléchargé avec succès 🎉");
+      const { blob, bestScale } = await fitOnePage((scale) =>
+        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
+      );
 
-      // 👉 Création automatique dans /applications
+      downloadBlob(blob, "cv-ia.pdf");
+      setCvStatus(`CV généré (1 page) ✅ (scale=${bestScale.toFixed(2)})`);
+
       await autoCreateApplication("cv");
 
-      // 📣 LOG L'USAGE du CV (1 docType = "cv")
       if (auth.currentUser) {
         await logUsage({
           user: auth.currentUser,
           action: "generate_document",
           docType: "cv",
           eventType: "generate",
-          tool: "generateCvPdf",
-          // creditsDelta: -1, // à activer si tu gères les crédits ici
+          tool: "clientPdfMakeCv",
         });
       }
     } catch (err: any) {
-      console.error("Erreur génération CV:", err);
-      setCvError(
-        err?.message || "Impossible de générer le CV pour le moment."
-      );
+      console.error("Erreur génération CV locale:", err);
+      setCvError(err?.message || "Impossible de générer le CV pour le moment.");
     } finally {
       setCvLoading(false);
       setGlobalLoadingMessage(null);
     }
   };
 
-  const handleGenerateCvLmZip = async () => {
+  const handleGenerateCvLmPdf = async () => {
     if (!profile) {
-      setCvError(
-        "Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF."
-      );
+      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
       return;
     }
 
     setCvError(null);
     setCvStatus(null);
     setCvZipLoading(true);
-    setGlobalLoadingMessage("L’IA prépare ton CV + lettre de motivation…");
+    setGlobalLoadingMessage("Mise en page CV + lettre (1 page + 1 page)…");
 
     try {
-      const res = await fetch(GENERATE_CV_LM_ZIP_API, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          profile,
-          targetJob: cvTargetJob,
-          template: cvTemplate,
-          lang: cvLang,
-          contract: cvContract,
-          jobLink: cvJobLink,
-          jobDescription: cvJobDesc,
-          autoCreate: cvAutoCreate,
-          lm: {
-            companyName,
-            jobTitle,
-            jobDescription,
-            jobLink,
-            lang: lmLang,
-          },
-        }),
+      // 1) CV
+      const cvModel: CvDocModel = profileToCvDocModel(profile, {
+        targetJob: cvTargetJob,
+        contract: cvContract,
       });
 
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(
-          text || "Erreur serveur lors de la génération du ZIP CV + LM."
-        );
+      const cvFit = await fitOnePage((scale) =>
+        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
+      );
+
+      // 2) Lettre : si pas encore générée -> IA
+      let cover = letterText?.trim();
+      if (!cover) {
+        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
+        cover = await generateCoverLetterText(lmLang);
+        setLetterText(cover);
       }
 
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "cv-lm-ia.zip";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url);
+      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
 
-      setCvStatus("CV + LM générés et téléchargés dans un ZIP 🎉");
+      const lmFit = await fitOnePage(
+        (scale) => buildLmStyledPdf(lmModel, colors, scale),
+        { min: 0.85, max: 1.6, iterations: 7, initial: 1.0 }
+      );
 
-      // 👉 Création auto dans /applications (CV + LM)
+      // 3) Fusion -> 2 pages
+      const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
+      downloadBlob(merged, "cv-lm-ia.pdf");
+
+      setCvStatus("CV (1 page) + LM (1 page) générés ✅ (PDF 2 pages)");
       await autoCreateApplication("cv_lm");
 
-      // 📣 LOG L'USAGE du ZIP (CV + LM)
       if (auth.currentUser) {
-        // 1) côté stats CV
         await logUsage({
           user: auth.currentUser,
           action: "generate_document",
           docType: "cv",
-          eventType: "generate_zip",
-          tool: "generateCvLmZip",
+          eventType: "generate",
+          tool: "clientPdfMakeCvLm",
         });
-        // 2) côté stats LM (sans retoucher les crédits)
         await logUsage({
           user: auth.currentUser,
           action: "generate_document",
           docType: "lm",
-          eventType: "generate_zip",
-          tool: "generateCvLmZip",
+          eventType: "generate",
+          tool: "clientPdfMakeCvLm",
           creditsDelta: 0,
         });
       }
     } catch (err: any) {
-      console.error("Erreur génération ZIP CV + LM:", err);
-      setCvError(
-        err?.message ||
-          "Impossible de générer le ZIP CV + LM pour le moment."
-      );
+      console.error("Erreur génération CV+LM locale:", err);
+      setCvError(err?.message || "Impossible de générer CV + LM pour le moment.");
     } finally {
       setCvZipLoading(false);
       setGlobalLoadingMessage(null);
     }
   };
 
-  // --- ACTIONS LETTRE DE MOTIVATION ---
-
+  // --- ACTIONS LETTRE ---
   const handleGenerateLetter = async (e?: FormEvent) => {
     if (e) e.preventDefault();
     if (!profile) {
-      setLmError(
-        "Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF."
-      );
+      setLmError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
       return;
     }
-
     if (!jobTitle && !jobDescription) {
-      setLmError(
-        "Ajoute au moins l'intitulé du poste ou un extrait de la description."
-      );
+      setLmError("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
       return;
     }
 
@@ -6145,36 +7733,11 @@ export default function AssistanceCandidaturePage() {
     setGlobalLoadingMessage("L’IA rédige ta lettre de motivation…");
 
     try {
-      const resp = await fetch(LETTER_AND_PITCH_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          profile,
-          jobTitle,
-          companyName,
-          jobDescription,
-          lang: lmLang,
-        }),
-      });
-
-      const json = await resp.json().catch(() => null);
-
-      if (!resp.ok) {
-        const msg =
-          (json && json.error) ||
-          "Erreur pendant la génération de la lettre de motivation.";
-        throw new Error(msg);
-      }
-
-      const coverLetter =
-        typeof json.coverLetter === "string" ? json.coverLetter.trim() : "";
-
+      const coverLetter = await generateCoverLetterText(lmLang);
       setLetterText(coverLetter);
 
-      // 👉 Création auto dans /applications (LM seule)
       await autoCreateApplication("lm");
 
-      // 📣 LOG L'USAGE de la LM (génération texte)
       if (auth.currentUser) {
         await logUsage({
           user: auth.currentUser,
@@ -6186,73 +7749,57 @@ export default function AssistanceCandidaturePage() {
       }
     } catch (err: any) {
       console.error("Erreur generateLetter:", err);
-      setLmError(
-        err?.message ||
-          "Impossible de générer la lettre de motivation pour le moment."
-      );
+      setLmError(err?.message || "Impossible de générer la lettre de motivation pour le moment.");
     } finally {
       setLmLoading(false);
       setGlobalLoadingMessage(null);
     }
   };
 
+  // ✅ PDF LM local (auto-génère si texte vide)
   const handleDownloadLetterPdf = async () => {
-    if (!letterText) {
-      setLmPdfError(
-        "Génère d'abord la lettre, puis tu pourras la télécharger en PDF."
-      );
+    if (!profile) {
+      setLmPdfError("Profil manquant.");
+      return;
+    }
+    if (!jobTitle && !jobDescription && !letterText) {
+      setLmPdfError("Renseigne au moins le poste ou colle un extrait d’offre, puis génère/télécharge.");
       return;
     }
 
     setLmPdfError(null);
     setLmPdfLoading(true);
-    setGlobalLoadingMessage("L’IA met en forme ta lettre en PDF…");
+    setGlobalLoadingMessage("Mise en forme PDF (lettre 1 page)…");
 
     try {
-      const resp = await fetch(GENERATE_LM_PDF_API, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          coverLetter: letterText,
-          jobTitle,
-          companyName,
-          candidateName: profile?.fullName || "",
-          lang: lmLang,
-        }),
-      });
-
-      if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(
-          text || "Erreur serveur lors de la génération du PDF de la lettre."
-        );
+      let cover = letterText?.trim();
+      if (!cover) {
+        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
+        cover = await generateCoverLetterText(lmLang);
+        setLetterText(cover);
       }
 
-      const blob = await resp.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "lettre-motivation.pdf";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url);
+      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
 
-      // 📣 LOG L'USAGE du téléchargement PDF de la LM
+      const { blob } = await fitOnePage(
+        (scale) => buildLmStyledPdf(lmModel, colors, scale),
+        { min: 0.85, max: 1.6, iterations: 7, initial: 1.0 }
+      );
+
+      downloadBlob(blob, "lettre-motivation.pdf");
+
       if (auth.currentUser) {
         await logUsage({
           user: auth.currentUser,
           action: "download_pdf",
           docType: "other",
           eventType: "lm_pdf_download",
-          tool: "generateLetterPdf",
+          tool: "clientPdfMakeLm",
         });
       }
     } catch (err: any) {
-      console.error("Erreur téléchargement LM PDF:", err);
-      setLmPdfError(
-        err?.message || "Impossible de générer le PDF pour le moment."
-      );
+      console.error("Erreur LM PDF (local):", err);
+      setLmPdfError(err?.message || "Impossible de générer le PDF pour le moment.");
     } finally {
       setLmPdfLoading(false);
       setGlobalLoadingMessage(null);
@@ -6270,18 +7817,14 @@ export default function AssistanceCandidaturePage() {
     }
   };
 
-  // --- ACTIONS PITCH ---
-
+  // --- PITCH ---
   const handleGeneratePitch = async () => {
     if (!profile) {
-      setPitchError(
-        "Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF."
-      );
+      setPitchError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
       return;
     }
 
-    const effectiveJobTitle =
-      jobTitle || cvTargetJob || "Candidature cible";
+    const effectiveJobTitle = jobTitle || cvTargetJob || "Candidature cible";
     const effectiveDesc = jobDescription || cvJobDesc || "";
 
     setPitchError(null);
@@ -6290,6 +7833,8 @@ export default function AssistanceCandidaturePage() {
     setGlobalLoadingMessage("L’IA prépare ton pitch d’ascenseur…");
 
     try {
+      const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
+
       const resp = await fetch(LETTER_AND_PITCH_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -6299,31 +7844,23 @@ export default function AssistanceCandidaturePage() {
           companyName,
           jobDescription: effectiveDesc,
           lang: pitchLang,
+          recaptchaToken,
         }),
       });
 
       const json = await resp.json().catch(() => null);
 
       if (!resp.ok) {
-        const msg =
-          (json && json.error) ||
-          "Erreur pendant la génération du pitch.";
+        const msg = (json && json.error) || "Erreur pendant la génération du pitch.";
         throw new Error(msg);
       }
 
-      const pitch =
-        typeof json.pitch === "string" ? json.pitch.trim() : "";
-
-      if (!pitch) {
-        throw new Error("Pitch vide renvoyé par l'API.");
-      }
+      const pitch = typeof json.pitch === "string" ? json.pitch.trim() : "";
+      if (!pitch) throw new Error("Pitch vide renvoyé par l'API.");
 
       setPitchText(pitch);
-
-      // 👉 Création auto dans /applications (pitch)
       await autoCreateApplication("pitch");
 
-      // 📣 LOG L'USAGE du Pitch
       if (auth.currentUser) {
         await logUsage({
           user: auth.currentUser,
@@ -6335,9 +7872,7 @@ export default function AssistanceCandidaturePage() {
       }
     } catch (err: any) {
       console.error("Erreur generatePitch:", err);
-      setPitchError(
-        err?.message || "Impossible de générer le pitch pour le moment."
-      );
+      setPitchError(err?.message || "Impossible de générer le pitch pour le moment.");
     } finally {
       setPitchLoading(false);
       setGlobalLoadingMessage(null);
@@ -6355,19 +7890,17 @@ export default function AssistanceCandidaturePage() {
     }
   };
 
-  // --- ACTIONS MAIL DE CANDIDATURE ---
-
+  // --- MAIL ---
   const buildEmailContent = () => {
     const name = profile?.fullName || "Je";
     const subject = `Candidature – ${jobTitle || "poste"} – ${name}`;
-    const recruiter =
-      recruiterName.trim() || "Madame, Monsieur";
+    const recruiter = recruiterName.trim() || "Madame, Monsieur";
 
     const body = `Bonjour ${recruiter},
 
-Je me permets de vous adresser ma candidature pour le poste de ${
-      jobTitle || "..."
-    } au sein de ${companyName || "votre entreprise"}.
+Je me permets de vous adresser ma candidature pour le poste de ${jobTitle || "..."} au sein de ${
+      companyName || "votre entreprise"
+    }.
 
 Vous trouverez ci-joint mon CV ainsi que ma lettre de motivation.
 Mon profil correspond particulièrement à vos attentes sur ce poste, et je serais ravi(e) d'échanger avec vous pour en discuter de vive voix.
@@ -6389,7 +7922,6 @@ ${name}
   };
 
   // --- RENDER ---
-
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }}
@@ -6397,7 +7929,7 @@ ${name}
       transition={{ duration: 0.25 }}
       className="max-w-3xl mx-auto px-3 sm:px-4 py-5 sm:py-6 space-y-4"
     >
-      {/* Bandeau global de chargement IA */}
+      {/* Bandeau global IA */}
       {globalLoadingMessage && (
         <div className="mb-2 rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-1.5 text-[11px] flex items-center gap-2 text-[var(--muted)]">
           <span className="inline-flex w-3 h-3 rounded-full border-2 border-[var(--brand)] border-t-transparent animate-spin" />
@@ -6405,7 +7937,7 @@ ${name}
         </div>
       )}
 
-      {/* HEADER MOBILE-FIRST */}
+      {/* HEADER */}
       <section className="space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="badge-muted flex items-center gap-1.5">
@@ -6418,76 +7950,52 @@ ${name}
             <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
               Profil IA :{" "}
               <span className="ml-1 font-medium">
-                {loadingProfile
-                  ? "Chargement…"
-                  : profile
-                  ? "Détecté ✅"
-                  : "Non détecté"}
+                {loadingProfile ? "Chargement…" : profile ? "Détecté ✅" : "Non détecté"}
               </span>
             </span>
             <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
-              Visibilité :{" "}
-              <span className="ml-1 font-medium">{visibilityLabel}</span>
+              Visibilité : <span className="ml-1 font-medium">{visibilityLabel}</span>
             </span>
           </div>
         </div>
 
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="space-y-1">
-            <h1 className="text-lg sm:text-xl font-semibold">
-              Prépare ta candidature avec ton CV IA
-            </h1>
+            <h1 className="text-lg sm:text-xl font-semibold">Prépare ta candidature avec ton CV IA</h1>
             <p className="text-[12px] text-[var(--muted)] max-w-xl">
-              À partir de ton profil CV IA, génère un{" "}
-              <strong>CV 1 page</strong>, une{" "}
-              <strong>lettre de motivation personnalisée</strong>, un{" "}
-              <strong>pitch d&apos;ascenseur</strong> et un{" "}
-              <strong>mail de candidature</strong> prêts à être envoyés.
+              Génère un <strong>CV 1 page</strong>, une <strong>lettre de motivation</strong> (1 page), un{" "}
+              <strong>pitch</strong> et un <strong>mail</strong>.
             </p>
           </div>
 
-          {/* Mini résumé profil */}
           <div className="w-full sm:w-[220px] rounded-2xl border border-[var(--border)] bg-[var(--bg-soft)] px-3 py-2.5 text-[11px]">
             <p className="text-[var(--muted)] mb-1">Résumé du profil</p>
-            <p className="font-semibold text-[var(--ink)] leading-tight">
-              {profileName}
-            </p>
-            <p className="mt-0.5 text-[var(--muted)] line-clamp-2">
-              {miniHeadline}
-            </p>
+            <p className="font-semibold text-[var(--ink)] leading-tight">{profileName}</p>
+            <p className="mt-0.5 text-[var(--muted)] line-clamp-2">{miniHeadline}</p>
           </div>
         </div>
 
-        {/* 4 étapes */}
         <div className="flex flex-wrap gap-1.5 text-[11px]">
-          <span className="inline-flex items-center gap-1 rounded-full bg-[var(--bg-soft)] border border-[var(--border)] px-2 py-[3px]">
-            <span className="w-4 h-4 rounded-full bg-[var(--brand)]/10 flex items-center justify-center text-[10px] text-[var(--brand)]">
-              1
+          {[
+            "Cible le poste",
+            "Génère CV & LM",
+            "Prépare ton pitch",
+            "Génère ton mail",
+          ].map((t, i) => (
+            <span
+              key={i}
+              className="inline-flex items-center gap-1 rounded-full bg-[var(--bg-soft)] border border-[var(--border)] px-2 py-[3px]"
+            >
+              <span className="w-4 h-4 rounded-full bg-[var(--brand)]/10 flex items-center justify-center text-[10px] text-[var(--brand)]">
+                {i + 1}
+              </span>
+              <span>{t}</span>
             </span>
-            <span>Cible le poste (titre, entreprise, offre)</span>
-          </span>
-          <span className="inline-flex items-center gap-1 rounded-full bg-[var(--bg-soft)] border border-[var(--border)] px-2 py-[3px]">
-            <span className="w-4 h-4 rounded-full bg-[var(--brand)]/10 flex items-center justify-center text-[10px] text-[var(--brand)]">
-              2
-            </span>
-            <span>Génère CV 1 page &amp; LM</span>
-          </span>
-          <span className="inline-flex items-center gap-1 rounded-full bg-[var(--bg-soft)] border border-[var(--border)] px-2 py-[3px]">
-            <span className="w-4 h-4 rounded-full bg-[var(--brand)]/10 flex items-center justify-center text-[10px] text-[var(--brand)]">
-              3
-            </span>
-            <span>Finalise ton pitch pour l’entretien</span>
-          </span>
-          <span className="inline-flex items-center gap-1 rounded-full bg-[var(--bg-soft)] border border-[var(--border)] px-2 py-[3px]">
-            <span className="w-4 h-4 rounded-full bg-[var(--brand)]/10 flex items-center justify-center text-[10px] text-[var(--brand)]">
-              4
-            </span>
-            <span>Génère ton mail de candidature</span>
-          </span>
+          ))}
         </div>
       </section>
 
-      {/* ÉTAPE 1 : CV IA */}
+      {/* ÉTAPE 1 : CV */}
       <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-2">
@@ -6495,23 +8003,17 @@ ${name}
               Étape 1
             </span>
             <div>
-              <h2 className="text-base sm:text-lg font-semibold text-[var(--ink)]">
-                CV IA – 1 page A4
-              </h2>
+              <h2 className="text-base sm:text-lg font-semibold text-[var(--ink)]">CV IA – 1 page A4</h2>
               <p className="text-[11px] text-[var(--muted)]">
-                PDF compact, lisible par les ATS, généré à partir de ton
-                profil.
+                Génération locale (PDF) – rendu identique aux templates HTML.
               </p>
             </div>
           </div>
         </div>
 
-        {/* Inputs CV */}
         <div className="space-y-3 text-[13px]">
           <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-              Titre / objectif du CV
-            </label>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Titre / objectif du CV</label>
             <input
               id="cvTargetJob"
               type="text"
@@ -6524,16 +8026,14 @@ ${name}
 
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Modèle
-              </label>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Modèle</label>
               <select
                 id="cvTemplate"
                 className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
                 value={cvTemplate}
                 onChange={(e) => setCvTemplate(e.target.value)}
               >
-                <option value="ats">ATS (sobre)</option>
+                <option value="ats">ATS (sobre) ✅</option>
                 <option value="design">Design (CLOUD)</option>
                 <option value="magazine">Magazine</option>
                 <option value="classic">Classique</option>
@@ -6541,11 +8041,15 @@ ${name}
                 <option value="minimalist">Minimaliste</option>
                 <option value="academic">Académique</option>
               </select>
+              {cvTemplate !== "ats" && (
+                <p className="mt-1 text-[10px] text-[var(--muted)]">
+                  Génération locale disponible en <strong>ATS</strong> pour l’instant.
+                </p>
+              )}
             </div>
+
             <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Langue
-              </label>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Langue</label>
               <select
                 id="cvLang"
                 className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
@@ -6560,9 +8064,7 @@ ${name}
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Contrat visé
-              </label>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Contrat visé</label>
               <select
                 id="cvContract"
                 className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
@@ -6576,6 +8078,35 @@ ${name}
                 <option value="Freelance">Freelance</option>
               </select>
             </div>
+
+            {/* ✅ COULEUR PDF */}
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Couleur PDF (CV + LM)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="color"
+                  value={pdfBrand}
+                  onChange={(e) => setPdfBrand(e.target.value)}
+                  className="h-9 w-12 rounded-lg border border-[var(--border)] bg-[var(--bg-soft)]"
+                  aria-label="Couleur du PDF"
+                />
+                <input
+                  type="text"
+                  value={pdfBrand}
+                  onChange={(e) => setPdfBrand(e.target.value)}
+                  className="input flex-1 text-[var(--ink)] bg-[var(--bg)]"
+                  placeholder="#ef4444"
+                />
+              </div>
+              <p className="mt-1 text-[10px] text-[var(--muted)]">
+                Par défaut : <strong>rouge</strong> (#ef4444).
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
                 Lien de l&apos;offre (optionnel)
@@ -6589,20 +8120,20 @@ ${name}
                 onChange={(e) => setCvJobLink(e.target.value)}
               />
             </div>
-          </div>
 
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-              Extraits de l&apos;offre (optionnel)
-            </label>
-            <textarea
-              id="cvJD"
-              rows={3}
-              className="input textarea w-full text-[13px] text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-              placeholder="Colle quelques missions / outils / mots-clés de l’offre."
-              value={cvJobDesc}
-              onChange={(e) => setCvJobDesc(e.target.value)}
-            />
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Extraits de l&apos;offre (optionnel)
+              </label>
+              <textarea
+                id="cvJD"
+                rows={3}
+                className="input textarea w-full text-[13px] text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                placeholder="Colle quelques missions / outils / mots-clés de l’offre."
+                value={cvJobDesc}
+                onChange={(e) => setCvJobDesc(e.target.value)}
+              />
+            </div>
           </div>
 
           <div className="pt-1">
@@ -6615,8 +8146,7 @@ ${name}
                 onChange={(e) => setCvAutoCreate(e.target.checked)}
               />
               <span className="text-[var(--muted)]">
-                Créer automatiquement une entrée dans le{" "}
-                <strong>Suivi 📌</strong> à chaque génération (CV, LM, pitch).
+                Créer automatiquement une entrée dans le <strong>Suivi 📌</strong> à chaque génération.
               </span>
             </label>
           </div>
@@ -6630,69 +8160,42 @@ ${name}
             disabled={cvLoading || !profile}
             className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            <span>
-              {cvLoading ? "Génération du CV..." : "Générer le CV (PDF)"}
-            </span>
-            <div
-              id="cvBtnSpinner"
-              className={`loader absolute inset-0 m-auto ${
-                cvLoading ? "" : "hidden"
-              }`}
-            />
+            <span>{cvLoading ? "Génération du CV..." : "Générer le CV (PDF) — 1 page"}</span>
+            <div id="cvBtnSpinner" className={`loader absolute inset-0 m-auto ${cvLoading ? "" : "hidden"}`} />
           </button>
+
           <button
-            id="generateCvLmZipBtn"
+            id="generateCvLmPdfBtn"
             type="button"
-            onClick={handleGenerateCvLmZip}
+            onClick={handleGenerateCvLmPdf}
             disabled={cvZipLoading || !profile}
             className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            <span>
-              {cvZipLoading ? "Génération ZIP..." : "CV + LM (ZIP)"}
-            </span>
-            <div
-              id="cvLmZipBtnSpinner"
-              className={`loader absolute inset-0 m-auto ${
-                cvZipLoading ? "" : "hidden"
-              }`}
-            />
+            <span>{cvZipLoading ? "Génération PDF..." : "CV + LM (PDF) — 2 pages"}</span>
+            <div id="cvLmZipBtnSpinner" className={`loader absolute inset-0 m-auto ${cvZipLoading ? "" : "hidden"}`} />
           </button>
         </div>
 
         <div className="mt-2 p-2.5 rounded-md border border-dashed border-[var(--border)]/70 text-[11px] text-[var(--muted)]">
           {cvStatus ? (
-            <p className="text-center text-emerald-400 text-[12px]">
-              {cvStatus}
-            </p>
+            <p className="text-center text-emerald-400 text-[12px]">{cvStatus}</p>
           ) : (
             <p className="text-center">
-              Le CV est directement téléchargé en PDF. Ce bloc affiche le
-              résultat de la génération.
+              Génération locale : téléchargement direct (CV 1 page, ou CV+LM 2 pages).
             </p>
           )}
-          {cvError && (
-            <p className="mt-1 text-center text-red-400 text-[12px]">
-              {cvError}
-            </p>
-          )}
+          {cvError && <p className="mt-1 text-center text-red-400 text-[12px]">{cvError}</p>}
         </div>
       </section>
 
-      {/* ÉTAPE 2 : LETTRE DE MOTIVATION */}
+      {/* ÉTAPE 2 : LM */}
       <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        {/* Bandeau rappel du poste ciblé */}
         <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
           <span>
-            🎯 Poste ciblé :{" "}
-            <span className="font-medium text-[var(--ink)]">
-              {targetedJob}
-            </span>
+            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
           </span>
           <span>
-            🏢{" "}
-            <span className="font-medium text-[var(--ink)]">
-              {targetedCompany}
-            </span>
+            🏢 <span className="font-medium text-[var(--ink)]">{targetedCompany}</span>
           </span>
         </div>
 
@@ -6703,12 +8206,9 @@ ${name}
                 Étape 2
               </span>
               <div>
-                <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">
-                  Lettre de motivation IA
-                </h3>
+                <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Lettre de motivation IA</h3>
                 <p className="text-[11px] text-[var(--muted)]">
-                  Génère un texte personnalisé à partir de ton profil et de
-                  l&apos;offre, puis exporte-le en PDF.
+                  La lettre est générée en s’appuyant sur <strong>tes expériences</strong> (et outils), puis exportée en PDF (1 page).
                 </p>
               </div>
             </div>
@@ -6726,9 +8226,7 @@ ${name}
           <div className="space-y-3 text-[13px]">
             <div className="grid sm:grid-cols-2 gap-3">
               <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                  Nom de l&apos;entreprise
-                </label>
+                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
                 <input
                   id="companyName"
                   type="text"
@@ -6739,9 +8237,7 @@ ${name}
                 />
               </div>
               <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                  Intitulé du poste
-                </label>
+                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
                 <input
                   id="jobTitle"
                   type="text"
@@ -6754,9 +8250,7 @@ ${name}
             </div>
 
             <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Extraits de l&apos;offre (optionnel)
-              </label>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Extraits de l&apos;offre (optionnel)</label>
               <textarea
                 id="jobDescription"
                 rows={3}
@@ -6768,9 +8262,7 @@ ${name}
             </div>
 
             <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Lien de l&apos;offre (optionnel)
-              </label>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Lien de l&apos;offre (optionnel)</label>
               <input
                 id="jobLink"
                 type="url"
@@ -6781,9 +8273,7 @@ ${name}
               />
             </div>
 
-            {lmError && (
-              <p className="text-[11px] text-red-400">{lmError}</p>
-            )}
+            {lmError && <p className="text-[11px] text-red-400">{lmError}</p>}
 
             <div className="flex flex-col sm:flex-row gap-2 pt-1">
               <button
@@ -6792,36 +8282,19 @@ ${name}
                 disabled={lmLoading || !profile}
                 className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <span>
-                  {lmLoading
-                    ? "Génération de la LM..."
-                    : "Générer la lettre"}
-                </span>
-                <div
-                  id="lmBtnSpinner"
-                  className={`loader absolute inset-0 m-auto ${
-                    lmLoading ? "" : "hidden"
-                  }`}
-                />
+                <span>{lmLoading ? "Génération de la LM..." : "Générer la lettre"}</span>
+                <div id="lmBtnSpinner" className={`loader absolute inset-0 m-auto ${lmLoading ? "" : "hidden"}`} />
               </button>
 
               <button
                 id="downloadLetterPdfBtn"
                 type="button"
                 onClick={handleDownloadLetterPdf}
-                disabled={!letterText || lmPdfLoading}
+                disabled={lmPdfLoading || !profile}
                 className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <span>
-                  {lmPdfLoading
-                    ? "Création du PDF..."
-                    : "Télécharger en PDF"}
-                </span>
-                <div
-                  className={`loader absolute inset-0 m-auto ${
-                    lmPdfLoading ? "" : "hidden"
-                  }`}
-                />
+                <span>{lmPdfLoading ? "Création du PDF..." : "Télécharger en PDF (1 page)"}</span>
+                <div className={`loader absolute inset-0 m-auto ${lmPdfLoading ? "" : "hidden"}`} />
               </button>
             </div>
 
@@ -6833,15 +8306,11 @@ ${name}
                 disabled={!letterText}
                 className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <span>
-                  {letterCopied ? "Texte copié ✅" : "Copier le texte"}
-                </span>
+                <span>{letterCopied ? "Texte copié ✅" : "Copier le texte"}</span>
               </button>
             </div>
 
-            {lmPdfError && (
-              <p className="text-[11px] text-red-400">{lmPdfError}</p>
-            )}
+            {lmPdfError && <p className="text-[11px] text-red-400">{lmPdfError}</p>}
           </div>
         </form>
 
@@ -6853,9 +8322,7 @@ ${name}
             {letterText ? (
               <p>{letterText}</p>
             ) : (
-              <p className="text-center text-[var(--muted)]">
-                Lance une génération pour voir ici le texte de la LM IA.
-              </p>
+              <p className="text-center text-[var(--muted)]">Lance une génération pour voir ici le texte de la LM IA.</p>
             )}
           </div>
         </div>
@@ -6863,13 +8330,9 @@ ${name}
 
       {/* ÉTAPE 3 : PITCH */}
       <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3">
-        {/* Bandeau rappel du poste ciblé */}
         <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
           <span>
-            🎯 Poste ciblé :{" "}
-            <span className="font-medium text-[var(--ink)]">
-              {targetedJob}
-            </span>
+            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
           </span>
           <span>🧩 Utilise ce pitch pour mails, LinkedIn et entretiens.</span>
         </div>
@@ -6880,12 +8343,9 @@ ${name}
               Étape 3
             </span>
             <div>
-              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">
-                Pitch d&apos;ascenseur
-              </h3>
+              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Pitch d&apos;ascenseur</h3>
               <p className="text-[11px] text-[var(--muted)]">
-                Résumé percutant de 2–4 phrases pour te présenter en 30–40
-                secondes.
+                Résumé percutant de 2–4 phrases pour te présenter en 30–40 secondes.
               </p>
             </div>
           </div>
@@ -6900,9 +8360,7 @@ ${name}
           </select>
         </div>
 
-        {pitchError && (
-          <p className="text-[11px] text-red-400">{pitchError}</p>
-        )}
+        {pitchError && <p className="text-[11px] text-red-400">{pitchError}</p>}
 
         <div className="flex flex-col sm:flex-row gap-2 pt-1">
           <button
@@ -6912,17 +8370,8 @@ ${name}
             disabled={pitchLoading || !profile}
             className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            <span>
-              {pitchLoading
-                ? "Génération du pitch..."
-                : "Générer le pitch"}
-            </span>
-            <div
-              id="pitchBtnSpinner"
-              className={`loader absolute inset-0 m-auto ${
-                pitchLoading ? "" : "hidden"
-              }`}
-            />
+            <span>{pitchLoading ? "Génération du pitch..." : "Générer le pitch"}</span>
+            <div id="pitchBtnSpinner" className={`loader absolute inset-0 m-auto ${pitchLoading ? "" : "hidden"}`} />
           </button>
           <button
             id="copyPitchBtn"
@@ -6931,9 +8380,7 @@ ${name}
             disabled={!pitchText}
             className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            <span>
-              {pitchCopied ? "Pitch copié ✅" : "Copier le pitch"}
-            </span>
+            <span>{pitchCopied ? "Pitch copié ✅" : "Copier le pitch"}</span>
           </button>
         </div>
 
@@ -6942,14 +8389,13 @@ ${name}
             <p>{pitchText}</p>
           ) : (
             <p className="text-center text-[11px] text-[var(--muted)]">
-              Après génération, ton pitch apparaîtra ici. Tu pourras ensuite le
-              réutiliser dans tes mails, sur LinkedIn ou en entretien.
+              Après génération, ton pitch apparaîtra ici.
             </p>
           )}
         </div>
       </section>
 
-      {/* ÉTAPE 4 : MAIL DE CANDIDATURE */}
+      {/* ÉTAPE 4 : MAIL */}
       <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-2">
@@ -6957,27 +8403,17 @@ ${name}
               Étape 4
             </span>
             <div>
-              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">
-                Mail de candidature prêt à envoyer
-              </h3>
+              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Mail de candidature</h3>
               <p className="text-[11px] text-[var(--muted)] max-w-xl">
-                Utilise les mêmes informations que ta lettre (entreprise, poste)
-                pour générer un <strong>objet</strong> et un{" "}
-                <strong>corps de mail</strong> à copier dans ton client mail ou
-                sur un jobboard.
+                Génère un <strong>objet</strong> et un <strong>corps de mail</strong> à copier.
               </p>
             </div>
           </div>
         </div>
 
-        <form
-          onSubmit={handleGenerateEmail}
-          className="grid md:grid-cols-2 gap-4 text-sm mt-1"
-        >
+        <form onSubmit={handleGenerateEmail} className="grid md:grid-cols-2 gap-4 text-sm mt-1">
           <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-              Nom de l&apos;entreprise
-            </label>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
             <input
               className="input w-full"
               value={companyName}
@@ -6986,9 +8422,7 @@ ${name}
             />
           </div>
           <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-              Intitulé du poste
-            </label>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
             <input
               className="input w-full"
               value={jobTitle}
@@ -6997,9 +8431,7 @@ ${name}
             />
           </div>
           <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-              Nom du recruteur (optionnel)
-            </label>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom du recruteur (optionnel)</label>
             <input
               className="input w-full"
               value={recruiterName}
@@ -7008,10 +8440,7 @@ ${name}
             />
           </div>
           <div className="md:col-span-2 flex justify-end">
-            <button
-              type="submit"
-              className="btn-primary min-w-[200px]"
-            >
+            <button type="submit" className="btn-primary min-w-[200px]">
               Générer le mail
             </button>
           </div>
@@ -7025,20 +8454,15 @@ ${name}
             </div>
           </div>
           <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
-            <h4 className="font-semibold text-sm mb-2">
-              Corps du mail
-            </h4>
+            <h4 className="font-semibold text-sm mb-2">Corps du mail</h4>
             <div className="text-xs text-[var(--muted)] whitespace-pre-line max-h-64 overflow-auto">
-              {emailPreview ||
-                "Le texte du mail apparaîtra ici après génération."}
+              {emailPreview || "Le texte du mail apparaîtra ici après génération."}
             </div>
           </div>
         </div>
 
         <p className="text-[10px] text-[var(--muted)] mt-3">
-          📌 Copie-colle l&apos;objet et le texte dans ton client mail ou dans
-          un formulaire &quot;Postuler&quot;, puis joins le CV et la lettre
-          PDF générés dans les étapes précédentes.
+          📌 Copie-colle l&apos;objet et le texte, puis joins le CV et la lettre PDF.
         </p>
       </section>
     </motion.div>
@@ -14187,6 +15611,7 @@ body {
 // app/layout.tsx
 import "./globals.css";
 import type { Metadata, Viewport } from "next";
+import Script from "next/script";
 import { AuthProvider } from "@/context/AuthContext";
 import ActivityTracker from "@/components/ActivityTracker";
 
@@ -14207,6 +15632,22 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
+  const siteKey = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY || "";
+  const useEnterprise =
+    (process.env.NEXT_PUBLIC_RECAPTCHA_ENTERPRISE || "")
+      .toLowerCase()
+      .trim() === "true";
+
+  const recaptchaSrc = siteKey
+    ? useEnterprise
+      ? `https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(
+          siteKey
+        )}`
+      : `https://www.google.com/recaptcha/api.js?render=${encodeURIComponent(
+          siteKey
+        )}`
+    : "";
+
   return (
     <html lang="fr">
       <head>
@@ -14219,6 +15660,7 @@ export default function RootLayout({
           content="black-translucent"
         />
       </head>
+
       <body
         className="
           min-h-screen
@@ -14228,6 +15670,15 @@ export default function RootLayout({
           antialiased
         "
       >
+        {/* ✅ Charge reCAPTCHA v3 (standard ou enterprise selon env) */}
+        {siteKey ? (
+          <Script
+            src={recaptchaSrc}
+            strategy="afterInteractive"
+            data-recaptcha={useEnterprise ? "enterprise" : "v3"}
+          />
+        ) : null}
+
         <AuthProvider>
           <ActivityTracker />
           <div className="min-h-screen flex flex-col">{children}</div>
@@ -14286,10 +15737,9 @@ const fadeUp = (delay = 0) => ({
   initial: { opacity: 0, y: 20 },
   whileInView: { opacity: 1, y: 0 },
   transition: { duration: 0.4, delay },
-  viewport: { once: false, amount: 0.4 }, // rejoue quand on remonte
+  viewport: { once: false, amount: 0.4 },
 });
 
-// ordre des sections pour le menu
 const SECTION_IDS: string[] = ["hero", "features", "how", "pricing", "stack", "faq"];
 
 export default function LandingPage() {
@@ -14299,9 +15749,9 @@ export default function LandingPage() {
 
   // 🔐 état d'auth Firebase
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [navigating, setNavigating] = useState(false);
   const router = useRouter();
 
-  // on écoute l'état Firebase pour savoir si la personne est connectée
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
       setCurrentUser(user);
@@ -14309,30 +15759,33 @@ export default function LandingPage() {
     return () => unsub();
   }, []);
 
-  // 👉 fonction intelligente pour tous les boutons "Se connecter"
+  /**
+   * ✅ Debug reCAPTCHA (facultatif)
+   * Si tu as bien mis le Script enterprise.js dans app/layout.tsx,
+   * tu dois voir window.grecaptcha après quelques ms.
+   */
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      const g = (window as any).grecaptcha;
+      // console.log("[recaptcha] loaded?", !!g, "enterprise?", !!g?.enterprise);
+    }, 1200);
+    return () => window.clearTimeout(t);
+  }, []);
+
   const handleSmartLoginClick = () => {
-    if (currentUser) {
-      // déjà connecté → on envoie direct au dashboard
-      router.push("/app");
-    } else {
-      // pas connecté → page de login normale
-      router.push("/login");
-    }
+    if (navigating) return;
+    setNavigating(true);
+    if (currentUser) router.push("/app");
+    else router.push("/login");
   };
 
   const handleScroll = (e: UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
     const maxScroll = el.scrollHeight - el.clientHeight;
 
-    // Progress bar (desktop)
-    if (maxScroll <= 0) {
-      setProgress(0);
-    } else {
-      const ratio = (el.scrollTop / maxScroll) * 100;
-      setProgress(ratio);
-    }
+    if (maxScroll <= 0) setProgress(0);
+    else setProgress((el.scrollTop / maxScroll) * 100);
 
-    // Déterminer la section la plus proche du haut du container
     const containerRect = el.getBoundingClientRect();
     let closestId: string = activeSection;
     let minDelta = Infinity;
@@ -14348,9 +15801,7 @@ export default function LandingPage() {
       }
     });
 
-    if (closestId !== activeSection) {
-      setActiveSection(closestId);
-    }
+    if (closestId !== activeSection) setActiveSection(closestId);
   };
 
   const baseNavLink =
@@ -14360,9 +15811,7 @@ export default function LandingPage() {
     (id: string) => (e: React.MouseEvent<HTMLAnchorElement>) => {
       e.preventDefault();
       const sec = document.getElementById(id);
-      if (sec) {
-        sec.scrollIntoView({ behavior: "smooth", block: "start" });
-      }
+      if (sec) sec.scrollIntoView({ behavior: "smooth", block: "start" });
     };
 
   return (
@@ -14477,14 +15926,15 @@ export default function LandingPage() {
           </nav>
 
           <div className="flex items-center gap-2">
-            {/* bouton intelligent : login ou dashboard */}
             <button
               type="button"
               onClick={handleSmartLoginClick}
-              className="hidden sm:inline-flex text-[11px] text-[var(--muted)] hover:text-[var(--ink)]"
+              disabled={navigating}
+              className="hidden sm:inline-flex text-[11px] text-[var(--muted)] hover:text-[var(--ink)] disabled:opacity-50"
             >
               Se connecter
             </button>
+
             <Link
               href="/signup"
               className="inline-flex items-center justify-center text-[11px] sm:text-xs px-3 sm:px-4 py-1.5 rounded-full bg-[var(--brand)] hover:bg-[var(--brandDark)] text-white shadow-lg shadow-[var(--brand)]/40 transition-colors"
@@ -14495,9 +15945,9 @@ export default function LandingPage() {
         </div>
       </header>
 
-      {/* CONTENU SCROLL-SNAP (desktop) / scroll normal (mobile) */}
+      {/* CONTENU */}
       <div className="flex-1 pt-14">
-        {/* Barre de progression uniquement sur desktop */}
+        {/* Barre de progression */}
         <div className="hidden md:block h-[2px] w-full bg-[var(--border)]/40 sticky top-14 z-30">
           <div
             className="scroll-progress-bar h-full bg-[var(--brand)] transition-[width] duration-150"
@@ -14505,7 +15955,6 @@ export default function LandingPage() {
           />
         </div>
 
-        {/* Container qui scroll + snap seulement à partir de md */}
         <main
           ref={scrollRef}
           onScroll={handleScroll}
@@ -14529,48 +15978,38 @@ export default function LandingPage() {
                   </span>
                   <span className="text-[11px] text-[var(--muted)]">
                     Gagne jusqu&apos;à{" "}
-                    <span className="text-[var(--ink)] font-medium">
-                      4h par semaine
-                    </span>{" "}
+                    <span className="text-[var(--ink)] font-medium">4h par semaine</span>{" "}
                     sur tes candidatures.
                   </span>
                 </div>
 
                 <h1 className="text-[1.9rem] sm:text-3xl md:text-[2.6rem] font-semibold leading-tight mb-3">
                   L&apos;assistant IA pour candidater comme un pro,
-                  <span className="text-[var(--brand)]">
-                    {" "}
-                    sans y passer tes soirées.
-                  </span>
+                  <span className="text-[var(--brand)]"> sans y passer tes soirées.</span>
                 </h1>
 
                 <p className="text-sm sm:text-base text-[var(--muted)] max-w-xl mb-5">
-                  Importe ton CV, colle une offre d’emploi, laisse l’IA générer
-                  une lettre de motivation ciblée, un pitch oral et suis toutes
-                  tes candidatures depuis un tableau de bord unique.
+                  Importe ton CV, colle une offre d’emploi, laisse l’IA générer une lettre de motivation
+                  ciblée, un pitch oral et suis toutes tes candidatures depuis un tableau de bord unique.
                 </p>
 
                 <div className="flex flex-wrap items-center gap-3 mb-4">
-                  <Link
-                    href="/signup"
-                    className="btn-primary text-xs sm:text-sm"
-                  >
+                  <Link href="/signup" className="btn-primary text-xs sm:text-sm">
                     Essayer gratuitement
                   </Link>
 
-                  {/* bouton intelligent ici aussi */}
                   <button
                     type="button"
                     onClick={handleSmartLoginClick}
-                    className="btn-secondary text-xs sm:text-sm"
+                    disabled={navigating}
+                    className="btn-secondary text-xs sm:text-sm disabled:opacity-50"
                   >
                     Se connecter
                   </button>
                 </div>
 
                 <p className="text-[11px] text-[var(--muted)]">
-                  Aucun CB requise • Crédits offerts à l’inscription • Pensé
-                  pour les profils tech & cybersécurité
+                  Aucun CB requise • Crédits offerts à l’inscription • Pensé pour les profils tech & cybersécurité
                 </p>
               </motion.div>
 
@@ -14592,31 +16031,19 @@ export default function LandingPage() {
 
                   <div className="grid gap-2 sm:grid-cols-3 mb-3">
                     <div className="rounded-xl bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-2">
-                      <p className="text-[10px] text-[var(--muted)] mb-1">
-                        Crédits restants
-                      </p>
+                      <p className="text-[10px] text-[var(--muted)] mb-1">Crédits restants</p>
                       <p className="text-lg font-semibold">124</p>
-                      <p className="text-[10px] text-[var(--muted)]">
-                        ~ 30 lettres + 15 pitchs
-                      </p>
+                      <p className="text-[10px] text-[var(--muted)]">~ 30 lettres + 15 pitchs</p>
                     </div>
                     <div className="rounded-xl bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-2">
-                      <p className="text-[10px] text-[var(--muted)] mb-1">
-                        Candidatures envoyées
-                      </p>
+                      <p className="text-[10px] text-[var(--muted)] mb-1">Candidatures envoyées</p>
                       <p className="text-lg font-semibold">18</p>
-                      <p className="text-[10px] text-[var(--muted)]">
-                        5 en entretien 🔥
-                      </p>
+                      <p className="text-[10px] text-[var(--muted)]">5 en entretien 🔥</p>
                     </div>
                     <div className="rounded-xl bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-2">
-                      <p className="text-[10px] text-[var(--muted)] mb-1">
-                        Temps économisé
-                      </p>
+                      <p className="text-[10px] text-[var(--muted)] mb-1">Temps économisé</p>
                       <p className="text-lg font-semibold">7h / semaine</p>
-                      <p className="text-[10px] text-[var(--muted)]">
-                        vs candidatures manuelles
-                      </p>
+                      <p className="text-[10px] text-[var(--muted)]">vs candidatures manuelles</p>
                     </div>
                   </div>
 
@@ -14625,9 +16052,7 @@ export default function LandingPage() {
                       <span>Offre · Ingénieur cybersécurité</span>
                       <span>
                         Match profil :{" "}
-                        <span className="text-emerald-300 font-semibold">
-                          92%
-                        </span>
+                        <span className="text-emerald-300 font-semibold">92%</span>
                       </span>
                     </div>
                     <div className="h-1.5 w-full rounded-full bg-[var(--bg-soft)] overflow-hidden">
@@ -14705,16 +16130,14 @@ export default function LandingPage() {
                     className="glass p-4 border border-[var(--border)]/80 hover:border-[var(--brand)]/60 transition-colors"
                   >
                     <h3 className="text-sm font-semibold mb-1">{f.title}</h3>
-                    <p className="text-[11px] sm:text-xs text-[var(--muted)]">
-                      {f.desc}
-                    </p>
+                    <p className="text-[11px] sm:text-xs text-[var(--muted)]">{f.desc}</p>
                   </motion.div>
                 ))}
               </div>
             </div>
           </section>
 
-          {/* HOW IT WORKS */}
+          {/* HOW */}
           <section
             id="how"
             className="md:snap-start md:min-h-[calc(100vh-3.5rem-2px)] flex items-center px-4 sm:px-8 py-10 md:py-0"
@@ -14728,8 +16151,7 @@ export default function LandingPage() {
                   3 étapes pour transformer ton process de candidature.
                 </h2>
                 <p className="text-sm text-[var(--muted)] max-w-xl mb-4">
-                  L’objectif : que tu passes moins de temps à lutter avec tes
-                  lettres, et plus de temps à préparer tes entretiens.
+                  L’objectif : que tu passes moins de temps à lutter avec tes lettres, et plus de temps à préparer tes entretiens.
                 </p>
 
                 <ol className="space-y-3 text-sm">
@@ -14738,12 +16160,9 @@ export default function LandingPage() {
                       1
                     </span>
                     <div>
-                      <p className="font-medium mb-1">
-                        Tu importes ton CV & les offres
-                      </p>
+                      <p className="font-medium mb-1">Tu importes ton CV & les offres</p>
                       <p className="text-[12px] text-[var(--muted)]">
-                        PDF de ton CV, lien d’offre ou texte copié/collé : tout
-                        part de ton vrai parcours.
+                        PDF de ton CV, lien d’offre ou texte copié/collé : tout part de ton vrai parcours.
                       </p>
                     </div>
                   </li>
@@ -14752,12 +16171,9 @@ export default function LandingPage() {
                       2
                     </span>
                     <div>
-                      <p className="font-medium mb-1">
-                        L’IA génère lettres, pitchs & matchs
-                      </p>
+                      <p className="font-medium mb-1">L’IA génère lettres, pitchs & matchs</p>
                       <p className="text-[12px] text-[var(--muted)]">
-                        Tu valides, ajustes, c’est toi qui garde le contrôle du
-                        ton et des infos.
+                        Tu valides, ajustes, c’est toi qui garde le contrôle du ton et des infos.
                       </p>
                     </div>
                   </li>
@@ -14766,46 +16182,28 @@ export default function LandingPage() {
                       3
                     </span>
                     <div>
-                      <p className="font-medium mb-1">
-                        Tu suis tout depuis le dashboard
-                      </p>
+                      <p className="font-medium mb-1">Tu suis tout depuis le dashboard</p>
                       <p className="text-[12px] text-[var(--muted)]">
-                        Tableau de bord, statut des candidatures, relances,
-                        historique : tout est centralisé.
+                        Tableau de bord, statut des candidatures, relances, historique : tout est centralisé.
                       </p>
                     </div>
                   </li>
                 </ol>
               </motion.div>
 
-              <motion.div
-                {...fadeUp(0.1)}
-                className="glass p-4 border border-[var(--border)]/80"
-              >
+              <motion.div {...fadeUp(0.1)} className="glass p-4 border border-[var(--border)]/80">
                 <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-2">
                   Pour qui ?
                 </p>
                 <ul className="space-y-2 text-[12px] text-[var(--muted)]">
-                  <li>
-                    • Étudiants & juniors qui veulent des candidatures propres
-                    sans y passer leurs nuits.
-                  </li>
-                  <li>
-                    • Profils tech / cybersécurité qui veulent aller droit au
-                    but avec un ton pro.
-                  </li>
-                  <li>
-                    • Pros en reconversion ou en veille qui envoient plusieurs
-                    candidatures par semaine.
-                  </li>
+                  <li>• Étudiants & juniors qui veulent des candidatures propres sans y passer leurs nuits.</li>
+                  <li>• Profils tech / cybersécurité qui veulent aller droit au but avec un ton pro.</li>
+                  <li>• Pros en reconversion ou en veille qui envoient plusieurs candidatures par semaine.</li>
                 </ul>
                 <div className="mt-4 border-t border-[var(--border)]/70 pt-3 text-[11px]">
-                  <p className="text-[var(--muted)] mb-1">
-                    Tu n’es pas obligé de tout automatiser.
-                  </p>
+                  <p className="text-[var(--muted)] mb-1">Tu n’es pas obligé de tout automatiser.</p>
                   <p>
-                    Utilise l’IA comme un accélérateur : tu gardes le contrôle,
-                    l’assistant fait le gros du texte.
+                    Utilise l’IA comme un accélérateur : tu gardes le contrôle, l’assistant fait le gros du texte.
                   </p>
                 </div>
               </motion.div>
@@ -14818,37 +16216,19 @@ export default function LandingPage() {
             className="md:snap-start md:min-h-[calc(100vh-3.5rem-2px)] flex items-center px-4 sm:px-8 py-10 md:py-0"
           >
             <div className="max-w-6xl mx-auto w-full">
-              <motion.div
-                {...fadeUp(0)}
-                className="text-center mb-8 max-w-2xl mx-auto"
-              >
-                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">
-                  Tarifs
-                </p>
-                <h2 className="text-lg sm:text-xl font-semibold mb-2">
-                  Des crédits simples, adaptés à ton rythme.
-                </h2>
+              <motion.div {...fadeUp(0)} className="text-center mb-8 max-w-2xl mx-auto">
+                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">Tarifs</p>
+                <h2 className="text-lg sm:text-xl font-semibold mb-2">Des crédits simples, adaptés à ton rythme.</h2>
                 <p className="text-sm text-[var(--muted)]">
-                  Commence avec les crédits gratuits. Tu ne paies que si l’outil
-                  t’aide vraiment.
+                  Commence avec les crédits gratuits. Tu ne paies que si l’outil t’aide vraiment.
                 </p>
               </motion.div>
 
               <div className="grid gap-4 md:grid-cols-3">
-                {/* Gratuit */}
-                <motion.div
-                  {...fadeUp(0.05)}
-                  className="glass p-4 border border-[var(--border)]/90"
-                >
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-                    Découverte
-                  </p>
-                  <h3 className="text-sm font-semibold mb-1">
-                    Gratuit • Pour tester
-                  </h3>
-                  <p className="text-[12px] text-[var(--muted)] mb-3">
-                    Idéal pour voir si le flow te convient.
-                  </p>
+                <motion.div {...fadeUp(0.05)} className="glass p-4 border border-[var(--border)]/90">
+                  <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">Découverte</p>
+                  <h3 className="text-sm font-semibold mb-1">Gratuit • Pour tester</h3>
+                  <p className="text-[12px] text-[var(--muted)] mb-3">Idéal pour voir si le flow te convient.</p>
                   <p className="text-2xl font-semibold mb-3">0 €</p>
                   <ul className="text-[11px] text-[var(--muted)] space-y-1.5 mb-4">
                     <li>• X crédits offerts à l’inscription</li>
@@ -14856,35 +16236,22 @@ export default function LandingPage() {
                     <li>• 1 pitch d’entretien</li>
                     <li>• Accès au tracker de candidatures</li>
                   </ul>
-                  <Link
-                    href="/signup"
-                    className="btn-secondary w-full text-center text-xs"
-                  >
+                  <Link href="/signup" className="btn-secondary w-full text-center text-xs">
                     Commencer gratuitement
                   </Link>
                 </motion.div>
 
-                {/* Standard */}
                 <motion.div
                   {...fadeUp(0.1)}
                   className="glass p-4 border border-[var(--brand)]/80 relative overflow-hidden"
                 >
                   <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(88,166,255,0.12),_transparent_55%)] pointer-events-none" />
                   <div className="relative">
-                    <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-                      Plus populaire
-                    </p>
-                    <h3 className="text-sm font-semibold mb-1">
-                      Campagne ciblée
-                    </h3>
-                    <p className="text-[12px] text-[var(--muted)] mb-3">
-                      Pour une vraie recherche active de poste.
-                    </p>
+                    <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">Plus populaire</p>
+                    <h3 className="text-sm font-semibold mb-1">Campagne ciblée</h3>
+                    <p className="text-[12px] text-[var(--muted)] mb-3">Pour une vraie recherche active de poste.</p>
                     <p className="text-2xl font-semibold mb-3">
-                      19 €{" "}
-                      <span className="text-[11px] text-[var(--muted)]">
-                        / une fois
-                      </span>
+                      19 € <span className="text-[11px] text-[var(--muted)]">/ une fois</span>
                     </p>
                     <ul className="text-[11px] text-[var(--muted)] space-y-1.5 mb-4">
                       <li>• Crédits pour ~25 lettres</li>
@@ -14892,34 +16259,18 @@ export default function LandingPage() {
                       <li>• Suivi avancé des candidatures</li>
                       <li>• Priorité sur les améliorations de templates</li>
                     </ul>
-                    <Link
-                      href="/app/credits"
-                      className="btn-primary w-full text-center text-xs"
-                    >
+                    <Link href="/app/credits" className="btn-primary w-full text-center text-xs">
                       Acheter des crédits
                     </Link>
                   </div>
                 </motion.div>
 
-                {/* Power user */}
-                <motion.div
-                  {...fadeUp(0.15)}
-                  className="glass p-4 border border-[var(--border)]/90"
-                >
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-                    Intensif
-                  </p>
-                  <h3 className="text-sm font-semibold mb-1">
-                    Pro / reconversion
-                  </h3>
-                  <p className="text-[12px] text-[var(--muted)] mb-3">
-                    Pour les périodes de candidatures massives.
-                  </p>
+                <motion.div {...fadeUp(0.15)} className="glass p-4 border border-[var(--border)]/90">
+                  <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">Intensif</p>
+                  <h3 className="text-sm font-semibold mb-1">Pro / reconversion</h3>
+                  <p className="text-[12px] text-[var(--muted)] mb-3">Pour les périodes de candidatures massives.</p>
                   <p className="text-2xl font-semibold mb-3">
-                    39 €{" "}
-                    <span className="text-[11px] text-[var(--muted)]">
-                      / une fois
-                    </span>
+                    39 € <span className="text-[11px] text-[var(--muted)]">/ une fois</span>
                   </p>
                   <ul className="text-[11px] text-[var(--muted)] space-y-1.5 mb-4">
                     <li>• Crédits pour ~60 lettres</li>
@@ -14927,10 +16278,7 @@ export default function LandingPage() {
                     <li>• Support prioritaire</li>
                     <li>• Idéal pour changer de pays / secteur</li>
                   </ul>
-                  <Link
-                    href="/app/credits"
-                    className="btn-secondary w-full text-center text-xs"
-                  >
+                  <Link href="/app/credits" className="btn-secondary w-full text-center text-xs">
                     Voir ce pack plus tard
                   </Link>
                 </motion.div>
@@ -14945,160 +16293,98 @@ export default function LandingPage() {
           >
             <div className="max-w-6xl mx-auto grid gap-6 md:grid-cols-2">
               <motion.div {...fadeUp(0)}>
-                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">
-                  Sous le capot
-                </p>
+                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">Sous le capot</p>
                 <h2 className="text-lg sm:text-xl font-semibold mb-2">
                   Une stack moderne, optimisée pour la vitesse.
                 </h2>
                 <p className="text-sm text-[var(--muted)] mb-3">
-                  Tu profites d’une interface fluide, sans te soucier de la
-                  technique. Mais si ça t’intéresse :
+                  Tu profites d’une interface fluide, sans te soucier de la technique. Mais si ça t’intéresse :
                 </p>
                 <ul className="text-[12px] text-[var(--muted)] space-y-1.5">
                   <li>
-                    •{" "}
-                    <span className="text-[var(--ink)] font-medium">
-                      Next.js
-                    </span>{" "}
-                    pour le frontend & le routing.
+                    • <span className="text-[var(--ink)] font-medium">Next.js</span> pour le frontend & le routing.
                   </li>
                   <li>
-                    •{" "}
-                    <span className="text-[var(--ink)] font-medium">
-                      Tailwind CSS
-                    </span>{" "}
-                    pour le design dark moderne.
+                    • <span className="text-[var(--ink)] font-medium">Tailwind CSS</span> pour le design dark moderne.
                   </li>
                   <li>
-                    •{" "}
-                    <span className="text-[var(--ink)] font-medium">
-                      Framer Motion
-                    </span>{" "}
-                    pour les animations fluides.
+                    • <span className="text-[var(--ink)] font-medium">Framer Motion</span> pour les animations fluides.
                   </li>
                   <li>
-                    •{" "}
-                    <span className="text-[var(--ink)] font-medium">
-                      Firebase
-                    </span>{" "}
-                    pour l’auth sécurisée & le stockage.
+                    • <span className="text-[var(--ink)] font-medium">Firebase</span> pour l’auth sécurisée & le stockage.
                   </li>
                   <li>
-                    •{" "}
-                    <span className="text-[var(--ink)] font-medium">
-                      Gemini
-                    </span>{" "}
-                    pour l’analyse de CV & la génération IA.
+                    • <span className="text-[var(--ink)] font-medium">Gemini</span> pour l’analyse de CV & la génération IA.
                   </li>
                 </ul>
               </motion.div>
 
-              <motion.div
-                {...fadeUp(0.1)}
-                className="glass p-4 border border-[var(--border)]/80 text-[11px] sm:text-xs"
-              >
+              <motion.div {...fadeUp(0.1)} className="glass p-4 border border-[var(--border)]/80 text-[11px] sm:text-xs">
                 <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-2">
                   Pourquoi c&apos;est important pour toi ?
                 </p>
                 <p className="text-[var(--muted)] mb-2">
-                  Parce que ça veut dire : moins de chargements lents, moins de
-                  bugs bizarres, et une interface qui réagit comme un vrai outil
-                  pro, pas comme un formulaire coincé dans le passé.
+                  Parce que ça veut dire : moins de chargements lents, moins de bugs bizarres, et une interface qui réagit comme un vrai outil pro.
                 </p>
                 <p className="text-[var(--muted)]">
-                  Et si tu es curieux·se côté dev, la structure du projet est
-                  pensée pour être lisible, extensible, et déployable facilement
-                  sur Firebase Hosting.
+                  Et si tu es curieux·se côté dev, la structure du projet est pensée pour être lisible, extensible, et déployable facilement sur Firebase Hosting.
                 </p>
               </motion.div>
             </div>
           </section>
 
-          {/* FAQ / CTA */}
+          {/* FAQ */}
           <section
             id="faq"
             className="md:snap-start md:min-h-[calc(100vh-3.5rem-2px)] flex items-center px-4 sm:px-8 pb-12 pt-10 md:py-0"
           >
             <div className="max-w-4xl mx-auto w-full">
               <motion.div {...fadeUp(0)} className="text-center mb-6">
-                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">
-                  Questions fréquentes
-                </p>
-                <h2 className="text-lg sm:text-xl font-semibold mb-2">
-                  Et si tu te poses encore la question…
-                </h2>
+                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">Questions fréquentes</p>
+                <h2 className="text-lg sm:text-xl font-semibold mb-2">Et si tu te poses encore la question…</h2>
               </motion.div>
 
               <div className="space-y-3 text-sm">
-                <motion.div
-                  {...fadeUp(0.05)}
-                  className="glass p-3 border border-[var(--border)]/80"
-                >
-                  <p className="font-medium mb-1">
-                    Est-ce que les textes sont vraiment uniques ?
-                  </p>
+                <motion.div {...fadeUp(0.05)} className="glass p-3 border border-[var(--border)]/80">
+                  <p className="font-medium mb-1">Est-ce que les textes sont vraiment uniques ?</p>
                   <p className="text-[12px] text-[var(--muted)]">
-                    Oui, chaque génération est basée sur ton CV, l’offre collée
-                    et les paramètres que tu choisis. Tu peux ensuite éditer et
-                    personnaliser autant que tu veux.
+                    Oui, chaque génération est basée sur ton CV, l’offre collée et les paramètres que tu choisis.
                   </p>
                 </motion.div>
-                <motion.div
-                  {...fadeUp(0.1)}
-                  className="glass p-3 border border-[var(--border)]/80"
-                >
-                  <p className="font-medium mb-1">
-                    Est-ce que l’outil remplace complètement mon travail ?
-                  </p>
+
+                <motion.div {...fadeUp(0.1)} className="glass p-3 border border-[var(--border)]/80">
+                  <p className="font-medium mb-1">Est-ce que l’outil remplace complètement mon travail ?</p>
                   <p className="text-[12px] text-[var(--muted)]">
-                    Non. L’idée est de te donner une base solide, structurée et
-                    adaptée, pour que tu passes de 0 → 80% en quelques minutes,
-                    puis que tu ajustes les derniers 20%.
+                    Non. L’idée est de te donner une base solide (0→80%), puis tu ajustes les derniers 20%.
                   </p>
                 </motion.div>
-                <motion.div
-                  {...fadeUp(0.15)}
-                  className="glass p-3 border border-[var(--border)]/80"
-                >
-                  <p className="font-medium mb-1">
-                    Je peux arrêter quand je veux ?
-                  </p>
+
+                <motion.div {...fadeUp(0.15)} className="glass p-3 border border-[var(--border)]/80">
+                  <p className="font-medium mb-1">Je peux arrêter quand je veux ?</p>
                   <p className="text-[12px] text-[var(--muted)]">
-                    Oui, les crédits ne t&apos;engagent pas dans un abonnement.
-                    Tu recharges uniquement quand tu en as besoin.
+                    Oui, les crédits ne t&apos;engagent pas dans un abonnement. Tu recharges uniquement quand tu en as besoin.
                   </p>
                 </motion.div>
               </div>
 
-              <motion.div
-                {...fadeUp(0.2)}
-                className="mt-8 glass p-5 border border-[var(--border)]/90 text-center"
-              >
-                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-2">
-                  Prêt à tester ?
-                </p>
+              <motion.div {...fadeUp(0.2)} className="mt-8 glass p-5 border border-[var(--border)]/90 text-center">
+                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-2">Prêt à tester ?</p>
                 <h3 className="text-base sm:text-lg font-semibold mb-2">
-                  Tu peux créer ton compte en 30 secondes et tester avec de vrais
-                  cas.
+                  Tu peux créer ton compte en 30 secondes et tester avec de vrais cas.
                 </h3>
                 <p className="text-[12px] text-[var(--muted)] mb-4">
-                  Tu gardes la main sur tout, l’IA est là pour accélérer ton
-                  travail, pas pour te remplacer.
+                  Tu gardes la main sur tout, l’IA est là pour accélérer ton travail, pas pour te remplacer.
                 </p>
                 <div className="flex flex-wrap gap-3 justify-center">
-                  <Link
-                    href="/signup"
-                    className="btn-primary text-xs sm:text-sm"
-                  >
+                  <Link href="/signup" className="btn-primary text-xs sm:text-sm">
                     Essayer gratuitement
                   </Link>
 
-                  {/* bouton intelligent ici aussi */}
                   <button
                     type="button"
                     onClick={handleSmartLoginClick}
-                    className="btn-secondary text-xs sm:text-sm"
+                    disabled={navigating}
+                    className="btn-secondary text-xs sm:text-sm disabled:opacity-50"
                   >
                     J&apos;ai déjà un compte
                   </button>
@@ -15685,6 +16971,9 @@ export function BuyCreditsButtons({ user }: BuyCreditsButtonsProps) {
 import { useState, useEffect, useRef } from "react";
 import { useAuth } from "@/context/AuthContext";
 
+// ✅ AJOUT reCAPTCHA
+import { tryGetRecaptchaToken } from "@/lib/recaptcha";
+
 type Message = {
   role: "interviewer" | "candidate" | "system";
   text: string;
@@ -15718,8 +17007,10 @@ const VOICE_PROFILES: Record<
   },
 };
 
-// Durée moyenne par question (en minutes) pour l'estimation
 const AVG_MIN_PER_QUESTION = 1.5;
+
+// ✅ reCAPTCHA action unique attendue côté serveur (Cloud Function + /api/interview)
+const RECAPTCHA_ACTION = "interview";
 
 // --- Helper : récup nom côté client (Firebase Auth) ---
 const getCandidateNameFromAuth = (user: any): string | null => {
@@ -15746,10 +17037,8 @@ const personalizeQuestionClient = (
   const firstName = safeName.split(" ")[0] || safeName;
 
   if (safeName) {
-    // FR
     q = q.replace(/\[Nom du candidat[^\]]*\]/gi, safeName);
     q = q.replace(/\[Prénom du candidat[^\]]*\]/gi, firstName);
-    // EN (au cas où)
     q = q.replace(/\[Name of the candidate[^\]]*\]/gi, safeName);
     q = q.replace(/\[First name of the candidate[^\]]*\]/gi, firstName);
   } else {
@@ -15759,12 +17048,9 @@ const personalizeQuestionClient = (
     q = q.replace(/\[First name of the candidate[^\]]*\]/gi, "");
   }
 
-  // Nettoyage "Bonjour ,", espaces multiples, etc.
   q = q.replace(/\s+,/g, ",");
   q = q.replace(/\s{2,}/g, " ").trim();
   q = q.replace(/^,\s*/, "");
-
-  // Harmonise les débuts de phrase
   q = q.replace(/^Bonjour\s*,/i, "Bonjour,");
   q = q.replace(/^Bonjour\s+$/, "Bonjour,");
 
@@ -15779,31 +17065,25 @@ export default function InterviewChat() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
-  // "started" = entretien en cours (questions qui s'enchaînent)
   const [started, setStarted] = useState(false);
-  // "finished" = bilan final reçu
   const [finished, setFinished] = useState(false);
 
-  // Config entretien
   const [jobTitle, setJobTitle] = useState("");
   const [jobDesc, setJobDesc] = useState("");
   const [interviewMode, setInterviewMode] =
     useState<InterviewMode>("complet");
   const [difficulty, setDifficulty] = useState<Difficulty>("standard");
 
-  // Profil du recruteur : voix + avatar
   const [voiceProfile, setVoiceProfile] =
     useState<VoiceProfileId>("femme");
   const [recruiterGender, setRecruiterGender] =
     useState<RecruiterGender>("f");
 
-  // Progression de l'entretien
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [totalQuestions, setTotalQuestions] = useState(
     INTERVIEW_QUESTION_PLAN["complet"]
   );
 
-  // États vocaux
   const [listening, setListening] = useState(false);
   const recognitionRef = useRef<any>(null);
   const [speechSupported, setSpeechSupported] = useState(false);
@@ -15811,17 +17091,58 @@ export default function InterviewChat() {
     useState(false);
   const [aiSpeaking, setAiSpeaking] = useState(false);
 
-  // Feedback final
   const [finalSummary, setFinalSummary] = useState<string | null>(null);
   const [finalScore, setFinalScore] = useState<number | null>(null);
   const [finalDecision, setFinalDecision] = useState<string | null>(null);
 
-  // Effet "texte qui s'écrit" pour la dernière question
   const [typing, setTyping] = useState(false);
   const [typingIndex, setTypingIndex] = useState(0);
 
-  // Auto-scroll du chat
   const chatRef = useRef<HTMLDivElement | null>(null);
+
+  // ✅ Helper fetch /api/interview + reCAPTCHA
+  const postInterview = async (payload: any) => {
+    const recaptchaToken = await tryGetRecaptchaToken(RECAPTCHA_ACTION).catch(
+      () => null
+    );
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (recaptchaToken) headers["X-Recaptcha-Token"] = recaptchaToken;
+
+    const body = {
+      ...payload,
+      recaptchaToken: recaptchaToken || undefined,
+      recaptchaAction: RECAPTCHA_ACTION,
+    };
+
+    const res = await fetch("/api/interview", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    const contentType = res.headers.get("content-type") || "";
+    const data = contentType.includes("application/json")
+      ? await res.json().catch(() => null)
+      : await res.text().catch(() => "");
+
+    if (!res.ok) {
+      const errMsg =
+        typeof data === "object" && data
+          ? data.error ||
+            `HTTP ${res.status}` +
+              (data.details ? ` — ${JSON.stringify(data.details)}` : "")
+          : typeof data === "string"
+          ? data || `HTTP ${res.status}`
+          : `HTTP ${res.status}`;
+
+      throw new Error(errMsg);
+    }
+
+    return data;
+  };
 
   // --- INIT VOIX (TTS) ---
   useEffect(() => {
@@ -15840,7 +17161,6 @@ export default function InterviewChat() {
     el.scrollTop = el.scrollHeight;
   }, [history, loading]);
 
-  // Index du dernier message "interviewer" (pour l'effet typewriter)
   const lastInterviewerIndex =
     history.length > 0
       ? [...history]
@@ -15854,7 +17174,7 @@ export default function InterviewChat() {
       ? history[lastInterviewerIndex]?.text || ""
       : "";
 
-  // --- TYPEWRITER (effet texte qui s'écrit pour la dernière question) ---
+  // --- TYPEWRITER ---
   useEffect(() => {
     if (!typing) return;
     if (lastInterviewerIndex === -1) return;
@@ -15898,7 +17218,7 @@ export default function InterviewChat() {
     }
   };
 
-  // --- PARLER (TTS) : NE LIT QUE LES QUESTIONS ---
+  // --- PARLER (TTS) ---
   const speak = (text: string) => {
     if (typeof window === "undefined") return;
     const toSpeak = (text || "").trim();
@@ -15910,18 +17230,14 @@ export default function InterviewChat() {
 
     try {
       const utterance = new SpeechSynthesisUtterance(toSpeak);
-
-      // Langue
       utterance.lang = "fr-FR";
 
-      // Pitch + vitesse selon profil (mais pas critique si ça ne marche pas)
       const profile = VOICE_PROFILES[voiceProfile];
       if (profile) {
         utterance.pitch = profile.pitch;
         utterance.rate = profile.rate;
       }
 
-      // Gestion des états UI
       utterance.onstart = () => setAiSpeaking(true);
       utterance.onend = () => setAiSpeaking(false);
       utterance.onerror = (e) => {
@@ -15929,7 +17245,6 @@ export default function InterviewChat() {
         setAiSpeaking(false);
       };
 
-      // On annule ce qui est en cours puis on parle
       try {
         window.speechSynthesis.cancel();
       } catch {
@@ -15942,7 +17257,7 @@ export default function InterviewChat() {
     }
   };
 
-  // --- PARSE des payloads backend (gère ```json ...``` + JSON cassé) ---
+  // --- PARSE payload backend ---
   const parseInterviewPayload = (raw: any): {
     nextQuestion: string | null;
     shortAnalysis: string | null;
@@ -15955,7 +17270,6 @@ export default function InterviewChat() {
       if (!txt) return null;
       let inner = txt.trim();
 
-      // On enlève d'abord les balises ```lang ... ```
       if (inner.startsWith("```")) {
         inner = inner
           .replace(/^```[a-zA-Z]*\s*\n?/, "")
@@ -15964,35 +17278,21 @@ export default function InterviewChat() {
       }
 
       try {
-        // Si c'est un JSON propre, on parse direct
         const parsed = JSON.parse(inner);
         return parsed;
       } catch {
-        // Sinon, on essaie d'extraire les champs à la main (regex)
         const result: any = {};
 
-        const extractField = (
-          field: string,
-          source: string
-        ): string | null => {
+        const extractField = (field: string, source: string): string | null => {
           const doubleQuote =
             source.match(
-              new RegExp(
-                `"${field}"\\s*:\\s*"([^"]*)"`,
-                "s"
-              )
+              new RegExp(`"${field}"\\s*:\\s*"([^"]*)"`, "s")
             ) ||
             source.match(
-              new RegExp(
-                `"${field}"\\s*:\\s*\\"([^"]*)\\"`,
-                "s"
-              )
+              new RegExp(`"${field}"\\s*:\\s*\\"([^"]*)\\"`, "s")
             );
           const singleQuote = source.match(
-            new RegExp(
-              `'${field}'\\s*:\\s*'([^']*)'`,
-              "s"
-            )
+            new RegExp(`'${field}'\\s*:\\s*'([^']*)'`, "s")
           );
           const m = doubleQuote || singleQuote;
           if (!m) return null;
@@ -16020,86 +17320,45 @@ export default function InterviewChat() {
           if (!Number.isNaN(num)) result.final_score = num;
         }
 
-        if (Object.keys(result).length > 0) {
-          return result;
-        }
-
-        // Dernier fallback : on considère que tout le texte est la question
+        if (Object.keys(result).length > 0) return result;
         return { next_question: inner };
       }
     };
 
-    // Si on reçoit une string brute (potentiellement avec ```json ...``` dedans)
-    if (typeof obj === "string") {
-      obj = tryParseString(obj);
-    }
+    if (typeof obj === "string") obj = tryParseString(obj);
 
-    // Si on reçoit un objet, mais que certains champs sont eux-mêmes du ```json ...```
     if (obj && typeof obj === "object") {
-      if (
-        typeof obj.nextQuestion === "string" &&
-        obj.nextQuestion.trim().startsWith("```")
-      ) {
+      if (typeof obj.nextQuestion === "string" && obj.nextQuestion.trim().startsWith("```")) {
         const nested = tryParseString(obj.nextQuestion);
         if (nested && typeof nested === "object") {
-          const q =
-            (nested as any).next_question ??
-            (nested as any).nextQuestion ??
-            null;
-          obj = {
-            ...obj,
-            ...nested,
-            next_question: q ?? obj.next_question,
-            nextQuestion: q ?? obj.nextQuestion,
-          };
+          const q = (nested as any).next_question ?? (nested as any).nextQuestion ?? null;
+          obj = { ...obj, ...nested, next_question: q ?? obj.next_question, nextQuestion: q ?? obj.nextQuestion };
         }
       }
-      if (
-        typeof obj.next_question === "string" &&
-        obj.next_question.trim().startsWith("```")
-      ) {
+      if (typeof obj.next_question === "string" && obj.next_question.trim().startsWith("```")) {
         const nested = tryParseString(obj.next_question);
         if (nested && typeof nested === "object") {
-          const q =
-            (nested as any).next_question ??
-            (nested as any).nextQuestion ??
-            null;
-          obj = {
-            ...obj,
-            ...nested,
-            next_question: q ?? obj.next_question,
-            nextQuestion: q ?? obj.nextQuestion,
-          };
+          const q = (nested as any).next_question ?? (nested as any).nextQuestion ?? null;
+          obj = { ...obj, ...nested, next_question: q ?? obj.next_question, nextQuestion: q ?? obj.nextQuestion };
         }
       }
     }
 
-    // ⚠️ IMPORTANT : on privilégie toujours next_question (propre) avant nextQuestion
     const nextQuestionRaw =
-      obj?.next_question ||
-      obj?.nextQuestion ||
-      obj?.question ||
-      null;
-    const shortAnalysis =
-      obj?.short_analysis || obj?.shortAnalysis || null;
-    const finalSummary =
-      obj?.final_summary || obj?.finalSummary || null;
-    const finalScoreRaw =
-      obj?.final_score ?? obj?.finalScore ?? null;
+      obj?.next_question || obj?.nextQuestion || obj?.question || null;
+    const shortAnalysis = obj?.short_analysis || obj?.shortAnalysis || null;
+    const finalSummary = obj?.final_summary || obj?.finalSummary || null;
+    const finalScoreRaw = obj?.final_score ?? obj?.finalScore ?? null;
 
     const nextQuestionText =
-      typeof nextQuestionRaw === "string"
-        ? nextQuestionRaw.trim()
-        : null;
+      typeof nextQuestionRaw === "string" ? nextQuestionRaw.trim() : null;
 
-    // --- NETTOYAGE : on retire tout bloc ```...``` éventuel du texte public ---
     let cleanNextQuestion = nextQuestionText;
     if (cleanNextQuestion) {
       cleanNextQuestion = cleanNextQuestion
         .replace(/```[a-zA-Z]*\s*\n?[\s\S]*?```/g, "")
         .trim();
     }
-    // -------------------------------------------------------------------------
 
     const scoreNum =
       typeof finalScoreRaw === "number"
@@ -16110,14 +17369,8 @@ export default function InterviewChat() {
 
     return {
       nextQuestion: cleanNextQuestion,
-      shortAnalysis:
-        typeof shortAnalysis === "string"
-          ? shortAnalysis.trim()
-          : null,
-      finalSummary:
-        typeof finalSummary === "string"
-          ? finalSummary.trim()
-          : null,
+      shortAnalysis: typeof shortAnalysis === "string" ? shortAnalysis.trim() : null,
+      finalSummary: typeof finalSummary === "string" ? finalSummary.trim() : null,
       finalScore: Number.isNaN(scoreNum) ? null : scoreNum,
     };
   };
@@ -16129,12 +17382,8 @@ export default function InterviewChat() {
       return;
     }
 
-    // 🔓 Débloque TTS dans le geste utilisateur (iOS / mobiles stricts)
     try {
-      if (
-        typeof window !== "undefined" &&
-        "speechSynthesis" in window
-      ) {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
         const silent = new SpeechSynthesisUtterance(" ");
         silent.volume = 0;
         silent.rate = 1;
@@ -16155,49 +17404,26 @@ export default function InterviewChat() {
     setTotalQuestions(INTERVIEW_QUESTION_PLAN[interviewMode]);
 
     try {
-      const res = await fetch("/api/interview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "start",
-          userId: user.uid,
-          jobTitle,
-          jobDesc,
-          interviewMode,
-          difficulty,
-          channel: "oral",
-        }),
+      // ✅ utilise postInterview (avec reCAPTCHA)
+      const data = await postInterview({
+        action: "start",
+        userId: user.uid,
+        jobTitle,
+        jobDesc,
+        interviewMode,
+        difficulty,
+        channel: "oral",
       });
 
-      const contentType = res.headers.get("content-type") || "";
-      if (!contentType.includes("application/json")) {
-        const text = await res.text();
-        console.error("Réponse non JSON de /api/interview (start):", text);
-        throw new Error(
-          "Réponse serveur invalide (non JSON). Vérifie le rewrite /api/interview."
-        );
-      }
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(
-          data.error || "Erreur lors du démarrage de l'entretien."
-        );
-      }
-
-      let rawFirst =
-        data.firstQuestion ||
-        data.first_question ||
-        data.nextQuestion ||
-        data.next_question ||
+      const rawFirst =
+        (data as any)?.firstQuestion ||
+        (data as any)?.first_question ||
+        (data as any)?.nextQuestion ||
+        (data as any)?.next_question ||
         data;
 
-      const {
-        nextQuestion,
-        shortAnalysis,
-        finalSummary,
-        finalScore,
-      } = parseInterviewPayload(rawFirst);
+      const { nextQuestion, shortAnalysis, finalSummary, finalScore } =
+        parseInterviewPayload(rawFirst);
 
       const firstQ = personalizeQuestionClient(
         nextQuestion ||
@@ -16205,13 +17431,11 @@ export default function InterviewChat() {
         user
       );
 
-      setSessionId(data.sessionId || data.session_id || null);
+      setSessionId((data as any)?.sessionId || (data as any)?.session_id || null);
       setStarted(true);
       setCurrentQuestionIndex(1);
 
-      const newHistory: Message[] = [
-        { role: "interviewer", text: firstQ },
-      ];
+      const newHistory: Message[] = [{ role: "interviewer", text: firstQ }];
 
       if (shortAnalysis) {
         newHistory.push({
@@ -16233,9 +17457,7 @@ export default function InterviewChat() {
       speak(firstQ);
     } catch (e: any) {
       console.error(e);
-      alert(
-        e.message || "Erreur lors du démarrage de la simulation."
-      );
+      alert(e?.message || "Erreur lors du démarrage de la simulation.");
       setStarted(false);
       setSessionId(null);
     } finally {
@@ -16243,79 +17465,46 @@ export default function InterviewChat() {
     }
   };
 
-  // --- RÉPONDRE (clavier + micro) ---
+  // --- RÉPONDRE ---
   const sendAnswer = async (text: string) => {
     const answer = text.trim();
     if (!answer) return;
 
     if (!started || !sessionId) {
-      console.warn(
-        "Réponse ignorée : entretien non démarré ou sessionId manquant."
-      );
+      console.warn("Réponse ignorée : entretien non démarré ou sessionId manquant.");
       return;
     }
 
-    setHistory((prev) => [
-      ...prev,
-      { role: "candidate", text: answer } as Message,
-    ]);
+    setHistory((prev) => [...prev, { role: "candidate", text: answer } as Message]);
     setInput("");
     setLoading(true);
 
     try {
-      const res = await fetch("/api/interview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "answer",
-          userId: user?.uid,
-          sessionId,
-          userMessage: answer,
-          interviewMode,
-          difficulty,
-        }),
+      // ✅ utilise postInterview (avec reCAPTCHA)
+      const data = await postInterview({
+        action: "answer",
+        userId: user?.uid,
+        sessionId,
+        userMessage: answer,
+        interviewMode,
+        difficulty,
       });
-
-      const contentType = res.headers.get("content-type") || "";
-      if (!contentType.includes("application/json")) {
-        const textErr = await res.text();
-        console.error("Réponse non JSON de /api/interview (answer):", textErr);
-        throw new Error(
-          "Réponse serveur invalide (non JSON) pendant l'entretien."
-        );
-      }
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(
-          data.error || "Erreur lors de l'envoi de la réponse."
-        );
-      }
 
       const payload = (() => {
         if (
-          data.nextQuestion ||
-          data.next_question ||
-          data.final_summary ||
-          data.finalSummary
+          (data as any)?.nextQuestion ||
+          (data as any)?.next_question ||
+          (data as any)?.final_summary ||
+          (data as any)?.finalSummary
         ) {
           return parseInterviewPayload(data);
         }
-        if (data.payload) {
-          return parseInterviewPayload(data.payload);
-        }
-        if (typeof data === "string") {
-          return parseInterviewPayload(data);
-        }
+        if ((data as any)?.payload) return parseInterviewPayload((data as any).payload);
+        if (typeof data === "string") return parseInterviewPayload(data);
         return parseInterviewPayload(data);
       })();
 
-      const {
-        nextQuestion,
-        shortAnalysis,
-        finalSummary,
-        finalScore,
-      } = payload;
+      const { nextQuestion, shortAnalysis, finalSummary, finalScore } = payload;
 
       const nextQClean = nextQuestion
         ? personalizeQuestionClient(nextQuestion, user)
@@ -16332,10 +17521,7 @@ export default function InterviewChat() {
         }
 
         if (nextQClean && !finalSummary) {
-          newHistory.push({
-            role: "interviewer",
-            text: nextQClean,
-          });
+          newHistory.push({ role: "interviewer", text: nextQClean });
         }
 
         return newHistory;
@@ -16364,18 +17550,14 @@ export default function InterviewChat() {
       }
 
       if (nextQClean && !finalSummary) {
-        setCurrentQuestionIndex((prev) =>
-          Math.min(prev + 1, totalQuestions)
-        );
+        setCurrentQuestionIndex((prev) => Math.min(prev + 1, totalQuestions));
         setTypingIndex(0);
         setTyping(true);
         speak(nextQClean);
       }
     } catch (e: any) {
       console.error(e);
-      alert(
-        e.message || "Erreur lors de l'envoi de ta réponse."
-      );
+      alert(e?.message || "Erreur lors de l'envoi de ta réponse.");
     } finally {
       setLoading(false);
     }
@@ -16386,8 +17568,7 @@ export default function InterviewChat() {
     if (typeof window === "undefined") return;
 
     const w = window as any;
-    const SpeechRecognition =
-      w.SpeechRecognition || w.webkitSpeechRecognition;
+    const SpeechRecognition = w.SpeechRecognition || w.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
       setRecognitionSupported(false);
@@ -16425,14 +17606,12 @@ export default function InterviewChat() {
         // ignore
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [started, sessionId]);
 
-  // --- ACTIONS UI ---
   const toggleMic = () => {
     if (!started) {
-      alert(
-        "Lance d'abord la simulation avant d'utiliser le micro."
-      );
+      alert("Lance d'abord la simulation avant d'utiliser le micro.");
       return;
     }
 
@@ -16489,7 +17668,6 @@ export default function InterviewChat() {
     setTypingIndex(0);
   };
 
-  // Progress / stepper / temps restant
   const progressPercent =
     totalQuestions > 0
       ? Math.min((currentQuestionIndex / totalQuestions) * 100, 100)
@@ -16498,21 +17676,11 @@ export default function InterviewChat() {
   const showConfig = !started || finished;
   const showInterviewPanel = started || finished;
 
-  const stepVisual = !started
-    ? 1
-    : finished || finalSummary || finalScore !== null
-    ? 3
-    : 2;
+  const stepVisual = !started ? 1 : finished || finalSummary || finalScore !== null ? 3 : 2;
 
-  const questionsLeft = Math.max(
-    totalQuestions - currentQuestionIndex,
-    0
-  );
+  const questionsLeft = Math.max(totalQuestions - currentQuestionIndex, 0);
   const estimatedMinutesLeft = questionsLeft * AVG_MIN_PER_QUESTION;
-  const estimatedMinutesRounded =
-    questionsLeft > 0
-      ? Math.max(1, Math.round(estimatedMinutesLeft))
-      : 0;
+  const estimatedMinutesRounded = questionsLeft > 0 ? Math.max(1, Math.round(estimatedMinutesLeft)) : 0;
 
   return (
     <section className="glass rounded-2xl p-5 space-y-4">
@@ -16522,11 +17690,8 @@ export default function InterviewChat() {
           Simulateur d&apos;entretien IA (mode vocal)
         </h2>
         <p className="text-[11px] text-[var(--muted)] max-w-2xl">
-          L&apos;IA joue le rôle du recruteur : elle te pose des
-          questions adaptées au poste et à ton profil à l&apos;oral,
-          tu réponds à l&apos;oral ou à l&apos;écrit, et elle lit
-          ensuite ses messages à voix haute. Idéal pour t&apos;entraîner
-          avec un casque ou des écouteurs.
+          L&apos;IA joue le rôle du recruteur : elle te pose des questions adaptées au poste et à ton profil à l&apos;oral,
+          tu réponds à l&apos;oral ou à l&apos;écrit, et elle lit ensuite ses messages à voix haute.
         </p>
       </div>
 
@@ -16550,30 +17715,22 @@ export default function InterviewChat() {
               >
                 {step.id}
               </div>
-              <span
-                className={
-                  stepVisual === step.id
-                    ? "text-emerald-300"
-                    : "text-[var(--muted)]"
-                }
-              >
+              <span className={stepVisual === step.id ? "text-emerald-300" : "text-[var(--muted)]"}>
                 {step.label}
               </span>
             </div>
           ))}
         </div>
 
-        {/* Bloc configuration avant / après l'entretien */}
+        {/* Bloc configuration */}
         {showConfig && (
           <div className="glass p-4 rounded-2xl border border-white/10 space-y-3">
             <p className="text-sm text-[var(--muted)]">
-              Configure ton entretien, choisis le type de simulation et
-              le profil du recruteur (voix + apparence), puis lance le
-              mode vocal.
+              Configure ton entretien, choisis le type de simulation et le profil du recruteur (voix + apparence),
+              puis lance le mode vocal.
             </p>
 
             <div className="grid gap-3 md:grid-cols-2">
-              {/* Colonne gauche : poste & description */}
               <div className="space-y-2">
                 <label className="block text-xs font-medium text-[var(--muted)]">
                   Poste visé
@@ -16591,14 +17748,13 @@ export default function InterviewChat() {
                 </label>
                 <textarea
                   className="w-full bg-black/20 border border-white/10 rounded-lg p-2 text-xs min-h-[100px]"
-                  placeholder="Colle ici l'annonce ou un extrait (missions, contexte...). Si tu laisses vide, l'IA fera un entretien plus général."
+                  placeholder="Colle ici l'annonce ou un extrait..."
                   value={jobDesc}
                   disabled={loading || started}
                   onChange={(e) => setJobDesc(e.target.value)}
                 />
               </div>
 
-              {/* Colonne droite : mode, niveau, profil recruteur */}
               <div className="space-y-2">
                 <div>
                   <label className="block text-xs font-medium text-[var(--muted)]">
@@ -16608,25 +17764,12 @@ export default function InterviewChat() {
                     className="w-full bg-black/20 border border-white/10 rounded-lg p-2 text-xs"
                     value={interviewMode}
                     disabled={loading || started}
-                    onChange={(e) =>
-                      setInterviewMode(
-                        e.target.value as InterviewMode
-                      )
-                    }
+                    onChange={(e) => setInterviewMode(e.target.value as InterviewMode)}
                   >
-                    <option value="complet">
-                      Entretien complet (général + motivation +
-                      compétences)
-                    </option>
-                    <option value="rapide">
-                      Flash 10 minutes (questions essentielles)
-                    </option>
-                    <option value="technique">
-                      Focalisé compétences / technique
-                    </option>
-                    <option value="comportemental">
-                      Comportemental (soft skills, situations)
-                    </option>
+                    <option value="complet">Entretien complet (général + motivation + compétences)</option>
+                    <option value="rapide">Flash 10 minutes (questions essentielles)</option>
+                    <option value="technique">Focalisé compétences / technique</option>
+                    <option value="comportemental">Comportemental (soft skills, situations)</option>
                   </select>
                 </div>
 
@@ -16638,23 +17781,14 @@ export default function InterviewChat() {
                     className="w-full bg-black/20 border border-white/10 rounded-lg p-2 text-xs"
                     value={difficulty}
                     disabled={loading || started}
-                    onChange={(e) =>
-                      setDifficulty(
-                        e.target.value as Difficulty
-                      )
-                    }
+                    onChange={(e) => setDifficulty(e.target.value as Difficulty)}
                   >
-                    <option value="facile">
-                      Facile / débutant
-                    </option>
+                    <option value="facile">Facile / débutant</option>
                     <option value="standard">Standard</option>
-                    <option value="difficile">
-                      Exigeant (questions poussées)
-                    </option>
+                    <option value="difficile">Exigeant (questions poussées)</option>
                   </select>
                 </div>
 
-                {/* Profil recruteur (voix + avatar) */}
                 <div className="mt-1">
                   <label className="block text-xs font-medium text-[var(--muted)]">
                     Profil du recruteur (voix + apparence)
@@ -16677,9 +17811,7 @@ export default function InterviewChat() {
                       <span className="text-left">
                         Recruteur homme
                         <br />
-                        <span className="text-[10px] text-[var(--muted)]">
-                          Voix masculine
-                        </span>
+                        <span className="text-[10px] text-[var(--muted)]">Voix masculine</span>
                       </span>
                     </button>
                     <button
@@ -16699,9 +17831,7 @@ export default function InterviewChat() {
                       <span className="text-left">
                         Recruteuse femme
                         <br />
-                        <span className="text-[10px] text-[var(--muted)]">
-                          Voix féminine
-                        </span>
+                        <span className="text-[10px] text-[var(--muted)]">Voix féminine</span>
                       </span>
                     </button>
                   </div>
@@ -16709,27 +17839,18 @@ export default function InterviewChat() {
 
                 <p className="text-[10px] text-[var(--muted)] mt-1">
                   L&apos;entretien durera environ{" "}
-                  <span className="font-semibold">
-                    {INTERVIEW_QUESTION_PLAN[interviewMode]} questions
-                  </span>
-                  .
+                  <span className="font-semibold">{INTERVIEW_QUESTION_PLAN[interviewMode]} questions</span>.
                 </p>
 
                 {!recognitionSupported && (
                   <p className="text-[10px] text-[var(--muted)] mt-1">
-                    ⚠️ La reconnaissance vocale n&apos;est pas
-                    disponible sur ce navigateur / appareil (par
-                    exemple iOS Safari). Tu pourras quand même répondre
-                    au clavier et écouter la voix du recruteur si elle
-                    est supportée.
+                    ⚠️ La reconnaissance vocale n&apos;est pas disponible sur ce navigateur / appareil.
                   </p>
                 )}
 
                 {!speechSupported && (
                   <p className="text-[10px] text-[var(--muted)] mt-1">
-                    ⚠️ La synthèse vocale n&apos;est pas supportée
-                    ici. L&apos;IA ne pourra pas lire les questions à
-                    voix haute.
+                    ⚠️ La synthèse vocale n&apos;est pas supportée ici.
                   </p>
                 )}
               </div>
@@ -16741,21 +17862,18 @@ export default function InterviewChat() {
               className="btn-primary w-full mt-2"
               type="button"
             >
-              {loading
-                ? "Préparation de la simulation..."
-                : "Lancer la simulation vocale 🎙️"}
+              {loading ? "Préparation de la simulation..." : "Lancer la simulation vocale 🎙️"}
             </button>
 
             {!user && (
               <p className="text-[10px] text-[var(--muted)]">
-                Tu dois être connecté pour utiliser le simulateur
-                d&apos;entretien.
+                Tu dois être connecté pour utiliser le simulateur d&apos;entretien.
               </p>
             )}
           </div>
         )}
 
-        {/* Bloc entretien en direct */}
+        {/* Bloc entretien */}
         {showInterviewPanel && (
           <div className="glass p-4 rounded-2xl border border-white/10 h-[520px] flex flex-col">
             <div className="flex justify-between items-start mb-4 border-b border-white/5 pb-2 gap-3">
@@ -16765,29 +17883,17 @@ export default function InterviewChat() {
                     aiSpeaking ? "animate-pulse" : ""
                   }`}
                 >
-                  <span className="text-2xl">
-                    {recruiterGender === "f" ? "👩‍💼" : "👨‍💼"}
-                  </span>
+                  <span className="text-2xl">{recruiterGender === "f" ? "👩‍💼" : "👨‍💼"}</span>
                 </div>
                 <div className="text-xs text-[var(--muted)]">
-                  <p className="font-semibold">
-                    {recruiterGender === "f"
-                      ? "Recruteuse IA"
-                      : "Recruteur IA"}
-                  </p>
+                  <p className="font-semibold">{recruiterGender === "f" ? "Recruteuse IA" : "Recruteur IA"}</p>
                   <p className="text-[11px]">
-                    {aiSpeaking
-                      ? "Te pose une question..."
-                      : finished
-                      ? "Entretien terminé"
-                      : "Attend ta réponse"}
+                    {aiSpeaking ? "Te pose une question..." : finished ? "Entretien terminé" : "Attend ta réponse"}
                   </p>
                   {lastInterviewerMessage && (
                     <button
                       type="button"
-                      onClick={() =>
-                        speak(lastInterviewerMessage)
-                      }
+                      onClick={() => speak(lastInterviewerMessage)}
                       className="mt-1 inline-flex items-center gap-1 text-[10px] px-2 py-[2px] rounded-full bg-white/5 hover:bg-white/10"
                     >
                       🔊 Réécouter la question
@@ -16797,70 +17903,40 @@ export default function InterviewChat() {
               </div>
 
               <div className="flex flex-col items-end gap-1">
-                <span className="text-[10px] font-semibold text-emerald-400 uppercase tracking-wider">
-                  En direct
-                </span>
+                <span className="text-[10px] font-semibold text-emerald-400 uppercase tracking-wider">En direct</span>
                 <span className="text-[10px] text-[var(--muted)]">
-                  {finished
-                    ? "Entretien terminé"
-                    : `Question ${Math.max(
-                        1,
-                        currentQuestionIndex
-                      )} sur ${totalQuestions}`}
+                  {finished ? "Entretien terminé" : `Question ${Math.max(1, currentQuestionIndex)} sur ${totalQuestions}`}
                 </span>
                 <div className="w-32 h-1.5 bg-white/10 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-emerald-400 transition-all"
-                    style={{ width: `${progressPercent}%` }}
-                  />
+                  <div className="h-full bg-emerald-400 transition-all" style={{ width: `${progressPercent}%` }} />
                 </div>
+
                 {!finished && questionsLeft > 0 && (
                   <span className="text-[10px] text-[var(--muted)]">
-                    Il reste environ{" "}
-                    <span className="font-semibold">
-                      {questionsLeft} questions
-                    </span>{" "}
-                    (~{estimatedMinutesRounded} min)
+                    Il reste environ <span className="font-semibold">{questionsLeft} questions</span> (~
+                    {estimatedMinutesRounded} min)
                   </span>
                 )}
+
                 {finished && (
                   <span className="text-[10px] text-[var(--muted)]">
                     Entretien terminé • Bilan disponible ci-dessous
                   </span>
                 )}
-                <button
-                  onClick={stopSession}
-                  className="text-[11px] text-red-400 hover:underline mt-1"
-                  type="button"
-                >
+
+                <button onClick={stopSession} className="text-[11px] text-red-400 hover:underline mt-1" type="button">
                   Arrêter l&apos;entretien
                 </button>
               </div>
             </div>
 
-            {/* Zone de chat */}
-            <div
-              ref={chatRef}
-              className="flex-1 overflow-y-auto space-y-4 custom-scrollbar pr-2"
-            >
+            <div ref={chatRef} className="flex-1 overflow-y-auto space-y-4 custom-scrollbar pr-2">
               {history.map((m, i) => {
-                const isLastInterviewer =
-                  m.role === "interviewer" &&
-                  i === lastInterviewerIndex;
-                const showText =
-                  isLastInterviewer && typing
-                    ? m.text.slice(0, typingIndex)
-                    : m.text;
+                const isLastInterviewer = m.role === "interviewer" && i === lastInterviewerIndex;
+                const showText = isLastInterviewer && typing ? m.text.slice(0, typingIndex) : m.text;
 
                 return (
-                  <div
-                    key={i}
-                    className={`flex ${
-                      m.role === "candidate"
-                        ? "justify-end"
-                        : "justify-start"
-                    }`}
-                  >
+                  <div key={i} className={`flex ${m.role === "candidate" ? "justify-end" : "justify-start"}`}>
                     <div
                       className={`max-w-[85%] p-3 rounded-2xl text-sm ${
                         m.role === "candidate"
@@ -16883,46 +17959,28 @@ export default function InterviewChat() {
                 </div>
               )}
 
-              {/* Résultat final */}
               {finished && (finalSummary || finalScore !== null) && (
                 <div className="mt-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-3 text-[11px] space-y-2">
-                  <p className="text-xs font-semibold text-emerald-300">
-                    Bilan de l&apos;entretien
-                  </p>
+                  <p className="text-xs font-semibold text-emerald-300">Bilan de l&apos;entretien</p>
                   {typeof finalScore === "number" && (
                     <p>
-                      <span className="font-semibold">
-                        Note globale :
-                      </span>{" "}
-                      {Math.round(finalScore)}/100
+                      <span className="font-semibold">Note globale :</span> {Math.round(finalScore)}/100
                     </p>
                   )}
                   {finalSummary && (
                     <p className="whitespace-pre-line">
-                      <span className="font-semibold">
-                        Synthèse :
-                      </span>{" "}
-                      {finalSummary}
+                      <span className="font-semibold">Synthèse :</span> {finalSummary}
                     </p>
                   )}
                   {finalDecision && (
                     <p className="whitespace-pre-line">
-                      <span className="font-semibold">
-                        Décision probable :
-                      </span>{" "}
-                      {finalDecision}
+                      <span className="font-semibold">Décision probable :</span> {finalDecision}
                     </p>
                   )}
-                  <p className="text-[10px] text-[var(--muted)]">
-                    Utilise ce bilan pour identifier les points à
-                    améliorer : structure des réponses, exemples
-                    concrets, mise en avant de tes résultats, etc.
-                  </p>
                 </div>
               )}
             </div>
 
-            {/* Zone de réponse */}
             <div className="mt-4 pt-4 border-t border-white/10 flex flex-col gap-2">
               <div className="flex items-center gap-2">
                 <button
@@ -16933,21 +17991,14 @@ export default function InterviewChat() {
                     listening
                       ? "bg-red-500/80 animate-pulse ring-2 ring-red-300/60"
                       : "bg-white/10 hover:bg-white/20"
-                  } ${
-                    !started || loading
-                      ? "opacity-50 cursor-not-allowed"
-                      : ""
-                  }`}
+                  } ${!started || loading ? "opacity-50 cursor-not-allowed" : ""}`}
                 >
                   <span>🎤</span>
                   {listening && (
-                    <span className="ml-1 text-[10px] uppercase tracking-widest text-red-100">
-                      REC
-                    </span>
+                    <span className="ml-1 text-[10px] uppercase tracking-widest text-red-100">REC</span>
                   )}
                 </button>
 
-                {/* Mini visualiseur audio (animation fake) */}
                 {listening && (
                   <div className="flex gap-[3px] h-4 items-end">
                     <span className="w-[3px] bg-red-100 rounded-sm animate-[ping_0.7s_ease-in-out_infinite]" />
@@ -16961,19 +18012,11 @@ export default function InterviewChat() {
               <div className="flex gap-2">
                 <input
                   className="flex-1 bg-black/20 border border-white/10 rounded-full px-4 text-sm"
-                  placeholder={
-                    started
-                      ? "Parle ou écris ta réponse..."
-                      : "Lance la simulation pour commencer l'entretien"
-                  }
+                  placeholder={started ? "Parle ou écris ta réponse..." : "Lance la simulation pour commencer l'entretien"}
                   value={input}
                   disabled={!started || loading}
                   onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) =>
-                    started &&
-                    e.key === "Enter" &&
-                    sendAnswer(input)
-                  }
+                  onKeyDown={(e) => started && e.key === "Enter" && sendAnswer(input)}
                 />
                 <button
                   onClick={() => sendAnswer(input)}
@@ -17734,19 +18777,25 @@ export function useLang() {
 
 ## File: functions/index.js
 ````javascript
-const functions = require("firebase-functions");
+"use strict";
+
+/**
+ * ✅ Version nettoyée (SANS doublons / SANS commandes terminal dans le JS)
+ * ✅ Import v1 explicite (Cloud Functions Gen1)
+ * ✅ Option bypass reCAPTCHA en dev/emulator (via env)
+ *
+ * IMPORTANT :
+ * - Utilise Node 18+ (fetch natif)
+ * - Ne colle JAMAIS "npm install ..." dans ce fichier
+ */
+
+const functions = require("firebase-functions/v1");
 const admin = require("firebase-admin");
 const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
 const JSZip = require("jszip");
 const { Polar } = require("@polar-sh/sdk");
-const {
-  validateEvent,
-  WebhookVerificationError,
-} = require("@polar-sh/sdk/webhooks");
-
-const {
-  RecaptchaEnterpriseServiceClient,
-} = require("@google-cloud/recaptcha-enterprise");
+const { validateEvent, WebhookVerificationError } = require("@polar-sh/sdk/webhooks");
+const { RecaptchaEnterpriseServiceClient } = require("@google-cloud/recaptcha-enterprise");
 
 // Initialisation Firebase Admin (pour Firestore + auth + callable)
 if (!admin.apps.length) {
@@ -17755,27 +18804,44 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 // =============================
+//  Helper fetch (Node 18+)
+// =============================
+const fetchFn = globalThis.fetch;
+if (!fetchFn) {
+  console.warn(
+    "⚠️ globalThis.fetch introuvable. Mets Node 18+ dans functions/package.json (engines.node=18)."
+  );
+}
+
+// =============================
 //  reCAPTCHA Enterprise (config + helper)
 // =============================
-
 const recaptchaClient = new RecaptchaEnterpriseServiceClient();
 
 function getRecaptchaConfig() {
-  const cfg =
-    (functions.config &&
-      functions.config() &&
-      functions.config().recaptcha) ||
-    {};
+  const cfg = (functions.config && functions.config() && functions.config().recaptcha) || {};
+
   const projectId = cfg.project_id || process.env.RECAPTCHA_PROJECT_ID || "";
   const siteKey = cfg.site_key || process.env.RECAPTCHA_SITE_KEY || "";
   const thresholdRaw = cfg.threshold || process.env.RECAPTCHA_THRESHOLD || "0.5";
   const threshold = Number(thresholdRaw);
 
+  // ✅ Bypass optionnel (dev seulement recommandé)
+  // - RECAPTCHA_BYPASS=true
+  // - ou functions:config:set recaptcha.bypass=true
+  const bypassRaw = cfg.bypass || process.env.RECAPTCHA_BYPASS || "false";
+  const bypass = String(bypassRaw).toLowerCase() === "true";
+
   return {
     projectId,
     siteKey,
     threshold: Number.isFinite(threshold) ? threshold : 0.5,
+    bypass,
   };
+}
+
+function isEmulator() {
+  return process.env.FUNCTIONS_EMULATOR === "true" || !!process.env.FIREBASE_EMULATOR_HUB;
 }
 
 function getClientIp(req) {
@@ -17791,11 +18857,6 @@ function getClientIp(req) {
   return typeof ip === "string" ? ip : "";
 }
 
-// ✅ MAJ: normalisation action (évite action_mismatch case-sensitive)
-function normalizeAction(action) {
-  return String(action || "").trim().toLowerCase();
-}
-
 /**
  * Vérifie le token reCAPTCHA Enterprise.
  * expectedAction :
@@ -17803,7 +18864,12 @@ function normalizeAction(action) {
  * - sinon -> pas de check d'action
  */
 async function verifyRecaptchaToken({ token, expectedAction, req }) {
-  const { projectId, siteKey, threshold } = getRecaptchaConfig();
+  const { projectId, siteKey, threshold, bypass } = getRecaptchaConfig();
+
+  // ✅ Bypass explicite (utile en local/dev)
+  if (bypass && (isEmulator() || process.env.NODE_ENV !== "production")) {
+    return { ok: true, bypass: true, score: null, threshold };
+  }
 
   // Si pas configuré, on ne bloque pas (mais on log)
   if (!projectId || !siteKey) {
@@ -17867,12 +18933,7 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
         : null;
 
     if (typeof score === "number" && score < threshold) {
-      return {
-        ok: false,
-        reason: "low_score",
-        score,
-        threshold,
-      };
+      return { ok: false, reason: "low_score", score, threshold };
     }
 
     return { ok: true, score, threshold };
@@ -17901,20 +18962,16 @@ async function enforceRecaptchaOrReturn(req, res, expectedAction) {
         req.body.action)) ||
     "";
 
-  // ✅ MAJ: normaliser l'action (case-sensitive côté Google)
-  const action = normalizeAction(expectedAction || actionFromBody || "");
+  const action = expectedAction || actionFromBody || "";
 
   const result = await verifyRecaptchaToken({
     token: typeof token === "string" ? token : String(token),
-    expectedAction: action,
+    expectedAction: typeof action === "string" ? action : String(action),
     req,
   });
 
   if (!result.ok) {
-    return res.status(403).json({
-      error: "reCAPTCHA failed",
-      details: result,
-    });
+    return res.status(403).json({ error: "reCAPTCHA failed", details: result });
   }
   return null; // ok
 }
@@ -17959,47 +19016,27 @@ function setCors(req, res) {
   );
 }
 
-/**
- * HTTPS: recaptchaVerify
- * Appelé par le front pour valider (token + action) avant Firebase Auth.
- *
- * Réponses :
- * - 200 { ok: true, score }
- * - 403 { ok: false, reason, score }
- */
+// =============================
+//  HTTPS: recaptchaVerify
+// =============================
 exports.recaptchaVerify = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
     setCors(req, res);
 
-    if (req.method === "OPTIONS") {
-      return res.status(204).send("");
-    }
-
-    if (req.method !== "POST") {
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST")
       return res.status(405).json({ ok: false, reason: "method_not_allowed" });
-    }
-
-    if (!req.is("application/json")) {
+    if (!req.is("application/json"))
       return res.status(400).json({ ok: false, reason: "bad_content_type" });
-    }
 
     const token = String(req.body?.token || "");
-    // ✅ MAJ: normaliser l’action
-    const action = normalizeAction(req.body?.action || "");
+    const action = String(req.body?.action || "").trim();
 
-    if (!token) {
-      return res.status(400).json({ ok: false, reason: "missing_token" });
-    }
-    if (!action) {
-      return res.status(400).json({ ok: false, reason: "missing_action" });
-    }
+    if (!token) return res.status(400).json({ ok: false, reason: "missing_token" });
+    if (!action) return res.status(400).json({ ok: false, reason: "missing_action" });
 
-    const result = await verifyRecaptchaToken({
-      token,
-      expectedAction: action,
-      req,
-    });
+    const result = await verifyRecaptchaToken({ token, expectedAction: action, req });
 
     if (!result.ok) {
       return res.status(403).json({
@@ -18015,7 +19052,9 @@ exports.recaptchaVerify = functions
     });
   });
 
-// Petit helper pour normaliser le texte (sans accents, minuscule)
+// =============================
+//  Helpers (profil, contrat)
+// =============================
 function normalizeString(str) {
   if (!str) return "";
   return str
@@ -18025,56 +19064,29 @@ function normalizeString(str) {
     .toLowerCase();
 }
 
-// Détection simple du type de contrat standard à partir d'une phrase brute
 function inferContractTypeStandard(raw) {
   const norm = normalizeString(raw);
   if (!norm) return "";
 
-  if (norm.includes("alternance") || norm.includes("apprentissage")) {
-    return "Alternance";
-  }
-  if (norm.includes("stage") || norm.includes("intern")) {
-    return "Stage";
-  }
-  if (
-    norm.includes("freelance") ||
-    norm.includes("independant") ||
-    norm.includes("indépendant") ||
-    norm.includes("auto-entrepreneur")
-  ) {
+  if (norm.includes("alternance") || norm.includes("apprentissage")) return "Alternance";
+  if (norm.includes("stage") || norm.includes("intern")) return "Stage";
+  if (norm.includes("freelance") || norm.includes("independant") || norm.includes("indépendant") || norm.includes("auto-entrepreneur"))
     return "Freelance";
-  }
-  if (
-    norm.includes("cdd") ||
-    norm.includes("duree determinee") ||
-    norm.includes("durée determinée")
-  ) {
+  if (norm.includes("cdd") || norm.includes("duree determinee") || norm.includes("durée determinée"))
     return "CDD";
-  }
-  if (
-    norm.includes("cdi") ||
-    norm.includes("duree indeterminee") ||
-    norm.includes("durée indeterminée")
-  ) {
+  if (norm.includes("cdi") || norm.includes("duree indeterminee") || norm.includes("durée indeterminée"))
     return "CDI";
-  }
-  if (norm.includes("interim") || norm.includes("intérim")) {
-    return "Intérim";
-  }
+  if (norm.includes("interim") || norm.includes("intérim")) return "Intérim";
 
   return "";
 }
 
-/* ============================
-   HELPER ADMIN COMMUN
-   ============================ */
-
+// =============================
+//  Admin helpers
+// =============================
 function assertIsAdmin(context) {
   if (!context.auth) {
-    throw new functions.https.HttpsError(
-      "unauthenticated",
-      "Tu dois être connecté."
-    );
+    throw new functions.https.HttpsError("unauthenticated", "Tu dois être connecté.");
   }
 
   const token = context.auth.token || {};
@@ -18087,10 +19099,6 @@ function assertIsAdmin(context) {
     );
   }
 }
-
-/* ============================
-   FONCTION ADMIN : SET ROLE ADMIN
-   ============================ */
 
 exports.setAdminRole = functions
   .region("europe-west1")
@@ -18110,10 +19118,6 @@ exports.setAdminRole = functions
     await admin.auth().setCustomUserClaims(uid, { isAdmin });
     return { success: true, uid, isAdmin };
   });
-
-/* ============================
-   FONCTION ADMIN : MAJ CRÉDITS (valeur absolue)
-   ============================ */
 
 exports.adminUpdateCredits = functions
   .region("europe-west1")
@@ -18143,75 +19147,45 @@ exports.adminUpdateCredits = functions
     return { success: true, userId, credits };
   });
 
-/* ============================
-   HTTPS FUNCTION CV (analyse CV PDF -> profil structuré)
-   ============================ */
+// =============================
+//  Gemini helpers
+// =============================
+async function callGeminiText(prompt, apiKey, temperature = 0.7, maxOutputTokens = 2400) {
+  if (!fetchFn) throw new Error("fetch indisponible. Mets Node 18+.");
 
-exports.extractProfile = functions
-  .region("europe-west1")
-  .https.onRequest(async (req, res) => {
-    setCors(req, res);
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
-    if (req.method === "OPTIONS") {
-      return res.status(204).send("");
-    }
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature, maxOutputTokens },
+  };
 
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Méthode non autorisée" });
-    }
-
-    if (!req.is("application/json")) {
-      return res
-        .status(400)
-        .json({ error: "Content-Type invalide. Envoie du JSON." });
-    }
-
-    // ✅ reCAPTCHA
-    const deny = await enforceRecaptchaOrReturn(req, res, "extract_profile");
-    if (deny) return;
-
-    try {
-      const body = req.body || {};
-      const base64Pdf = body.base64Pdf;
-
-      if (!base64Pdf) {
-        return res.status(400).json({
-          error: "Champ 'base64Pdf' manquant dans le corps JSON.",
-        });
-      }
-
-      // 🔑 Clé Gemini
-      const GEMINI_API_KEY =
-        process.env.GEMINI_API_KEY ||
-        (functions.config().gemini && functions.config().gemini.key);
-
-      if (!GEMINI_API_KEY) {
-        console.error("GEMINI_API_KEY manquante");
-        return res.status(500).json({
-          error:
-            "Clé Gemini manquante côté serveur. Configure GEMINI_API_KEY ou functions.config().gemini.key.",
-        });
-      }
-
-      // Analyse via Gemini
-      const profile = await callGeminiWithCv(base64Pdf, GEMINI_API_KEY);
-
-      return res.status(200).json(profile);
-    } catch (err) {
-      console.error("Erreur analyse CV :", err);
-      const msg = String(err && err.message ? err.message : "");
-      const errorMessage = msg.startsWith("Erreur Gemini:")
-        ? msg
-        : "Erreur pendant l'analyse du CV.";
-      return res.status(500).json({ error: errorMessage });
-    }
+  const resp = await fetchFn(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    body: JSON.stringify(body),
   });
 
-// =====================
-//   APPEL GEMINI (CV)
-// =====================
+  if (!resp.ok) {
+    const errorText = await resp.text();
+    throw new Error("Erreur Gemini (texte): " + errorText);
+  }
+
+  const data = await resp.json();
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const text = parts
+    .map((p) => (typeof p.text === "string" ? p.text : ""))
+    .join("\n")
+    .trim();
+
+  if (!text) throw new Error("Réponse Gemini (texte) vide");
+  return text;
+}
 
 async function callGeminiWithCv(base64Pdf, apiKey) {
+  if (!fetchFn) throw new Error("fetch indisponible. Mets Node 18+.");
+
   const endpoint =
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
@@ -18221,10 +19195,7 @@ async function callGeminiWithCv(base64Pdf, apiKey) {
         role: "user",
         parts: [
           {
-            inline_data: {
-              mime_type: "application/pdf",
-              data: base64Pdf,
-            },
+            inline_data: { mime_type: "application/pdf", data: base64Pdf },
           },
           {
             text: `Lis ce CV et renvoie STRICTEMENT un JSON valide avec exactement ce schéma :
@@ -18246,28 +19217,16 @@ async function callGeminiWithCv(base64Pdf, apiKey) {
   "secondaryDomains": string[],
   "skills": {
     "sections": [
-      {
-        "title": string,
-        "items": string[]
-      }
+      { "title": string, "items": string[] }
     ],
     "tools": string[]
   },
   "softSkills": string[],
   "experiences": [
-    {
-      "company": string,
-      "role": string,
-      "dates": string,
-      "bullets": string[]
-    }
+    { "company": string, "role": string, "dates": string, "bullets": string[] }
   ],
   "education": [
-    {
-      "school": string,
-      "degree": string,
-      "dates": string
-    }
+    { "school": string, "degree": string, "dates": string }
   ],
   "educationShort": string[],
   "certs": string,
@@ -18279,59 +19238,20 @@ async function callGeminiWithCv(base64Pdf, apiKey) {
 }
 
 RÈGLES IMPORTANTES :
-
-1) Type de contrat (contractType, contractTypeStandard, contractTypeFull)
-- "contractTypeFull" : recopie la phrase du CV la plus explicite.
-- "contractType" : version simplifiée si tu veux (sans perdre le sens).
-- "contractTypeStandard" : DOIT être parmi :
-   "CDI", "CDD", "Alternance", "Stage", "Freelance", "Intérim", "".
-
-2) Domaines / métiers principaux (primaryDomain, secondaryDomains)
-- "primaryDomain" DOIT être parmi :
-  "finance", "it_dev", "cyber", "data", "marketing", "sales",
-  "hr", "project", "ops", "health", "education", "autre".
-- "secondaryDomains" : 0 à 3 de ces mêmes valeurs.
-
-3) Compétences en sections (skills.sections)
-- Si le CV a déjà des rubriques de compétences, reprends-les.
-- Sinon, crée 2–4 sections logiques.
-- "items" : petites étiquettes (2–5 mots max).
-
-4) Outils (skills.tools)
-- 3 à 10 logiciels / outils réellement présents dans le CV.
-
-5) Soft skills (softSkills)
-- 3 à 10 soft skills extraites du CV (sections + texte).
-
-6) Résumé du profil (profileSummary)
-- 1 à 2 phrases max, cohérent avec le CV et le contrat recherché.
-
-7) Langues (langLine)
-- Une seule ligne compacte, ex :
-  "Français (natif) · Anglais (B2 – TOEIC)".
-
-8) Formation, expériences, hobbies, mobilité :
-- Ne pas inventer, ne mettre que ce qui est présent.
-
-GÉNÉRAL :
-- Si une info est absente -> chaîne vide "" ou tableau [].
+- Ne pas inventer.
+- Si une info est absente -> "" ou [].
 - RENVOIE UNIQUEMENT ce JSON, sans texte autour.
 `.trim(),
           },
         ],
       },
     ],
-    generationConfig: {
-      response_mime_type: "application/json",
-    },
+    generationConfig: { response_mime_type: "application/json" },
   };
 
-  const resp = await fetch(endpoint, {
+  const resp = await fetchFn(endpoint, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
+    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
     body: JSON.stringify(body),
   });
 
@@ -18342,18 +19262,11 @@ GÉNÉRAL :
 
   const data = await resp.json();
 
-  // 🔎 Parsing robuste
   let parsed = null;
-
-  if (
-    data &&
-    data.candidates &&
-    data.candidates[0]?.content?.parts?.[0]?.text
-  ) {
-    const text = data.candidates[0].content.parts[0].text;
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (typeof text === "string" && text.trim()) {
     try {
-      const cleanedText = text.replace(/```json|```/gi, "").trim();
-      parsed = JSON.parse(cleanedText);
+      parsed = JSON.parse(text.replace(/```json|```/gi, "").trim());
     } catch (e) {
       console.error("JSON Gemini invalide dans le champ text:", text);
       throw new Error("JSON Gemini invalide (Parsing text) : " + text);
@@ -18362,18 +19275,12 @@ GÉNÉRAL :
     parsed = data;
   }
 
-  // ==============================
-  //  POST-TRAITEMENT
-  // ==============================
-
-  // 1) Récupération des champs bruts
-  let sectionsRaw = Array.isArray(parsed?.skills?.sections)
-    ? parsed.skills.sections
-    : [];
+  // Post-traitement (skills/tools/softskills + contrat)
+  let sectionsRaw = Array.isArray(parsed?.skills?.sections) ? parsed.skills.sections : [];
   let tools = Array.isArray(parsed?.skills?.tools) ? parsed.skills.tools : [];
   let softSkillsArr = Array.isArray(parsed?.softSkills) ? parsed.softSkills : [];
 
-  // 2) Nettoyage / dédup soft skills
+  // Soft skills clean/dedup
   const softSeen = new Set();
   softSkillsArr = softSkillsArr
     .filter((s) => typeof s === "string")
@@ -18385,7 +19292,7 @@ GÉNÉRAL :
       return true;
     });
 
-  // 3) Injection des soft skills dans "Soft skills"
+  // Inject soft skills into sections if needed
   if (softSkillsArr.length > 0) {
     let idx = sectionsRaw.findIndex(
       (sec) =>
@@ -18395,31 +19302,21 @@ GÉNÉRAL :
     );
 
     if (idx === -1) {
-      sectionsRaw.push({
-        title: "Soft skills",
-        items: softSkillsArr,
-      });
+      sectionsRaw.push({ title: "Soft skills", items: softSkillsArr });
     } else {
-      const items = Array.isArray(sectionsRaw[idx].items)
-        ? sectionsRaw[idx].items
-        : [];
+      const items = Array.isArray(sectionsRaw[idx].items) ? sectionsRaw[idx].items : [];
       const seenLocal = new Set(
-        items
-          .filter((x) => typeof x === "string")
-          .map((x) => x.toLowerCase().trim())
+        items.filter((x) => typeof x === "string").map((x) => x.toLowerCase().trim())
       );
-      const merged = [
+      sectionsRaw[idx].items = [
         ...items,
-        ...softSkillsArr.filter(
-          (s) => !seenLocal.has(s.toLowerCase().trim())
-        ),
+        ...softSkillsArr.filter((s) => !seenLocal.has(s.toLowerCase().trim())),
       ];
-      sectionsRaw[idx].items = merged;
     }
   }
 
-  // 4) nettoyer / dédupliquer les items dans chaque section
-  let sections = sectionsRaw
+  // Clean sections
+  const sections = sectionsRaw
     .map((sec) => {
       const seen = new Set();
       const items = Array.isArray(sec.items) ? sec.items : [];
@@ -18439,7 +19336,7 @@ GÉNÉRAL :
     })
     .filter((sec) => sec.title || sec.items.length);
 
-  // 5) nettoyer / dédupliquer tools
+  // Clean tools
   const cleanTools = [];
   const seenTools = new Set();
   for (const raw of tools) {
@@ -18452,35 +19349,18 @@ GÉNÉRAL :
   }
   tools = cleanTools;
 
-  // 6) dédupliquer entre sections.items et tools
+  // Dedup tools vs section items
   const sectionItemSet = new Set();
-  sections.forEach((sec) => {
-    sec.items.forEach((it) => {
-      if (typeof it === "string") {
-        sectionItemSet.add(it.toLowerCase());
-      }
-    });
-  });
+  sections.forEach((sec) => sec.items.forEach((it) => sectionItemSet.add(String(it).toLowerCase())));
+  tools = tools.filter((t) => !sectionItemSet.has(String(t).toLowerCase()));
 
-  tools = tools.filter((t) => !sectionItemSet.has(t.toLowerCase()));
-
-  // 7) standardisation du contrat
+  // Contract
   const contractTypeFull = parsed?.contractTypeFull || parsed?.contractType || "";
-
   let contractTypeStandard = parsed?.contractTypeStandard || "";
-  if (!contractTypeStandard) {
-    contractTypeStandard = inferContractTypeStandard(contractTypeFull);
-  }
-
+  if (!contractTypeStandard) contractTypeStandard = inferContractTypeStandard(contractTypeFull);
   const contractTypeFinal = contractTypeStandard || contractTypeFull || "";
 
-  // 8) domaines
-  const primaryDomain = parsed?.primaryDomain || "";
-  const secondaryDomains = Array.isArray(parsed?.secondaryDomains)
-    ? parsed.secondaryDomains
-    : [];
-
-  const profile = {
+  return {
     fullName: parsed?.fullName || "",
     email: parsed?.email || "",
     phone: parsed?.phone || "",
@@ -18494,85 +19374,71 @@ GÉNÉRAL :
     contractTypeStandard,
     contractTypeFull,
 
-    primaryDomain,
-    secondaryDomains,
+    primaryDomain: parsed?.primaryDomain || "",
+    secondaryDomains: Array.isArray(parsed?.secondaryDomains) ? parsed.secondaryDomains : [],
 
     softSkills: softSkillsArr,
     drivingLicense: parsed?.drivingLicense || "",
     vehicle: parsed?.vehicle || "",
 
-    skills: {
-      sections,
-      tools,
-    },
+    skills: { sections, tools },
 
     experiences: Array.isArray(parsed?.experiences) ? parsed.experiences : [],
     education: Array.isArray(parsed?.education) ? parsed.education : [],
-    educationShort: Array.isArray(parsed?.educationShort)
-      ? parsed.educationShort
-      : [],
+    educationShort: Array.isArray(parsed?.educationShort) ? parsed.educationShort : [],
     certs: parsed?.certs || "",
     langLine: parsed?.langLine || "",
     hobbies: Array.isArray(parsed?.hobbies) ? parsed.hobbies : [],
   };
-
-  return profile;
 }
 
-// =====================
-//   APPEL GEMINI TEXTE
-// =====================
+// =============================
+//  HTTPS: extractProfile
+// =============================
+exports.extractProfile = functions
+  .region("europe-west1")
+  .https.onRequest(async (req, res) => {
+    setCors(req, res);
 
-async function callGeminiText(prompt, apiKey, temperature = 0.7, maxOutputTokens = 2400) {
-  const endpoint =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Méthode non autorisée" });
+    if (!req.is("application/json"))
+      return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: prompt }],
-      },
-    ],
-    generationConfig: {
-      temperature,
-      maxOutputTokens,
-    },
-  };
+    // ✅ reCAPTCHA
+    const deny = await enforceRecaptchaOrReturn(req, res, "extract_profile");
+    if (deny) return;
 
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
-    body: JSON.stringify(body),
+    try {
+      const base64Pdf = req.body?.base64Pdf;
+      if (!base64Pdf) {
+        return res.status(400).json({ error: "Champ 'base64Pdf' manquant dans le corps JSON." });
+      }
+
+      const GEMINI_API_KEY =
+        process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
+
+      if (!GEMINI_API_KEY) {
+        return res.status(500).json({
+          error:
+            "Clé Gemini manquante côté serveur. Configure GEMINI_API_KEY ou functions.config().gemini.key.",
+        });
+      }
+
+      const profile = await callGeminiWithCv(base64Pdf, GEMINI_API_KEY);
+      return res.status(200).json(profile);
+    } catch (err) {
+      console.error("Erreur analyse CV :", err);
+      const msg = String(err?.message || "");
+      return res.status(500).json({
+        error: msg.startsWith("Erreur Gemini:") ? msg : "Erreur pendant l'analyse du CV.",
+      });
+    }
   });
 
-  if (!resp.ok) {
-    const errorText = await resp.text();
-    throw new Error("Erreur Gemini (texte): " + errorText);
-  }
-
-  const data = await resp.json();
-  const parts = data?.candidates?.[0]?.content?.parts || [];
-  const text = parts
-    .map((p) => (typeof p.text === "string" ? p.text : ""))
-    .join("\n")
-    .trim();
-
-  if (!text) {
-    throw new Error("Réponse Gemini (texte) vide");
-  }
-
-  return text;
-}
-
-/* ============================
-   SIMULATION D'ENTRETIEN IA (interview)
-   ============================ */
-
-// Plan du nombre de questions par mode
+// =============================
+//  Interview (simulation)
+// =============================
 const INTERVIEW_QUESTION_PLAN = {
   complet: 8,
   rapide: 4,
@@ -18580,17 +19446,12 @@ const INTERVIEW_QUESTION_PLAN = {
   comportemental: 6,
 };
 
-// Id simple pour les sessions en mémoire (par instance de fonction)
 function createInterviewSessionId() {
   return Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
 }
 
-// ⚠️ En mémoire par instance de Cloud Function
 const interviewSessions = new Map();
 
-/**
- * Essaie d'extraire un objet JSON depuis un texte brut renvoyé par l'IA.
- */
 function extractInterviewJson(raw) {
   if (!raw || typeof raw !== "string") return null;
   let t = raw.trim();
@@ -18614,9 +19475,6 @@ function extractInterviewJson(raw) {
   return null;
 }
 
-/**
- * Construit le prompt d'entretien pour Gemini (JSON attendu en sortie).
- */
 function buildInterviewPrompt(session, lastUserAnswer) {
   const total = session.totalQuestions || 8;
   const step = session.currentStep || 1;
@@ -18656,53 +19514,34 @@ ${historyLines}`
 ${lastUserAnswer ? `Dernière réponse du candidat : "${lastUserAnswer}".` : ""}
 
 SI nous ne sommes PAS à la dernière étape (étape < ${total}) :
-
-1) Analyse très brièvement la la réponse précédente du candidat (ou son profil au démarrage).
+1) Analyse très brièvement la réponse précédente du candidat (ou son profil au démarrage).
 2) Propose la prochaine question d'entretien adaptée au poste.
 
 SI nous SOMMES à la dernière étape (étape >= ${total}) :
+1) Fais un bilan synthétique (points forts / axes d'amélioration).
+2) Donne un score global sur 100 (final_score).
 
-1) Fais un bilan synthétique de l'entretien et du candidat (points forts / axes d'amélioration).
-2) Propose éventuellement une courte phrase de clôture d'entretien.
-3) Donne un score global de l'entretien sur 100 (final_score).
-
-Ta RÉPONSE DOIT être STRICTEMENT un objet JSON VALIDE, sans aucun texte autour, EXACTEMENT de la forme :
+Ta RÉPONSE DOIT être STRICTEMENT un objet JSON VALIDE, sans aucun texte autour, EXACTEMENT :
 
 {
-  "next_question": "string ou null si l'entretien est terminé",
-  "short_analysis": "string (analyse courte de la réponse ou du profil)",
-  "final_summary": "string ou null si l'entretien continue",
+  "next_question": "string ou null",
+  "short_analysis": "string",
+  "final_summary": "string ou null",
   "final_score": nombre ou null
+}`;
+
+  return `${base}\n\n${histBlock}\n\n${stepInfo}`;
 }
 
-⚠️ Ne renvoie JAMAIS de markdown, JAMAIS de commentaires hors du JSON.`;
-
-  return `${base}
-
-${histBlock}
-
-${stepInfo}`;
-}
-
-/**
- * HTTPS: interview (simulation IA temps réel)
- */
 exports.interview = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
     setCors(req, res);
 
-    if (req.method === "OPTIONS") {
-      return res.status(204).send("");
-    }
-
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Méthode non autorisée" });
-    }
-
-    if (!req.is("application/json")) {
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Méthode non autorisée" });
+    if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
-    }
 
     // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "interview");
@@ -18713,12 +19552,10 @@ exports.interview = functions
       const action = body.action;
 
       if (!action) {
-        return res.status(400).json({
-          error: "Champ 'action' manquant ('start' ou 'answer').",
-        });
+        return res.status(400).json({ error: "Champ 'action' manquant ('start' ou 'answer')." });
       }
 
-      // ========== DÉMARRAGE ==========
+      // START
       if (action === "start") {
         const userId = body.userId || "";
         const jobTitle = body.jobTitle || "";
@@ -18726,9 +19563,7 @@ exports.interview = functions
         const interviewMode = body.interviewMode || "complet";
         const difficulty = body.difficulty || "standard";
 
-        if (!userId) {
-          return res.status(400).json({ error: "Champ 'userId' manquant." });
-        }
+        if (!userId) return res.status(400).json({ error: "Champ 'userId' manquant." });
 
         const totalQuestions =
           INTERVIEW_QUESTION_PLAN[interviewMode] || INTERVIEW_QUESTION_PLAN.complet;
@@ -18763,28 +19598,22 @@ exports.interview = functions
             process.env.GEMINI_API_KEY ||
             (functions.config().gemini && functions.config().gemini.key);
 
-          if (!GEMINI_API_KEY) {
-            throw new Error("GEMINI_API_KEY manquante");
-          }
+          if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY manquante");
 
           const prompt = buildInterviewPrompt(session, null);
           const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.6, 1200);
 
           const parsed = extractInterviewJson(raw) || {};
-          if (parsed && typeof parsed === "object") {
-            if (typeof parsed.next_question === "string" && parsed.next_question.trim()) {
-              nextQuestion = parsed.next_question.trim();
-            }
-            if (typeof parsed.short_analysis === "string") {
-              shortAnalysis = parsed.short_analysis.trim();
-            }
-            if (typeof parsed.final_summary === "string" && parsed.final_summary.trim()) {
-              finalSummary = parsed.final_summary.trim();
-            }
-            if (typeof parsed.final_score === "number" || typeof parsed.final_score === "string") {
-              const num = Number(parsed.final_score);
-              if (!Number.isNaN(num)) finalScore = num;
-            }
+          if (typeof parsed.next_question === "string" && parsed.next_question.trim()) {
+            nextQuestion = parsed.next_question.trim();
+          }
+          if (typeof parsed.short_analysis === "string") shortAnalysis = parsed.short_analysis.trim();
+          if (typeof parsed.final_summary === "string" && parsed.final_summary.trim()) {
+            finalSummary = parsed.final_summary.trim();
+          }
+          if (typeof parsed.final_score === "number" || typeof parsed.final_score === "string") {
+            const num = Number(parsed.final_score);
+            if (!Number.isNaN(num)) finalScore = num;
           }
         } catch (err) {
           console.error("Erreur Gemini (interview/start):", err);
@@ -18799,15 +19628,9 @@ exports.interview = functions
           }
         }
 
-        session.history.push({
-          role: "interviewer",
-          text: nextQuestion,
-          createdAt: nowIso,
-        });
+        session.history.push({ role: "interviewer", text: nextQuestion, createdAt: nowIso });
 
-        if (finalSummary) {
-          session.finished = true;
-        }
+        if (finalSummary) session.finished = true;
 
         session.updatedAt = new Date().toISOString();
         interviewSessions.set(sessionId, session);
@@ -18823,7 +19646,7 @@ exports.interview = functions
         });
       }
 
-      // ========== RÉPONSE ==========
+      // ANSWER
       if (action === "answer") {
         const userId = body.userId || "";
         const sessionId = body.sessionId || "";
@@ -18843,16 +19666,10 @@ exports.interview = functions
         }
 
         if (session.userId && session.userId !== userId) {
-          return res.status(403).json({
-            error: "Cette session ne correspond pas à cet utilisateur.",
-          });
+          return res.status(403).json({ error: "Cette session ne correspond pas à cet utilisateur." });
         }
 
-        session.history.push({
-          role: "candidate",
-          text: userMessage,
-          createdAt: new Date().toISOString(),
-        });
+        session.history.push({ role: "candidate", text: userMessage, createdAt: new Date().toISOString() });
 
         const nextStep = Math.min(
           (session.currentStep || 1) + 1,
@@ -18870,34 +19687,28 @@ exports.interview = functions
             process.env.GEMINI_API_KEY ||
             (functions.config().gemini && functions.config().gemini.key);
 
-          if (!GEMINI_API_KEY) {
-            throw new Error("GEMINI_API_KEY manquante");
-          }
+          if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY manquante");
 
           const prompt = buildInterviewPrompt(session, userMessage);
           const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.6, 1200);
+
           const parsed = extractInterviewJson(raw) || {};
-          if (parsed && typeof parsed === "object") {
-            if (typeof parsed.next_question === "string" && parsed.next_question.trim()) {
-              nextQuestion = parsed.next_question.trim();
-            }
-            if (typeof parsed.short_analysis === "string") {
-              shortAnalysis = parsed.short_analysis.trim();
-            }
-            if (typeof parsed.final_summary === "string" && parsed.final_summary.trim()) {
-              finalSummary = parsed.final_summary.trim();
-            }
-            if (typeof parsed.final_score === "number" || typeof parsed.final_score === "string") {
-              const num = Number(parsed.final_score);
-              if (!Number.isNaN(num)) finalScore = num;
-            }
+          if (typeof parsed.next_question === "string" && parsed.next_question.trim()) {
+            nextQuestion = parsed.next_question.trim();
+          }
+          if (typeof parsed.short_analysis === "string") shortAnalysis = parsed.short_analysis.trim();
+          if (typeof parsed.final_summary === "string" && parsed.final_summary.trim()) {
+            finalSummary = parsed.final_summary.trim();
+          }
+          if (typeof parsed.final_score === "number" || typeof parsed.final_score === "string") {
+            const num = Number(parsed.final_score);
+            if (!Number.isNaN(num)) finalScore = num;
           }
         } catch (err) {
           console.error("Erreur Gemini (interview/answer):", err);
         }
 
-        const isLastStep =
-          session.currentStep >= (session.totalQuestions || INTERVIEW_QUESTION_PLAN.complet);
+        const isLastStep = session.currentStep >= (session.totalQuestions || INTERVIEW_QUESTION_PLAN.complet);
 
         if (!nextQuestion && !finalSummary) {
           if (isLastStep) {
@@ -18913,16 +19724,10 @@ exports.interview = functions
         }
 
         if (nextQuestion) {
-          session.history.push({
-            role: "interviewer",
-            text: nextQuestion,
-            createdAt: new Date().toISOString(),
-          });
+          session.history.push({ role: "interviewer", text: nextQuestion, createdAt: new Date().toISOString() });
         }
 
-        if (finalSummary || isLastStep) {
-          session.finished = true;
-        }
+        if (finalSummary || isLastStep) session.finished = true;
 
         session.updatedAt = new Date().toISOString();
         interviewSessions.set(sessionId, session);
@@ -18938,18 +19743,16 @@ exports.interview = functions
         });
       }
 
-      return res.status(400).json({
-        error: "Action invalide. Utilise 'start' ou 'answer'.",
-      });
+      return res.status(400).json({ error: "Action invalide. Utilise 'start' ou 'answer'." });
     } catch (err) {
       console.error("Erreur interne /interview:", err);
-      return res.status(500).json({
-        error: "Erreur interne lors de la simulation d'entretien.",
-      });
+      return res.status(500).json({ error: "Erreur interne lors de la simulation d'entretien." });
     }
   });
 
-// Construit un contexte texte compact à partir du profil CV
+// =============================
+//  Build profile context
+// =============================
 function buildProfileContextForIA(profile) {
   const p = profile || {};
 
@@ -18960,26 +19763,21 @@ function buildProfileContextForIA(profile) {
     skillsArr = [];
     if (Array.isArray(p.skills.sections)) {
       p.skills.sections.forEach((sec) => {
-        if (Array.isArray(sec.items)) {
-          skillsArr = skillsArr.concat(sec.items);
-        }
+        if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
       });
     }
-    if (Array.isArray(p.skills.tools)) {
-      skillsArr = skillsArr.concat(p.skills.tools);
-    }
+    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
   } else {
     skillsArr = [];
   }
+
   const skillsStr = (skillsArr || []).join(", ");
 
   const expStr = Array.isArray(p.experiences)
     ? p.experiences
         .map(
           (e) =>
-            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(
-              e.bullets || []
-            ).join(" ")}`
+            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
         )
         .join("; \n")
     : "";
@@ -19007,17 +19805,10 @@ Langues: ${p.langLine || p.lang || ""}`.trim();
 }
 
 // =============================
-//  HELPER: création PDF simple pour CV
+//  PDF helpers
 // =============================
-
 async function createSimpleCvPdf(profile, options) {
-  const {
-    targetJob = "",
-    lang = "fr",
-    contract = "",
-    jobLink = "",
-    jobDescription = "",
-  } = options || {};
+  const { targetJob = "", lang = "fr", contract = "", jobLink = "", jobDescription = "" } = options || {};
 
   const p = profile || {};
   const pdfDoc = await PDFDocument.create();
@@ -19032,13 +19823,7 @@ async function createSimpleCvPdf(profile, options) {
   function drawLine(text, size = 11, bold = false) {
     if (!text || y < 50) return;
     const f = bold ? fontBold : font;
-    page.drawText(text, {
-      x: marginX,
-      y,
-      size,
-      font: f,
-      color: rgb(0.1, 0.12, 0.16),
-    });
+    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
     y -= size + 4;
   }
 
@@ -19057,13 +19842,7 @@ async function createSimpleCvPdf(profile, options) {
         const testWidth = f.widthOfTextAtSize(testLine, size);
         if (testWidth > maxWidth) {
           if (y < 50) return;
-          page.drawText(line, {
-            x: marginX,
-            y,
-            size,
-            font: f,
-            color: rgb(0.1, 0.12, 0.16),
-          });
+          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
           y -= size + 3;
           line = w;
         } else {
@@ -19072,29 +19851,16 @@ async function createSimpleCvPdf(profile, options) {
       }
 
       if (line && y >= 50) {
-        page.drawText(line, {
-          x: marginX,
-          y,
-          size,
-          font: f,
-          color: rgb(0.1, 0.12, 0.16),
-        });
+        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
         y -= size + 6;
       }
-
       y -= 2;
     }
   }
 
   function drawSectionTitle(title) {
     if (!title || y < 60) return;
-    page.drawText(title, {
-      x: marginX,
-      y,
-      size: 11,
-      font: fontBold,
-      color: rgb(0.08, 0.15, 0.45),
-    });
+    page.drawText(title, { x: marginX, y, size: 11, font: fontBold, color: rgb(0.08, 0.15, 0.45) });
     y -= 14;
   }
 
@@ -19139,34 +19905,24 @@ async function createSimpleCvPdf(profile, options) {
     }
   }
 
-  // En-tête
+  // Header
   drawLine(p.fullName || "", 16, true);
-  const jobLine =
-    targetJob ||
-    contract ||
-    p.contractType ||
-    (lang === "en" ? "Target position" : "Poste recherché");
+  const jobLine = targetJob || contract || p.contractType || (lang === "en" ? "Target position" : "Poste recherché");
   drawLine(jobLine, 11, false);
 
   const contactParts = [p.email || "", p.phone || "", p.city || "", p.linkedin || ""].filter(Boolean);
-  if (contactParts.length) {
-    drawLine(contactParts.join(" · "), 9, false);
-  }
+  if (contactParts.length) drawLine(contactParts.join(" · "), 9, false);
 
-  if (jobLink) {
-    drawLine((lang === "en" ? "Job link: " : "Lien de l'offre : ") + jobLink, 8, false);
-  }
+  if (jobLink) drawLine((lang === "en" ? "Job link: " : "Lien de l'offre : ") + jobLink, 8, false);
 
   y -= 6;
 
-  // Résumé
   if (p.profileSummary) {
     drawSectionTitle(lang === "en" ? "Profile" : "Profil");
     drawParagraph(p.profileSummary, 9.5);
     y -= 4;
   }
 
-  // Compétences
   if (p.skills && Array.isArray(p.skills.sections) && p.skills.sections.length) {
     drawSectionTitle(lang === "en" ? "Key skills" : "Compétences clés");
     p.skills.sections.forEach((sec) => {
@@ -19177,7 +19933,6 @@ async function createSimpleCvPdf(profile, options) {
     });
   }
 
-  // Expériences
   if (Array.isArray(p.experiences) && p.experiences.length) {
     drawSectionTitle(lang === "en" ? "Experience" : "Expériences professionnelles");
     p.experiences.forEach((exp) => {
@@ -19190,7 +19945,6 @@ async function createSimpleCvPdf(profile, options) {
     });
   }
 
-  // Formation
   if (Array.isArray(p.education) && p.education.length && y > 80) {
     drawSectionTitle(lang === "en" ? "Education" : "Formation");
     p.education.forEach((ed) => {
@@ -19202,7 +19956,6 @@ async function createSimpleCvPdf(profile, options) {
     });
   }
 
-  // Divers
   if (p.langLine && y > 60) {
     drawSectionTitle(lang === "en" ? "Languages" : "Langues");
     drawParagraph(p.langLine, 9);
@@ -19216,10 +19969,6 @@ async function createSimpleCvPdf(profile, options) {
   const pdfBytes = await pdfDoc.save();
   return Buffer.from(pdfBytes);
 }
-
-// =============================
-//  HELPER: création PDF pour lettre de motivation
-// =============================
 
 async function createLetterPdf(coverLetter, meta) {
   const { jobTitle = "", companyName = "", candidateName = "", lang = "fr" } = meta || {};
@@ -19236,13 +19985,7 @@ async function createLetterPdf(coverLetter, meta) {
   function drawLine(text, size = 11, bold = false) {
     if (!text || y < 60) return;
     const f = bold ? fontBold : font;
-    page.drawText(text, {
-      x: marginX,
-      y,
-      size,
-      font: f,
-      color: rgb(0.15, 0.17, 0.23),
-    });
+    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
     y -= size + 4;
   }
 
@@ -19295,9 +20038,57 @@ async function createLetterPdf(coverLetter, meta) {
   return Buffer.from(pdfBytes);
 }
 
-/* ============================
-   HTTPS: generateLetterAndPitch
-   ============================ */
+// =============================
+//  HTTPS: generateLetterAndPitch
+// =============================
+function buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang) {
+  const p = profile || {};
+  const name = p.fullName || "";
+  const city = p.city || "";
+  const primaryDomain = p.primaryDomain || "";
+  const summary = p.profileSummary || "";
+  const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
+  const role = firstExp?.role || firstExp?.title || "";
+  const company = firstExp?.company || "";
+  const years = Array.isArray(p.experiences) && p.experiences.length > 0 ? p.experiences.length : null;
+
+  if (lang === "en") {
+    return {
+      pitch:
+        summary ||
+        `I am ${name || "a candidate"} with ${years ? years + " years of experience" : "solid experience"} in ${
+          primaryDomain || "my field"
+        }, motivated by the ${jobTitle || "role"} at ${companyName || "your company"}.`,
+      // fallback "full letter", ok if you use it as body too
+      coverLetter: `I am writing to express my interest in the position of ${jobTitle || "your advertised role"}. With ${
+        years ? years + " years of experience" : "solid experience"
+      } in ${primaryDomain || "my field"}, I have developed strong skills relevant to this opportunity.
+
+In my previous experience at ${company || "my last company"}, I contributed to projects with measurable impact and collaborated with different stakeholders.
+
+I would be delighted to discuss how I can contribute to your team.`,
+    };
+  }
+
+  return {
+    pitch:
+      summary ||
+      `Je suis ${name || "un(e) candidat(e)"} avec ${
+        years ? years + " ans d’expérience" : "une solide expérience"
+      } ${primaryDomain ? "dans " + primaryDomain : ""}, motivé(e) par le poste de ${
+        jobTitle || "votre poste"
+      } chez ${companyName || "votre entreprise"}.`,
+    // fallback "full letter", ok if you use it as body too
+    coverLetter: `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
+      companyName || "votre entreprise"
+    }. Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
+      primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
+    }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
+
+Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`,
+  };
+}
+
 exports.generateLetterAndPitch = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
@@ -19321,88 +20112,76 @@ exports.generateLetterAndPitch = functions
       const langRaw = body.lang || "fr";
       const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
 
-      if (!profile) {
-        return res.status(400).json({ error: "Champ 'profile' manquant dans le corps JSON." });
-      }
-
-      if (!jobTitle && !jobDescription) {
+      if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
+      if (!jobTitle && !jobDescription)
         return res.status(400).json({
           error: "Ajoute au moins l'intitulé du poste ou un extrait de la description.",
         });
-      }
 
       const GEMINI_API_KEY =
-        process.env.GEMINI_API_KEY ||
-        (functions.config().gemini && functions.config().gemini.key);
+        process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
 
       const cvText = buildProfileContextForIA(profile);
 
       if (!GEMINI_API_KEY) {
-        console.error("GEMINI_API_KEY manquante (generateLetterAndPitch)");
-        const { coverLetter, pitch } = buildFallbackLetterAndPitch(
-          profile,
-          jobTitle,
-          companyName,
-          jobDescription,
-          lang
-        );
-        return res.status(200).json({ coverLetter, pitch, lang });
+        const fb = buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang);
+        return res.status(200).json({ coverLetter: fb.coverLetter, pitch: fb.pitch, lang });
       }
 
+      // ✅ IMPORTANT: coverLetter = CORPS uniquement (pas d'objet / salutation / signature)
       const prompt =
         lang === "en"
-          ? `You are a career coach.
-Based on the candidate profile and the target job, produce a JSON object with exactly two keys:
-- "coverLetter": a professional cover letter in ENGLISH for the "${jobTitle || "role"}" position at "${companyName || "the company"}". Use 3–5 short paragraphs, adapted to the job description. Do NOT copy the job text.
-- "pitch": a concise elevator pitch in ENGLISH (2–4 sentences) the candidate can say out loud.
+          ? `You are a senior career coach and recruiter.
 
-Return STRICTLY valid JSON with this shape:
-{
-  "coverLetter": "string",
-  "pitch": "string"
-}
+Return STRICTLY valid JSON:
+{ "coverLetter": "string", "pitch": "string" }
 
-Do not add any other keys, explanations or markdown.
+COVER LETTER RULES:
+- "coverLetter" must be ONLY the BODY (no header, no subject, no greeting, no signature).
+- 3 to 5 short paragraphs separated by a blank line.
+- Do not invent facts, companies, tools, numbers.
+- Use ONLY the candidate profile and the job description.
 
-CANDIDATE PROFILE:
+CANDIDATE PROFILE (source of truth):
 ${cvText}
 
-JOB DESCRIPTION / HINTS:
-${jobDescription || "—"}`
-          : `Tu es un coach carrières.
-À partir du profil du candidat et de l'offre, produis un objet JSON avec exactement deux clés :
-- "coverLetter" : une lettre de motivation professionnelle en FRANÇAIS pour le poste "${jobTitle || "cible"}" chez "${companyName || "l'entreprise"}". 3–5 paragraphes courts, concrets, alignés avec l'offre. Ne copie pas le texte de l'annonce.
-- "pitch" : un pitch d’ascenseur concis en FRANÇAIS (2–4 phrases) que le candidat peut dire à l’oral.
+JOB DESCRIPTION:
+${jobDescription || "—"}
 
-FORMAT :
-Retourne STRICTEMENT un JSON valide de la forme :
-{
-  "coverLetter": "string",
-  "pitch": "string"
-}
+JOB TITLE: ${jobTitle || "the role"}
+COMPANY: ${companyName || "your company"}`
+          : `Tu es un coach carrières senior et recruteur.
 
-Pas d'autres clés, pas de markdown, pas de commentaires.
+Retourne STRICTEMENT un JSON valide :
+{ "coverLetter": "string", "pitch": "string" }
 
-PROFIL CANDIDAT :
+RÈGLES LETTRE :
+- "coverLetter" = UNIQUEMENT le CORPS (pas d’en-tête, pas d’objet, pas de formule d’appel, pas de signature).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Ne pas inventer (entreprises/outils/chiffres).
+- Utilise UNIQUEMENT le profil candidat + la fiche de poste.
+
+PROFIL CANDIDAT (source de vérité) :
 ${cvText}
 
-DESCRIPTION DU POSTE / INDICES :
-${jobDescription || "—"}`;
+FICHE DE POSTE :
+${jobDescription || "—"}
+
+INTITULÉ : ${jobTitle || "le poste"}
+ENTREPRISE : ${companyName || "votre entreprise"}`;
 
       let coverLetter = "";
       let pitch = "";
 
       try {
-        const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.7, 2400);
-        let cleaned = raw.replace(/```json|```/gi, "").trim();
-        let parsed;
+        const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.7, 2200);
+        const cleaned = String(raw).replace(/```json|```/gi, "").trim();
+        let parsed = null;
         try {
           parsed = JSON.parse(cleaned);
-        } catch (e) {
-          console.error("JSON Gemini (LM/pitch) invalide, utilisation brute du texte:", raw);
+        } catch {
           parsed = { coverLetter: cleaned, pitch: "" };
         }
-
         coverLetter = typeof parsed.coverLetter === "string" ? parsed.coverLetter.trim() : "";
         pitch = typeof parsed.pitch === "string" ? parsed.pitch.trim() : "";
       } catch (err) {
@@ -19418,99 +20197,64 @@ ${jobDescription || "—"}`;
       return res.status(200).json({ coverLetter, pitch, lang });
     } catch (err) {
       console.error("Erreur generateLetterAndPitch:", err);
-      const msg = err && err.message ? err.message : "Erreur interne lors de la génération LM/pitch.";
-      return res.status(500).json({ error: msg });
+      return res.status(500).json({ error: err?.message || "Erreur interne." });
     }
   });
 
-/**
- * Fallback local si Gemini plante ou renvoie un pitch vide
- */
-function buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang) {
-  const p = profile || {};
-  const name = p.fullName || "";
-  const city = p.city || "";
-  const primaryDomain = p.primaryDomain || "";
-  const summary = p.profileSummary || "";
-
-  const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
-
-  const role = firstExp?.role || firstExp?.title || "";
-  const company = firstExp?.company || "";
-  const years = Array.isArray(p.experiences) && p.experiences.length > 0 ? p.experiences.length : null;
-
-  let pitch;
-  let coverLetter;
+// =============================
+//  HTTPS: generateInterviewQA
+// =============================
+function buildFallbackQuestions(lang, role, company, city, dates, bullets) {
+  const missions = (Array.isArray(bullets) ? bullets : [])
+    .filter((b) => typeof b === "string")
+    .slice(0, 3);
 
   if (lang === "en") {
-    pitch =
-      summary ||
-      `I am ${name || "a candidate"} with ${years ? years + " years of experience" : "solid experience"} in ${
-        primaryDomain || "my field"
-      }, and I am particularly motivated by the position of ${jobTitle || "your role"} at ${
-        companyName || "your company"
-      }. I combine ${role || "relevant professional experience"} with strong motivation to contribute to your team.`;
-
-    coverLetter = `Dear ${companyName || "Hiring Manager"},
-
-I am writing to express my interest in the position of ${jobTitle || "your advertised role"}. With ${
-      years ? years + " years of experience" : "solid experience"
-    } in ${primaryDomain || "my field"}, I have developed strong skills in ${role || "my previous roles"} that I believe are directly relevant to this opportunity.
-
-In my previous experience at ${company || "my last company"}, I was involved in key missions where I ${
-      summary ||
-      "contributed to projects with measurable impact and collaborated closely with different stakeholders."
-    }
-
-What motivates me particularly about joining ${companyName || "your company"} is the opportunity to grow in a challenging environment and to contribute to concrete projects aligned with my values and skills.
-
-I would be delighted to further discuss my application with you and present in more detail how I can contribute to your team.
-
-Best regards,
-${name || ""}${city ? "\n" + city : ""}`;
-  } else {
-    pitch =
-      summary ||
-      `Je suis ${name || "un(e) candidat(e)"} avec ${
-        years ? years + " ans d’expérience" : "une solide expérience"
-      } ${primaryDomain ? "dans " + primaryDomain : ""}, et je suis particulièrement motivé(e) par le poste de ${
-        jobTitle || "votre poste"
-      } chez ${companyName || "votre entreprise"}. J’allie ${
-        role || "des expériences professionnelles pertinentes"
-      } à une forte motivation pour contribuer à vos projets.`;
-
-    coverLetter = `Madame, Monsieur,
-
-Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
-      companyName || "votre entreprise"
-    }. Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
-      primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
-    }, j’ai développé des compétences solides en ${
-      role || "gestion de projets, collaboration d’équipe et suivi d’objectifs"
-    }.
-
-Au cours de mon expérience ${company ? "chez " + company : "professionnelle"}, j’ai notamment ${
-      summary ||
-      "contribué à des projets à fort impact, tout en travaillant en étroite collaboration avec différentes parties prenantes."
-    }
-
-Ce qui me motive particulièrement dans le poste de ${jobTitle || "votre poste"}, c’est la possibilité de mettre à profit mes compétences au service de ${
-      companyName || "votre structure"
-    } et de continuer à progresser dans un environnement stimulant et exigeant.
-
-Je serais ravi(e) de pouvoir échanger plus en détail avec vous lors d’un entretien et de vous présenter plus précisément ce que je peux apporter à votre équipe.
-
-Je vous prie d’agréer, Madame, Monsieur, l’expression de mes salutations distinguées.
-
-${name || ""}${city ? "\n" + city : ""}`;
+    return [
+      {
+        question: `Can you describe your role as ${role} at ${company}?`,
+        answer: `In my position as ${role} at ${company}${city ? " in " + city : ""}${dates ? " (" + dates + ")" : ""}, I was responsible for ${
+          missions[0] || "several key tasks related to this role"
+        }.`,
+      },
+      {
+        question: `Tell me about a concrete achievement in this role.`,
+        answer: missions[1]
+          ? `One strong achievement was: ${missions[1]}`
+          : `One of my main achievements was delivering key tasks with measurable impact.`,
+      },
+      {
+        question: `Which tools or technologies did you use most often?`,
+        answer: missions[2]
+          ? `I regularly used tools/technologies such as ${missions[2]}.`
+          : `I used the main tools and workflows of the role on a daily basis.`,
+      },
+    ];
   }
 
-  return { coverLetter, pitch };
+  return [
+    {
+      question: `Pouvez-vous me décrire votre rôle de ${role} chez ${company} ?`,
+      answer: `Dans ce poste de ${role} chez ${company}${city ? " à " + city : ""}${dates ? " (" + dates + ")" : ""}, j'étais principalement en charge de ${
+        missions[0] ||
+        "plusieurs missions clés en lien avec le poste (projets, coordination, suivi, etc.)"
+      }.`,
+    },
+    {
+      question: `Parlez-moi d'une réalisation concrète dont vous êtes fier(e).`,
+      answer: missions[1]
+        ? `Une réalisation marquante : ${missions[1]}`
+        : `Une de mes réalisations majeures a eu un impact positif mesurable sur l'équipe et/ou l'entreprise.`,
+    },
+    {
+      question: `Quels outils ou technologies utilisiez-vous le plus souvent ?`,
+      answer: missions[2]
+        ? `J'utilisais notamment ${missions[2]} au quotidien.`
+        : `J'utilisais au quotidien les principaux outils liés à ce poste.`,
+    },
+  ];
 }
 
-/* ============================
-   HTTPS: generateInterviewQA
-   ============================ */
 exports.generateInterviewQA = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
@@ -19537,9 +20281,7 @@ exports.generateInterviewQA = functions
         });
       }
 
-      const idx = Number.isInteger(experienceIndex)
-        ? experienceIndex
-        : parseInt(experienceIndex, 10);
+      const idx = Number.isInteger(experienceIndex) ? experienceIndex : parseInt(experienceIndex, 10);
 
       if (Number.isNaN(idx) || !profile.experiences[idx]) {
         return res.status(400).json({ error: "Indice d'expérience invalide." });
@@ -19553,13 +20295,11 @@ exports.generateInterviewQA = functions
       const bullets = Array.isArray(exp.bullets) ? exp.bullets : [];
 
       const GEMINI_API_KEY =
-        process.env.GEMINI_API_KEY ||
-        (functions.config().gemini && functions.config().gemini.key);
+        process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
 
       const cvText = buildProfileContextForIA(profile);
 
       if (!GEMINI_API_KEY) {
-        console.error("GEMINI_API_KEY manquante (generateInterviewQA)");
         const questions = buildFallbackQuestions(lang, role, company, city, dates, bullets);
         return res.status(200).json({ questions, lang });
       }
@@ -19567,17 +20307,12 @@ exports.generateInterviewQA = functions
       const prompt =
         lang === "en"
           ? `You are an interview coach.
-Generate EXACTLY 3 interview question/answer pairs in ENGLISH.
-
-Return STRICTLY a JSON array of 3 objects:
+Return STRICTLY a JSON array of EXACTLY 3 objects:
 [
   { "question": "string", "answer": "string" },
-  ...
+  { "question": "string", "answer": "string" },
+  { "question": "string", "answer": "string" }
 ]
-
-Guidelines:
-- "question": short, precise.
-- "answer": concise (Action + Tool + Result) in 1–3 sentences or bullet-style lines.
 
 Context:
 - Role: ${role} — ${company} — ${city} — ${dates}
@@ -19585,17 +20320,12 @@ Context:
 - Candidate profile:
 ${cvText}`
           : `Tu es un coach d'entretien.
-Génère EXACTEMENT 3 paires question/réponse d'entretien en FRANÇAIS.
-
-Retourne STRICTEMENT un tableau JSON de 3 objets :
+Retourne STRICTEMENT un tableau JSON de EXACTEMENT 3 objets :
 [
   { "question": "string", "answer": "string" },
-  ...
+  { "question": "string", "answer": "string" },
+  { "question": "string", "answer": "string" }
 ]
-
-Règles :
-- "question" : question courte et précise.
-- "answer" : réponse synthétique (Action + Outils + Résultat) en 1–3 phrases ou lignes.
 
 Contexte :
 - ${role} — ${company} — ${city} — ${dates}
@@ -19603,17 +20333,16 @@ Contexte :
 - Profil candidat :
 ${cvText}`;
 
-      let questions;
+      let questions = null;
 
       try {
         const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.7, 1200);
-        let cleaned = raw.replace(/```json|```/gi, "").trim();
+        const cleaned = String(raw).replace(/```json|```/gi, "").trim();
 
-        let parsed;
+        let parsed = null;
         try {
           parsed = JSON.parse(cleaned);
-        } catch (e) {
-          console.error("JSON Gemini (Q&A) invalide, utilisation brute du texte:", raw);
+        } catch {
           parsed = null;
         }
 
@@ -19623,84 +20352,27 @@ ${cvText}`;
               question: (item.question || item.q || "").toString().trim(),
               answer: (item.answer || item.a || "").toString().trim(),
             }))
-            .filter((qa) => qa.question && qa.answer);
+            .filter((qa) => qa.question && qa.answer)
+            .slice(0, 3);
         }
+      } catch (e) {
+        console.error("Erreur Gemini generateInterviewQA:", e);
+      }
 
-        if (!questions || !questions.length) {
-          console.warn("Gemini Q&A vide, fallback local sur l'expérience:", role, company);
-          questions = buildFallbackQuestions(lang, role, company, city, dates, bullets);
-        }
-      } catch (gemErr) {
-        console.error("Erreur generateInterviewQA/Gemini:", gemErr);
+      if (!questions || questions.length !== 3) {
         questions = buildFallbackQuestions(lang, role, company, city, dates, bullets);
       }
 
       return res.status(200).json({ questions, lang });
     } catch (err) {
-      console.error("Erreur generateInterviewQA (général):", err);
-      return res.status(500).json({
-        error: "Erreur interne lors de la génération des Q&A, réessaie plus tard.",
-      });
+      console.error("Erreur generateInterviewQA:", err);
+      return res.status(500).json({ error: "Erreur interne lors de la génération des Q&A." });
     }
   });
 
 // =============================
-//  Fallback local si Gemini plante
+//  HTTPS: generateCvPdf
 // =============================
-function buildFallbackQuestions(lang, role, company, city, dates, bullets) {
-  const missions = (Array.isArray(bullets) ? bullets : [])
-    .filter((b) => typeof b === "string")
-    .slice(0, 3);
-
-  if (lang === "en") {
-    return [
-      {
-        question: `Can you describe your role as ${role} at ${company}?`,
-        answer: `In my position as ${role} at ${company}${city ? " in " + city : ""}${dates ? " (" + dates + ")" : ""}, I was responsible for ${
-          missions[0] || "several key tasks related to this role"
-        }.`,
-      },
-      {
-        question: `Tell me about a concrete achievement in this role.`,
-        answer: missions[1]
-          ? `One strong achievement was: ${missions[1]}`
-          : `One of my main achievements was successfully delivering key tasks with measurable impact on the project and the team.`,
-      },
-      {
-        question: `Which tools or technologies did you use most often in this position?`,
-        answer: missions[2]
-          ? `In this role, I regularly used tools and technologies such as ${missions[2]}.`
-          : `I used the main tools and technologies of the job on a daily basis (development, monitoring, collaboration, etc.).`,
-      },
-    ];
-  }
-
-  return [
-    {
-      question: `Pouvez-vous me décrire votre rôle de ${role} chez ${company} ?`,
-      answer: `Dans ce poste de ${role} chez ${company}${city ? " à " + city : ""}${dates ? " (" + dates + ")" : ""}, j'étais principalement en charge de ${
-        missions[0] ||
-        "plusieurs missions clés en lien avec le poste (projets, coordination, suivi, etc.)"
-      }.`,
-    },
-    {
-      question: `Parlez-moi d'une réalisation concrète dont vous êtes fier(e) dans ce poste.`,
-      answer: missions[1]
-        ? `Une réalisation marquante : ${missions[1]}`
-        : `Une de mes réalisations majeures a été de mener à bien des missions qui ont eu un impact positif mesurable sur l'équipe et/ou l'entreprise.`,
-    },
-    {
-      question: `Quels outils ou technologies utilisiez-vous le plus souvent dans ce rôle ?`,
-      answer: missions[2]
-        ? `Dans ce rôle, j'utilisais notamment ${missions[2]} au quotidien.`
-        : `J'utilisais au quotidien les principaux outils et technologies liés à ce poste (outils métiers, outils de suivi, communication, etc.).`,
-    },
-  ];
-}
-
-/* ============================
-   HTTPS: generateCvPdf
-   ============================ */
 exports.generateCvPdf = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
@@ -19719,17 +20391,13 @@ exports.generateCvPdf = functions
       const body = req.body || {};
       const profile = body.profile;
       const targetJob = body.targetJob || "";
-      const template = body.template || "ats";
       const langRaw = body.lang || "fr";
       const contract = body.contract || "";
       const jobLink = body.jobLink || "";
       const jobDescription = body.jobDescription || "";
-
       const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
 
-      if (!profile) {
-        return res.status(400).json({ error: "Champ 'profile' manquant dans le corps JSON." });
-      }
+      if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
 
       const pdfBuffer = await createSimpleCvPdf(profile, {
         targetJob,
@@ -19741,18 +20409,16 @@ exports.generateCvPdf = functions
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", 'attachment; filename="cv-ia.pdf"');
-
       return res.status(200).send(pdfBuffer);
     } catch (err) {
       console.error("Erreur generateCvPdf:", err);
-      const msg = err && err.message ? err.message : "Erreur interne lors de la génération du CV.";
-      return res.status(500).json({ error: msg });
+      return res.status(500).json({ error: err?.message || "Erreur interne." });
     }
   });
 
-/* ============================
-   HTTPS: generateCvLmZip
-   ============================ */
+// =============================
+//  HTTPS: generateCvLmZip
+// =============================
 exports.generateCvLmZip = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
@@ -19770,19 +20436,15 @@ exports.generateCvLmZip = functions
       const body = req.body || {};
       const profile = body.profile;
       const targetJob = body.targetJob || "";
-      const template = body.template || "ats";
       const langRaw = body.lang || "fr";
       const contract = body.contract || "";
       const jobLink = body.jobLink || "";
       const jobDescription = body.jobDescription || "";
       const lm = body.lm || {};
-      const autoCreate = !!body.autoCreate;
 
       const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
 
-      if (!profile) {
-        return res.status(400).json({ error: "Champ 'profile' manquant dans le corps JSON." });
-      }
+      if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
 
       const cvBuffer = await createSimpleCvPdf(profile, {
         targetJob,
@@ -19793,14 +20455,11 @@ exports.generateCvLmZip = functions
       });
 
       const GEMINI_API_KEY =
-        process.env.GEMINI_API_KEY ||
-        (functions.config().gemini && functions.config().gemini.key);
+        process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
 
       if (!GEMINI_API_KEY) {
-        console.error("GEMINI_API_KEY manquante (generateCvLmZip)");
         return res.status(500).json({
-          error:
-            "Clé Gemini manquante côté serveur. Configure GEMINI_API_KEY ou functions.config().gemini.key.",
+          error: "Clé Gemini manquante côté serveur. Configure GEMINI_API_KEY ou functions.config().gemini.key.",
         });
       }
 
@@ -19812,31 +20471,72 @@ exports.generateCvLmZip = functions
 
       const cvText = buildProfileContextForIA(profile);
 
+      // ✅ NOUVEAU PROMPT (CORPS “vrai” + JSON + anti-hallucination)
       const promptLm =
         lmLang === "en"
-          ? `You are a career coach.
-Based on the candidate profile and the target job, produce ONLY a professional cover letter in ENGLISH for the "${jobTitle || "role"}" position at "${companyName || "the company"}". Use 3–5 short paragraphs, adapted to the job description. Do NOT copy the job text.
+          ? `
+You are a senior career coach and recruiter.
 
-Return ONLY the letter body as plain text (no JSON, no explanation).
+TASK:
+Write ONLY the BODY of a cover letter tailored to the job, using ONLY the provided information (CV + job description).
 
-CANDIDATE PROFILE:
+INPUTS:
+- Job title: "${jobTitle || "the role"}"
+- Company: "${companyName || "your company"}"
+- Job description:
+${lmJobDescription || jobDescription || "—"}
+
+- Candidate profile (source of truth):
 ${cvText}
 
-JOB DESCRIPTION / HINTS:
-${lmJobDescription || "—"}`
-          : `Tu es un coach carrières.
-À partir du profil du candidat et de l'offre, produis UNIQUEMENT une lettre de motivation professionnelle en FRANÇAIS pour le poste "${jobTitle || "cible"}" chez "${companyName || "l'entreprise"}". 3–5 paragraphes courts, concrets, alignés avec l'offre. Ne copie pas le texte de l'annonce.
+STRICT RULES:
+- Do NOT invent facts (no fake metrics, clients, tools, dates).
+- 3 to 5 paragraphs separated by ONE blank line.
+- No header, no subject line, no greeting, no signature.
+- Output MUST be STRICT JSON only:
+{ "body": "..." }
+`.trim()
+          : `
+Tu es un coach carrières senior et recruteur.
 
-Retourne UNIQUEMENT le corps de la lettre en texte brut (pas de JSON, pas de commentaires).
+MISSION :
+Rédige UNIQUEMENT le CORPS d’une lettre de motivation adaptée au poste, basée UNIQUEMENT sur les infos fournies (CV + fiche de poste).
 
-PROFIL CANDIDAT :
+ENTRÉES :
+- Intitulé : "${jobTitle || targetJob || "le poste"}"
+- Entreprise : "${companyName || "votre entreprise"}"
+- Fiche de poste :
+${lmJobDescription || jobDescription || "—"}
+
+- Profil candidat :
 ${cvText}
 
-DESCRIPTION DU POSTE / INDICES :
-${lmJobDescription || "—"}`;
+RÈGLES :
+- Ne pas inventer (pas de chiffres/clients/technos non présents).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Pas d’en-tête, pas d’objet, pas de salutation, pas de signature.
+- Réponds STRICTEMENT en JSON :
+{ "body": "..." }
+`.trim();
 
-      const rawLm = await callGeminiText(promptLm, GEMINI_API_KEY, 0.7, 2400);
-      const coverLetterText = rawLm.trim();
+      const rawLm = await callGeminiText(promptLm, GEMINI_API_KEY, 0.65, 1400);
+
+      // Parsing JSON strict
+      let coverLetterText = "";
+      try {
+        const cleaned = String(rawLm).replace(/```json|```/gi, "").trim();
+        const parsed = JSON.parse(cleaned);
+        coverLetterText = typeof parsed.body === "string" ? parsed.body.trim() : "";
+      } catch {
+        // fallback: si l'IA foire, on prend brut
+        coverLetterText = String(rawLm || "").trim();
+      }
+
+      if (!coverLetterText) {
+        // fallback de sécurité
+        const fb = buildFallbackLetterAndPitch(profile, jobTitle, companyName, lmJobDescription, lmLang);
+        coverLetterText = fb.coverLetter || "";
+      }
 
       const lmBuffer = await createLetterPdf(coverLetterText, {
         jobTitle,
@@ -19853,19 +20553,16 @@ ${lmJobDescription || "—"}`;
 
       res.setHeader("Content-Type", "application/zip");
       res.setHeader("Content-Disposition", 'attachment; filename="cv-lm-ia.zip"');
-
       return res.status(200).send(zipContent);
     } catch (err) {
       console.error("Erreur generateCvLmZip:", err);
-      const msg =
-        err && err.message ? err.message : "Erreur interne lors de la génération du ZIP CV + LM.";
-      return res.status(500).json({ error: msg });
+      return res.status(500).json({ error: err?.message || "Erreur interne." });
     }
   });
 
-/* ============================
-   HTTPS: generateLetterPdf (LM -> PDF direct)
-   ============================ */
+// =============================
+//  HTTPS: generateLetterPdf
+// =============================
 exports.generateLetterPdf = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
@@ -19889,10 +20586,7 @@ exports.generateLetterPdf = functions
       const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
 
       if (!coverLetter) {
-        return res.status(400).json({
-          error:
-            "Champ 'coverLetter' manquant ou vide. Envoie le texte de la lettre à convertir en PDF.",
-        });
+        return res.status(400).json({ error: "Champ 'coverLetter' manquant ou vide." });
       }
 
       const pdfBuffer = await createLetterPdf(coverLetter, {
@@ -19908,25 +20602,20 @@ exports.generateLetterPdf = functions
         .replace(/^-+|-+$/g, "");
 
       const filename =
-        (lang === "en" ? "cover-letter" : "lettre-motivation") +
-        (safeJob ? `-${safeJob}` : "") +
-        ".pdf";
+        (lang === "en" ? "cover-letter" : "lettre-motivation") + (safeJob ? `-${safeJob}` : "") + ".pdf";
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-
       return res.status(200).send(pdfBuffer);
     } catch (err) {
       console.error("Erreur generateLetterPdf:", err);
-      return res.status(500).json({
-        error: "Erreur interne lors de la génération du PDF de la lettre.",
-      });
+      return res.status(500).json({ error: "Erreur interne lors de la génération du PDF." });
     }
   });
 
-/* ============================
-   HTTPS: jobs (recherche d'offres Adzuna)
-   ============================ */
+// =============================
+//  HTTPS: jobs (Adzuna)
+// =============================
 exports.jobs = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
@@ -19941,6 +20630,8 @@ exports.jobs = functions
     if (deny) return;
 
     try {
+      if (!fetchFn) throw new Error("fetch indisponible. Mets Node 18+.");
+
       const body = req.body || {};
       const query = (body.query || "").toString().trim();
       const location = (body.location || "").toString().trim();
@@ -19948,23 +20639,15 @@ exports.jobs = functions
 
       if (!query && !location) {
         return res.status(400).json({
-          error:
-            "Ajoute au moins un mot-clé (query) ou un lieu (location) pour lancer la recherche.",
+          error: "Ajoute au moins un mot-clé (query) ou un lieu (location).",
         });
       }
 
-      const ADZUNA_APP_ID =
-        (functions.config().adzuna && functions.config().adzuna.app_id) || process.env.ADZUNA_APP_ID;
-      const ADZUNA_APP_KEY =
-        (functions.config().adzuna && functions.config().adzuna.app_key) ||
-        process.env.ADZUNA_APP_KEY;
+      const ADZUNA_APP_ID = (functions.config().adzuna && functions.config().adzuna.app_id) || process.env.ADZUNA_APP_ID;
+      const ADZUNA_APP_KEY = (functions.config().adzuna && functions.config().adzuna.app_key) || process.env.ADZUNA_APP_KEY;
 
       if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY) {
-        console.error("Clés Adzuna manquantes dans functions.config() ou env.");
-        return res.status(500).json({
-          error:
-            "Clés Adzuna manquantes côté serveur. Configure adzuna.app_id et adzuna.app_key.",
-        });
+        return res.status(500).json({ error: "Clés Adzuna manquantes côté serveur." });
       }
 
       const page =
@@ -19984,11 +20667,7 @@ exports.jobs = functions
 
       const url = `https://api.adzuna.com/v1/api/jobs/fr/search/${page}?${params.toString()}`;
 
-      const resp = await fetch(url, {
-        method: "GET",
-        headers: { Accept: "application/json" },
-      });
-
+      const resp = await fetchFn(url, { method: "GET", headers: { Accept: "application/json" } });
       if (!resp.ok) {
         const textErr = await resp.text();
         console.error("Erreur Adzuna:", resp.status, textErr);
@@ -20006,41 +20685,30 @@ exports.jobs = functions
         return {
           id: job.id || `job-${index}`,
           title: job.title || "Offre sans titre",
-          company:
-            job.company && job.company.display_name ? job.company.display_name : "Entreprise non renseignée",
-          location:
-            job.location && job.location.display_name ? job.location.display_name : "Lieu non précisé",
+          company: job.company && job.company.display_name ? job.company.display_name : "Entreprise non renseignée",
+          location: job.location && job.location.display_name ? job.location.display_name : "Lieu non précisé",
           url: job.redirect_url || "",
           description: job.description || "",
           created: job.created || "",
-          salary: hasSalary
-            ? `${salaryMin.toLocaleString("fr-FR")} – ${salaryMax.toLocaleString("fr-FR")} €`
-            : null,
+          salary: hasSalary ? `${salaryMin.toLocaleString("fr-FR")} – ${salaryMax.toLocaleString("fr-FR")} €` : null,
         };
       });
 
       return res.status(200).json({ jobs });
     } catch (err) {
       console.error("Erreur /jobs:", err);
-      return res.status(500).json({
-        error: "Erreur interne lors de la recherche d'offres (Adzuna /jobs).",
-      });
+      return res.status(500).json({ error: "Erreur interne lors de la recherche d'offres (Adzuna /jobs)." });
     }
   });
 
-/* ============================
-   POLAR CHECKOUT (paiement crédits)
-   ============================ */
-
-// Log au démarrage si le token manque
+// =============================
+//  Polar checkout + webhook
+// =============================
 const POLAR_ACCESS_TOKEN_BOOT =
-  process.env.POLAR_ACCESS_TOKEN ||
-  (functions.config().polar && functions.config().polar.access_token);
+  process.env.POLAR_ACCESS_TOKEN || (functions.config().polar && functions.config().polar.access_token);
 
 if (!POLAR_ACCESS_TOKEN_BOOT) {
-  console.warn(
-    "⚠️ POLAR_ACCESS_TOKEN manquant (env ou functions.config().polar.access_token). Les paiements ne fonctionneront pas."
-  );
+  console.warn("⚠️ POLAR_ACCESS_TOKEN manquant. Les paiements ne fonctionneront pas.");
 }
 
 exports.polarCheckout = functions
@@ -20069,40 +20737,27 @@ exports.polarCheckout = functions
       }
 
       const polarAccessToken =
-        process.env.POLAR_ACCESS_TOKEN ||
-        (functions.config().polar && functions.config().polar.access_token);
+        process.env.POLAR_ACCESS_TOKEN || (functions.config().polar && functions.config().polar.access_token);
 
       const polarEnv =
         process.env.POLAR_ENV || (functions.config().polar && functions.config().polar.env) || "sandbox";
 
-      const product20 =
-        process.env.POLAR_PRODUCT_20_ID ||
-        (functions.config().polar && functions.config().polar.product_20_id);
-      const product50 =
-        process.env.POLAR_PRODUCT_50_ID ||
-        (functions.config().polar && functions.config().polar.product_50_id);
-      const product100 =
-        process.env.POLAR_PRODUCT_100_ID ||
-        (functions.config().polar && functions.config().polar.product_100_id);
+      const product20 = process.env.POLAR_PRODUCT_20_ID || (functions.config().polar && functions.config().polar.product_20_id);
+      const product50 = process.env.POLAR_PRODUCT_50_ID || (functions.config().polar && functions.config().polar.product_50_id);
+      const product100 = process.env.POLAR_PRODUCT_100_ID || (functions.config().polar && functions.config().polar.product_100_id);
 
       if (!polarAccessToken) {
-        console.error("POLAR_ACCESS_TOKEN manquant côté serveur");
         return res.status(500).json({ ok: false, error: "Configuration Polar manquante côté serveur." });
       }
 
       const server = polarEnv === "production" ? "production" : "sandbox";
 
-      const polar = new Polar({
-        accessToken: polarAccessToken,
-        // @ts-ignore selon version du SDK
-        server,
-      });
+      const polar = new Polar({ accessToken: polarAccessToken, server });
 
       const mapPackToProduct = { "20": product20, "50": product50, "100": product100 };
-      const productId = mapPackToProduct[packId];
+      const productId = mapPackToProduct[String(packId)];
 
       if (!productId) {
-        console.error("Pack invalide ou productId non configuré :", packId);
         return res.status(400).json({
           ok: false,
           error: `Pack invalide ou productId non configuré pour "${packId}".`,
@@ -20122,14 +20777,11 @@ exports.polarCheckout = functions
         success_url: successUrl,
         return_url: returnUrl,
         customer_email: email,
-
         external_customer_id: userId,
-
         allow_discount_codes: true,
         require_billing_address: false,
         allow_trial: true,
         is_business_customer: false,
-
         metadata: {
           firebase_uid: String(userId),
           pack_id: String(packId),
@@ -20140,11 +20792,10 @@ exports.polarCheckout = functions
       const checkout = await polar.checkouts.create(payload);
 
       if (!checkout || !checkout.url) {
-        console.error("Checkout Polar créé mais sans URL :", checkout);
         return res.status(500).json({ ok: false, error: "Checkout Polar créé mais URL manquante." });
       }
 
-      // ✅ mapping checkoutId -> userId en Firestore
+      // mapping checkoutId -> userId
       try {
         const checkoutId = checkout.id ? String(checkout.id) : null;
         const customerId = checkout.customer_id ? String(checkout.customer_id) : null;
@@ -20176,7 +20827,11 @@ exports.polarCheckout = functions
             .collection("polar_customers")
             .doc(customerId)
             .set(
-              { userId: String(userId), email: String(email), updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+              {
+                userId: String(userId),
+                email: String(email),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
               { merge: true }
             );
         }
@@ -20191,10 +20846,6 @@ exports.polarCheckout = functions
     }
   });
 
-/* ============================
-   POLAR WEBHOOK (ajout de crédits dans Firestore)
-   ============================ */
-
 function deepFindByKey(obj, keyNames) {
   if (!obj || typeof obj !== "object") return null;
   const keys = Array.isArray(keyNames) ? keyNames : [keyNames];
@@ -20204,9 +20855,7 @@ function deepFindByKey(obj, keyNames) {
     const found = keys.find((target) => lower === target.toLowerCase());
     if (found) {
       const val = obj[k];
-      if (val !== undefined && val !== null && val !== "") {
-        return val;
-      }
+      if (val !== undefined && val !== null && val !== "") return val;
     }
     const child = obj[k];
     if (child && typeof child === "object") {
@@ -20227,14 +20876,10 @@ function deepCollectByKey(obj, keyNames, acc = []) {
     const val = obj[k];
 
     if (isMatch) {
-      if (val !== undefined && val !== null && val !== "") {
-        acc.push(val);
-      }
+      if (val !== undefined && val !== null && val !== "") acc.push(val);
     }
 
-    if (val && typeof val === "object") {
-      deepCollectByKey(val, keys, acc);
-    }
+    if (val && typeof val === "object") deepCollectByKey(val, keys, acc);
   }
   return acc;
 }
@@ -20248,10 +20893,6 @@ function inferCreditsFromText(text) {
   return 0;
 }
 
-const POLAR_WEBHOOK_SECRET =
-  process.env.POLAR_WEBHOOK_SECRET ||
-  (functions.config().polar && functions.config().polar.webhook_secret);
-
 exports.polarWebhook = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
@@ -20262,44 +20903,26 @@ exports.polarWebhook = functions
       return res.status(405).json({ ok: false, error: "Méthode non autorisée" });
     }
 
-    let event;
-
     try {
-      // ✅ Debug (validation désactivée pour l'instant)
-      event = req.body || {};
-
+      // ⚠️ Validation signature désactivée (tu peux réactiver plus tard avec validateEvent)
+      const event = req.body || {};
       console.log("Webhook Polar reçu :", JSON.stringify(event, null, 2));
 
       if (!event || !event.type) {
-        console.error("Webhook Polar sans type d'événement.");
         return res.status(400).json({ ok: false, error: "Event Polar invalide (type manquant)." });
       }
 
-      // On ne gère que order.paid
       if (event.type !== "order.paid") {
-        console.log("Event Polar ignoré (type non géré) :", event.type);
         return res.status(200).json({ ok: true, ignored: true });
       }
 
-      const product20 =
-        process.env.POLAR_PRODUCT_20_ID ||
-        (functions.config().polar && functions.config().polar.product_20_id);
-      const product50 =
-        process.env.POLAR_PRODUCT_50_ID ||
-        (functions.config().polar && functions.config().polar.product_50_id);
-      const product100 =
-        process.env.POLAR_PRODUCT_100_ID ||
-        (functions.config().polar && functions.config().polar.product_100_id);
+      const product20 = process.env.POLAR_PRODUCT_20_ID || (functions.config().polar && functions.config().polar.product_20_id);
+      const product50 = process.env.POLAR_PRODUCT_50_ID || (functions.config().polar && functions.config().polar.product_50_id);
+      const product100 = process.env.POLAR_PRODUCT_100_ID || (functions.config().polar && functions.config().polar.product_100_id);
 
-      const price20 =
-        process.env.POLAR_PRICE_20_ID ||
-        (functions.config().polar && functions.config().polar.price_20_id);
-      const price50 =
-        process.env.POLAR_PRICE_50_ID ||
-        (functions.config().polar && functions.config().polar.price_50_id);
-      const price100 =
-        process.env.POLAR_PRICE_100_ID ||
-        (functions.config().polar && functions.config().polar.price_100_id);
+      const price20 = process.env.POLAR_PRICE_20_ID || (functions.config().polar && functions.config().polar.price_20_id);
+      const price50 = process.env.POLAR_PRICE_50_ID || (functions.config().polar && functions.config().polar.price_50_id);
+      const price100 = process.env.POLAR_PRICE_100_ID || (functions.config().polar && functions.config().polar.price_100_id);
 
       const CREDITS_BY_PRODUCT_ID = {};
       if (product20) CREDITS_BY_PRODUCT_ID[String(product20)] = 20;
@@ -20312,7 +20935,6 @@ exports.polarWebhook = functions
       if (price100) CREDITS_BY_PRICE_ID[String(price100)] = 100;
 
       const data = event.data || {};
-
       const priceIds = deepCollectByKey(data, ["product_price_id", "productPriceId"]).map(String);
       const productIds = deepCollectByKey(data, ["product_id", "productId"]).map(String);
 
@@ -20324,7 +20946,6 @@ exports.polarWebhook = functions
           break;
         }
       }
-
       if (!creditsToAdd) {
         for (const id of productIds) {
           if (CREDITS_BY_PRODUCT_ID[id]) {
@@ -20333,7 +20954,6 @@ exports.polarWebhook = functions
           }
         }
       }
-
       if (!creditsToAdd) {
         const labels = deepCollectByKey(data, ["label", "description", "name"])
           .filter((x) => typeof x === "string")
@@ -20348,7 +20968,6 @@ exports.polarWebhook = functions
       }
 
       if (!creditsToAdd) {
-        console.warn("Impossible de déterminer le pack/crédits (IDs/texte). Event ignoré.");
         return res.status(200).json({
           ok: true,
           ignored: true,
@@ -20360,7 +20979,7 @@ exports.polarWebhook = functions
       let userId =
         deepFindByKey(data, ["external_customer_id", "customer_external_id"]) ||
         deepFindByKey(data, ["firebase_uid", "firebaseUid"]) ||
-        deepFindByKey(data, ["custom_field_data"])?.firebase_uid ||
+        (deepFindByKey(data, ["custom_field_data"]) || {})?.firebase_uid ||
         null;
 
       if (userId && typeof userId !== "string") userId = String(userId);
@@ -20369,10 +20988,7 @@ exports.polarWebhook = functions
         const customerId = deepFindByKey(data, ["customer_id", "customerId"]) || null;
         if (customerId) {
           const snap = await db.collection("polar_customers").doc(String(customerId)).get();
-          if (snap.exists) {
-            const d = snap.data() || {};
-            if (d.userId) userId = String(d.userId);
-          }
+          if (snap.exists) userId = String((snap.data() || {}).userId || "");
         }
       }
 
@@ -20380,10 +20996,7 @@ exports.polarWebhook = functions
         const checkoutId = deepFindByKey(data, ["checkout_id", "checkoutId"]) || null;
         if (checkoutId) {
           const snap = await db.collection("polar_checkouts").doc(String(checkoutId)).get();
-          if (snap.exists) {
-            const d = snap.data() || {};
-            if (d.userId) userId = String(d.userId);
-          }
+          if (snap.exists) userId = String((snap.data() || {}).userId || "");
         }
       }
 
@@ -20392,35 +21005,24 @@ exports.polarWebhook = functions
         if (email && typeof email === "string") {
           try {
             const u = await admin.auth().getUserByEmail(email);
-            if (u && u.uid) {
-              userId = u.uid;
-              console.warn("userId récupéré via email fallback (admin.auth).", email);
-            }
+            if (u?.uid) userId = u.uid;
           } catch (e) {
             console.warn("Fallback email->uid impossible:", e);
           }
         }
       }
 
-      if (!userId || typeof userId !== "string") {
-        console.warn("Impossible de récupérer userId dans le webhook Polar, event ignoré.");
+      if (!userId) {
         return res.status(200).json({ ok: true, ignored: true, reason: "userId introuvable" });
       }
 
       const orderId = (data && (data.id || data.order_id || data.orderId)) || event.id || null;
-
-      let ledgerRef = null;
-      if (orderId) {
-        ledgerRef = db.collection("polar_orders").doc(String(orderId));
-      }
+      const ledgerRef = orderId ? db.collection("polar_orders").doc(String(orderId)) : null;
 
       await db.runTransaction(async (tx) => {
         if (ledgerRef) {
           const ledgerSnap = await tx.get(ledgerRef);
-          if (ledgerSnap.exists) {
-            console.log("Paiement Polar déjà traité, pas de double crédit. orderId=", orderId);
-            return;
-          }
+          if (ledgerSnap.exists) return; // pas de double crédit
         }
 
         const userRef = db.collection("users").doc(userId);
@@ -20432,10 +21034,7 @@ exports.polarWebhook = functions
 
         tx.set(
           userRef,
-          {
-            credits: newCredits,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
+          { credits: newCredits, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
           { merge: true }
         );
 
@@ -20451,9 +21050,7 @@ exports.polarWebhook = functions
           });
         }
 
-        console.log(
-          `Crédits ajoutés via webhook Polar : +${creditsToAdd} (total=${newCredits}) pour userId=${userId}, orderId=${orderId}`
-        );
+        console.log(`Crédits ajoutés: +${creditsToAdd} (total=${newCredits}) userId=${userId}`);
       });
 
       return res.status(200).json({ ok: true, processed: true });
@@ -20476,7 +21073,7 @@ exports.polarWebhook = functions
     "node": "20"
   },
   "dependencies": {
-    "@google-cloud/recaptcha-enterprise": "^6.3.0",
+    "@google-cloud/recaptcha-enterprise": "^6.3.1",
     "@google/genai": "^1.30.0",
     "@polar-sh/sdk": "^0.41.5",
     "busboy": "^1.6.0",
@@ -20488,7 +21085,8 @@ exports.polarWebhook = functions
     "nodemailer": "^7.0.10",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^2.4.5",
-    "pdfjs-dist": "^5.4.394"
+    "pdfjs-dist": "^5.4.394",
+    "pdfmake": "^0.2.21"
   }
 }
 ````
@@ -20948,6 +21546,7 @@ export async function consumeCredits(arg1: any, arg2?: any): Promise<void> {
 
 ## File: lib/firebase.ts
 ````typescript
+// lib/firebase.ts
 "use client";
 
 import { initializeApp, getApps, getApp } from "firebase/app";
@@ -20955,7 +21554,7 @@ import { getAuth, GoogleAuthProvider } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 import { getFunctions } from "firebase/functions";
 
-// ✅ Ta config Firebase
+// Firebase config (publique)
 const firebaseConfig = {
   apiKey: "AIzaSyCNb2cU0yhUeBGOk-8IK3TGNbjL6wSYMRs",
   authDomain: "assistant-ia-v4.firebaseapp.com",
@@ -20966,20 +21565,17 @@ const firebaseConfig = {
   measurementId: "G-61HCNNZBTN",
 };
 
-const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
+export const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 
 export const auth = getAuth(app);
 export const db = getFirestore(app);
-// ✅ Functions dans la même région que tes Cloud Functions
+
+// Functions dans la même région que tes Cloud Functions
 export const functions = getFunctions(app, "europe-west1");
 
-// ✅ Provider Google (pour popup)
+// Provider Google (pour popup)
 export const googleProvider = new GoogleAuthProvider();
-googleProvider.setCustomParameters({
-  prompt: "select_account",
-});
-
-export { app };
+googleProvider.setCustomParameters({ prompt: "select_account" });
 ````
 
 ## File: lib/firebaseAdmin.ts
@@ -21048,260 +21644,368 @@ export {
 
 ## File: lib/gemini.ts
 ````typescript
+// lib/gemini.ts
 "use client";
 
-// lib/gemini.ts
-// =========================================================
-// Intégration Gemini & Cloud Functions pour ton app
-// - extractProfile        : Cloud Function HTTPS (profil CV)
-// - generateLetterAndPitch: route Next.js /api/letterAndPitch
-// - generateInterviewQA   : Cloud Function HTTPS generateInterviewQA
-// =========================================================
+// Client-side helpers: Cloud Functions / API routes + reCAPTCHA via lib/recaptcha.ts
+// ⚠️ Ce fichier ne doit contenir AUCUN JSX/React. Uniquement du TypeScript.
 
 import { getRecaptchaToken } from "@/lib/recaptcha";
 
-// URL de base des Cloud Functions HTTP
-// En prod, mets NEXT_PUBLIC_API_BASE_URL = "https://europe-west1-assistant-ia-v4.cloudfunctions.net"
-const RAW_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
-const CF_BASE_URL =
-  RAW_BASE_URL.trim() ||
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+export type Language = "fr" | "en";
 
-function buildCfUrl(path: string): string {
-  return `${CF_BASE_URL.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
-}
+/** ------ Types domaine ------ */
+export type ProfileData = {
+  fullName?: string;
+  email?: string;
+  phone?: string;
+  location?: string;
+  title?: string;
+  summary?: string;
 
-async function requireRecaptcha(action: string): Promise<string> {
-  try {
-    // getRecaptchaToken normalise déjà l'action en lowercase dans lib/recaptcha.ts
-    return await getRecaptchaToken(action);
-  } catch (e: any) {
-    const msg =
-      e?.message ||
-      "reCAPTCHA non disponible (script bloqué ? adblock ?).";
-    throw new Error(
-      `Sécurité: impossible de valider reCAPTCHA (${action}). ${msg}`
-    );
-  }
-}
+  links?: Array<{ label?: string; url: string }>;
+  skills?: string[];
+  languages?: Array<{ name: string; level?: string }>;
 
-// =========================================================
-// 1) EXTRACT PROFILE (CV → profil structuré via Cloud Function)
-// =========================================================
-
-export async function callExtractProfile(base64Pdf: string) {
-  const url = buildCfUrl("extractProfile");
-  const recaptchaToken = await requireRecaptcha("extract_profile");
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ base64Pdf, recaptchaToken }),
-  });
-
-  const json = await res.json().catch(() => null);
-
-  if (!res.ok) {
-    console.error("Erreur HTTP extractProfile:", res.status, json);
-    throw new Error(json?.error || "Erreur extractProfile");
-  }
-
-  if (!json || typeof json !== "object") {
-    console.error("Réponse extractProfile invalide:", json);
-    throw new Error("Réponse extractProfile invalide.");
-  }
-
-  return json;
-}
-
-// =========================================================
-// 2) LETTRE DE MOTIVATION + PITCH (via /api/letterAndPitch)
-// =========================================================
-
-export type GenerateLetterAndPitchPayload = {
-  profile: any; // profil complet CV Firestore
-  jobDescription: string;
-  jobTitle?: string;
-  companyName?: string;
-  lang?: "fr" | "en";
+  experiences?: Array<{
+    company?: string;
+    title?: string;
+    role?: string; // compat
+    location?: string;
+    city?: string; // compat
+    startDate?: string;
+    endDate?: string;
+    dates?: string; // compat
+    description?: string;
+    bullets?: string[];
+  }>;
+  experience?: any; // compat
+  [key: string]: any;
 };
 
-export type GenerateLetterAndPitchResult = {
+export type LetterAndPitchResponse = {
   coverLetter: string;
   pitch: string;
-  lang?: string;
 };
 
-export async function callGenerateLetterAndPitch(
-  payload: GenerateLetterAndPitchPayload
-): Promise<GenerateLetterAndPitchResult> {
-  const recaptchaToken = await requireRecaptcha("generate_letter_pitch");
+export type InterviewQAResponse = {
+  questions: Array<{
+    question: string;
+    expectedPoints?: string[];
+    sampleAnswer?: string;
+    answer?: string;
+    a?: string;
+    q?: string;
+  }>;
+  lang: Language;
+};
 
-  const res = await fetch("/api/letterAndPitch", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, recaptchaToken }),
-  });
+/** Compat : ancienne page importait ce type */
+export type GenerateInterviewQAResult = InterviewQAResponse;
 
-  const contentType = res.headers.get("content-type") || "";
-  let json: any = null;
-  let rawText: string | null = null;
-
-  if (contentType.includes("application/json")) {
-    json = await res.json().catch((err) => {
-      console.error("Erreur de parse JSON generateLetterAndPitch:", err);
-      return null;
-    });
-  } else {
-    rawText = await res.text().catch(() => null);
-  }
-
-  if (!res.ok) {
-    console.error(
-      "Erreur HTTP generateLetterAndPitch:",
-      res.status,
-      contentType,
-      json ?? rawText?.slice(0, 400)
-    );
-    throw new Error(
-      json?.error || `Erreur generateLetterAndPitch (code ${res.status})`
-    );
-  }
-
-  if (!contentType.includes("application/json")) {
-    console.error(
-      "generateLetterAndPitch: réponse non JSON (souvent page HTML de 404/500):",
-      res.status,
-      contentType,
-      rawText?.slice(0, 400)
-    );
-    throw new Error(
-      "L'endpoint /api/letterAndPitch ne renvoie pas de JSON. " +
-        "En production, vérifie que la route API existe bien."
-    );
-  }
-
-  if (!json || typeof json !== "object") {
-    console.error("Réponse generateLetterAndPitch invalide:", json);
-    throw new Error("Réponse generateLetterAndPitch invalide.");
-  }
-
-  const coverLetter =
-    typeof (json as any).coverLetter === "string"
-      ? (json as any).coverLetter
-      : "";
-  const pitch =
-    typeof (json as any).pitch === "string" ? (json as any).pitch : "";
-
-  return {
-    coverLetter,
-    pitch,
-    lang: (json as any).lang || payload.lang || "fr",
-  };
+/** ------ Config URLs ------ */
+function stripTrailingSlash(s: string) {
+  return s.endsWith("/") ? s.slice(0, -1) : s;
 }
 
-// =========================================================
-// 3) Q&A D'ENTRETIEN (via Cloud Function generateInterviewQA)
-// =========================================================
+const CF_BASE =
+  stripTrailingSlash(
+    process.env.NEXT_PUBLIC_CLOUD_FUNCTIONS_BASE_URL ||
+      "https://europe-west1-assistant-ia-v4.cloudfunctions.net"
+  ) || "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
 
-export type GenerateInterviewQAPayload = {
-  profile: any;
-  experienceIndex: number;
-  lang?: "fr" | "en";
+const URL_EXTRACT_PROFILE = `${CF_BASE}/extractProfile`;
+const URL_GENERATE_INTERVIEW_QA = `${CF_BASE}/generateInterviewQA`;
+const URL_GENERATE_CV_PDF = `${CF_BASE}/generateCvPdf`;
+const URL_GENERATE_CV_LM_ZIP = `${CF_BASE}/generateCvLmZip`;
+const URL_GENERATE_LETTER_AND_PITCH_CF = `${CF_BASE}/generateLetterAndPitch`;
+const URL_GENERATE_LETTER_PDF = `${CF_BASE}/generateLetterPdf`;
+
+// App Route (Next.js) — si tu utilises /api/letterAndPitch côté serveur
+const URL_LETTER_AND_PITCH_API = "/api/letterAndPitch";
+
+/** ------ Fetch helpers ------ */
+type FetchJsonOptions = {
+  timeoutMs?: number;
+  headers?: Record<string, string>;
 };
 
-export type InterviewQAPair = {
-  question: string;
-  answer: string;
-};
+async function readErrorBody(res: Response): Promise<string> {
+  const ct = res.headers.get("content-type") || "";
+  try {
+    if (ct.includes("application/json")) {
+      const j = await res.json().catch(() => null);
+      if (j && typeof j === "object") {
+        const msg =
+          (j as any).error ||
+          (j as any).message ||
+          JSON.stringify(j).slice(0, 2000);
+        return msg;
+      }
+    }
+    const t = await res.text().catch(() => "");
+    return t || `HTTP ${res.status}`;
+  } catch {
+    return `HTTP ${res.status}`;
+  }
+}
 
-export type GenerateInterviewQAResult = {
-  questions: InterviewQAPair[];
-  lang?: string;
-};
+async function fetchJson<T>(
+  url: string,
+  body: unknown,
+  opts: FetchJsonOptions = {}
+): Promise<T> {
+  const controller = opts.timeoutMs ? new AbortController() : undefined;
+  const timer =
+    controller && opts.timeoutMs
+      ? window.setTimeout(() => controller.abort(), opts.timeoutMs)
+      : undefined;
 
-export async function callGenerateInterviewQA(
-  payload: GenerateInterviewQAPayload
-): Promise<GenerateInterviewQAResult> {
-  const url = buildCfUrl("generateInterviewQA");
-  const recaptchaToken = await requireRecaptcha("generate_interview_qa");
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, recaptchaToken }),
-  });
-
-  const contentType = res.headers.get("content-type") || "";
-  let json: any = null;
-  let rawText: string | null = null;
-
-  if (contentType.includes("application/json")) {
-    json = await res.json().catch((err) => {
-      console.error("Erreur de parse JSON generateInterviewQA:", err);
-      return null;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(opts.headers || {}),
+      },
+      body: JSON.stringify(body),
+      signal: controller?.signal,
     });
-  } else {
-    rawText = await res.text().catch(() => null);
+
+    if (!res.ok) {
+      const msg = await readErrorBody(res);
+      throw new Error(`HTTP ${res.status}: ${msg}`);
+    }
+
+    return (await res.json()) as T;
+  } finally {
+    if (timer) window.clearTimeout(timer);
+  }
+}
+
+async function fetchBinary(
+  url: string,
+  body: unknown,
+  opts: FetchJsonOptions = {}
+): Promise<Blob> {
+  const controller = opts.timeoutMs ? new AbortController() : undefined;
+  const timer =
+    controller && opts.timeoutMs
+      ? window.setTimeout(() => controller.abort(), opts.timeoutMs)
+      : undefined;
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(opts.headers || {}),
+      },
+      body: JSON.stringify(body),
+      signal: controller?.signal,
+    });
+
+    if (!res.ok) {
+      const msg = await readErrorBody(res);
+      throw new Error(`HTTP ${res.status}: ${msg}`);
+    }
+
+    return await res.blob();
+  } finally {
+    if (timer) window.clearTimeout(timer);
+  }
+}
+
+/** ------ Domain helpers ------ */
+function getExperiencesArray(profile: ProfileData): any[] {
+  const a = (profile as any)?.experiences ?? (profile as any)?.experience ?? [];
+  return Array.isArray(a) ? a : [];
+}
+
+function buildExperienceJobDescription(
+  profile: ProfileData,
+  experienceIndex: number
+): {
+  jobTitle: string;
+  companyName: string;
+  jobDescription: string;
+  experience: any;
+} {
+  const experiences = getExperiencesArray(profile);
+
+  if (
+    typeof experienceIndex !== "number" ||
+    Number.isNaN(experienceIndex) ||
+    experienceIndex < 0 ||
+    experienceIndex >= experiences.length
+  ) {
+    throw new Error("Indice d'expérience invalide.");
   }
 
-  if (!res.ok) {
-    console.error(
-      "Erreur HTTP generateInterviewQA:",
-      res.status,
-      contentType,
-      json ?? rawText?.slice(0, 400)
-    );
-    throw new Error(
-      json?.error || `Erreur generateInterviewQA (code ${res.status}).`
-    );
+  const exp = experiences[experienceIndex];
+
+  const jobTitle =
+    String(exp?.title || exp?.role || "").trim() ||
+    String(profile.title || "").trim() ||
+    "Poste (non renseigné)";
+
+  const companyName =
+    String(exp?.company || "").trim() || "Entreprise (non renseignée)";
+
+  const lines: string[] = [];
+  lines.push(`Expérience ciblée: ${jobTitle} chez ${companyName}`);
+
+  const location = exp?.location || exp?.city || profile.location || "";
+  if (location) lines.push(`Lieu: ${String(location)}`);
+
+  const period =
+    exp?.dates ||
+    ((exp?.startDate || exp?.endDate)
+      ? `${exp?.startDate || "?"} → ${exp?.endDate || "?"}`
+      : "");
+  if (period) lines.push(`Période: ${String(period)}`);
+
+  if (exp?.description) {
+    lines.push("");
+    lines.push(String(exp.description));
   }
 
-  if (!contentType.includes("application/json")) {
-    console.error(
-      "generateInterviewQA: réponse non JSON:",
-      res.status,
-      contentType,
-      rawText?.slice(0, 400)
-    );
-    throw new Error(
-      "La Cloud Function generateInterviewQA ne renvoie pas de JSON. Vérifie son déploiement."
-    );
+  if (Array.isArray(exp?.bullets) && exp.bullets.length) {
+    lines.push("");
+    lines.push("Points clés:");
+    for (const b of exp.bullets) {
+      const t = String(b || "").trim();
+      if (t) lines.push(`- ${t}`);
+    }
   }
 
-  if (!json || typeof json !== "object") {
-    console.error("Réponse generateInterviewQA invalide:", json);
-    throw new Error("Réponse generateInterviewQA invalide.");
+  if (profile.skills?.length) {
+    lines.push("");
+    lines.push(`Compétences (extrait): ${profile.skills.slice(0, 12).join(", ")}`);
   }
 
-  const questionsRaw: any[] = Array.isArray((json as any).questions)
-    ? (json as any).questions
-    : [];
-
-  const questions: InterviewQAPair[] = questionsRaw
-    .map((q, idx) => ({
-      question:
-        (q?.question ??
-          q?.q ??
-          (typeof q === "string" ? q : `Question ${idx + 1}`)) + "",
-      answer: (q?.answer ?? q?.a ?? "") + "",
-    }))
-    .filter((q) => q.question && q.answer);
-
-  if (!questions.length) {
-    console.error(
-      "generateInterviewQA: aucune question exploitable dans la réponse:",
-      json
-    );
-    throw new Error(
-      "L'IA n'a pas renvoyé de questions exploitables pour cette expérience."
-    );
+  if (profile.summary?.trim()) {
+    lines.push("");
+    lines.push(`Résumé candidat: ${profile.summary.trim()}`);
   }
 
-  return {
-    questions,
-    lang: (json as any).lang || payload.lang || "fr",
-  };
+  const jobDescription = lines.join("\n").trim() || "Description non disponible.";
+  return { jobTitle, companyName, jobDescription, experience: exp };
+}
+
+/** ------ Public API ------ */
+export async function callExtractProfile(profileText: string): Promise<ProfileData> {
+  const recaptchaToken = await getRecaptchaToken("extract_profile");
+  return await fetchJson<ProfileData>(
+    URL_EXTRACT_PROFILE,
+    { text: profileText, recaptchaToken },
+    { timeoutMs: 60_000 }
+  );
+}
+
+export async function callGenerateLetterAndPitch(
+  profile: ProfileData,
+  jobOffer: {
+    companyName: string;
+    jobTitle: string;
+    jobDescription: string;
+    location?: string;
+  }
+): Promise<LetterAndPitchResponse> {
+  return await fetchJson<LetterAndPitchResponse>(
+    URL_LETTER_AND_PITCH_API,
+    { profile, jobOffer },
+    { timeoutMs: 90_000 }
+  );
+}
+
+export async function callGenerateLetterAndPitchCF(
+  profile: ProfileData,
+  jobOffer: {
+    companyName: string;
+    jobTitle: string;
+    jobDescription: string;
+    location?: string;
+  },
+  lang: Language = "fr"
+): Promise<LetterAndPitchResponse> {
+  const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
+  return await fetchJson<LetterAndPitchResponse>(
+    URL_GENERATE_LETTER_AND_PITCH_CF,
+    { profile, jobOffer, lang, recaptchaToken },
+    { timeoutMs: 120_000 }
+  );
+}
+
+/** ✅ Q/R entretien sur une expérience (Cloud Function) */
+export async function callGenerateInterviewQA(params: {
+  profile: ProfileData;
+  experienceIndex: number;
+  lang?: Language;
+}): Promise<InterviewQAResponse> {
+  const { profile, experienceIndex, lang = "fr" } = params;
+
+  const { jobTitle, companyName, jobDescription, experience } =
+    buildExperienceJobDescription(profile, experienceIndex);
+
+  const recaptchaToken = await getRecaptchaToken("generate_interview_qa");
+
+  return await fetchJson<InterviewQAResponse>(
+    URL_GENERATE_INTERVIEW_QA,
+    {
+      experienceIndex, // ✅ important
+      profile,
+      experience,
+      jobTitle,
+      companyName,
+      jobDescription,
+      lang,
+      recaptchaToken,
+    },
+    { timeoutMs: 120_000 }
+  );
+}
+
+export async function callGenerateCvPdf(cvJson: unknown): Promise<Blob> {
+  const recaptchaToken = await getRecaptchaToken("generate_cv_pdf");
+  return await fetchBinary(
+    URL_GENERATE_CV_PDF,
+    { cvJson, recaptchaToken },
+    { timeoutMs: 120_000 }
+  );
+}
+
+export async function callGenerateCvLmZip(cvJson: unknown): Promise<Blob> {
+  const recaptchaToken = await getRecaptchaToken("generate_cv_lm_zip");
+  return await fetchBinary(
+    URL_GENERATE_CV_LM_ZIP,
+    { cvJson, recaptchaToken },
+    { timeoutMs: 180_000 }
+  );
+}
+
+export async function callGenerateLetterPdf(params: {
+  letterText: string;
+  candidateName?: string;
+  jobTitle?: string;
+  companyName?: string;
+  lang?: Language;
+}): Promise<Blob> {
+  const {
+    letterText,
+    candidateName = "",
+    jobTitle = "",
+    companyName = "",
+    lang = "fr",
+  } = params;
+
+  const recaptchaToken = await getRecaptchaToken("generate_letter_pdf");
+
+  return await fetchBinary(
+    URL_GENERATE_LETTER_PDF,
+    { letterText, candidateName, jobTitle, companyName, lang, recaptchaToken },
+    { timeoutMs: 120_000 }
+  );
 }
 ````
 
@@ -22003,9 +22707,32 @@ export async function createPolarCheckout(options: CreateCheckoutOptions) {
 
 ## File: lib/recaptcha.ts
 ````typescript
+// lib/recaptcha.ts
 "use client";
 
-// lib/recaptcha.ts
+/**
+ * ✅ Single source of truth reCAPTCHA (v3 standard ou Enterprise)
+ * - Loader robuste (si script pas encore chargé)
+ * - tryGetRecaptchaToken(): non bloquant => retourne null si adblock/timeout…
+ * - getRecaptchaToken(): strict => throw si impossible
+ * - verifyRecaptcha(): optionnel via ton endpoint CF /recaptchaVerify (Enterprise)
+ */
+
+declare global {
+  interface Window {
+    grecaptcha?: GrecaptchaRoot;
+  }
+}
+
+type GrecaptchaClient = {
+  ready?: (cb: () => void) => void;
+  execute: (siteKey: string, opts: { action: string }) => Promise<string>;
+};
+
+type GrecaptchaRoot = GrecaptchaClient & {
+  enterprise?: GrecaptchaClient;
+};
+
 export type VerifyResult =
   | { ok: true; score?: number }
   | { ok: false; reason: string; score?: number };
@@ -22013,108 +22740,188 @@ export type VerifyResult =
 const DEFAULT_API_BASE =
   "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
 
-const API_BASE = (
-  process.env.NEXT_PUBLIC_API_BASE_URL ||
-  DEFAULT_API_BASE
+export const API_BASE = (
+  process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE
 ).replace(/\/+$/, "");
 
-/**
- * Normalise l'action pour éviter les mismatches (case-sensitive).
- * Choisis une convention et garde-la partout.
- */
+const SITE_KEY =
+  process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY ||
+  process.env.NEXT_PUBLIC_RECAPTCHA_KEY ||
+  "";
+
+const USE_ENTERPRISE =
+  (process.env.NEXT_PUBLIC_RECAPTCHA_ENTERPRISE || "")
+    .toLowerCase()
+    .trim() === "true";
+
+let recaptchaLoadPromise: Promise<void> | null = null;
+
+function isBrowser() {
+  return typeof window !== "undefined" && typeof document !== "undefined";
+}
+
 function normalizeAction(action: string) {
   return (action || "").trim().toLowerCase();
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number, reason: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = window.setTimeout(() => reject(new Error(reason)), ms);
-    p.then((v) => {
-      window.clearTimeout(t);
-      resolve(v);
-    }).catch((e) => {
-      window.clearTimeout(t);
-      reject(e);
-    });
-  });
+function describeRecaptchaLoadFailure() {
+  return [
+    "Sécurité: impossible de valider reCAPTCHA.",
+    "Le script reCAPTCHA n’a pas pu être chargé ou est bloqué.",
+    "Causes fréquentes: bloqueur de pubs, DNS filtrant, proxy/corporate, CSP trop stricte, ou réseau qui bloque google.com.",
+  ].join(" ");
+}
+
+function hasUsableRecaptcha(): boolean {
+  const g = window.grecaptcha;
+  if (!g) return false;
+
+  if (USE_ENTERPRISE) {
+    return Boolean(g.enterprise && typeof g.enterprise.execute === "function");
+  }
+
+  return typeof g.execute === "function";
+}
+
+function pickRecaptchaClient(): GrecaptchaClient | null {
+  const g = window.grecaptcha;
+  if (!g) return null;
+
+  if (USE_ENTERPRISE) {
+    if (g.enterprise && typeof g.enterprise.execute === "function") return g.enterprise;
+    return null;
+  }
+
+  if (typeof g.execute === "function") return g;
+  return null;
 }
 
 /**
- * ✅ Version "non bloquante" :
- * - retourne un token si possible
- * - sinon retourne null (adblock, script bloqué, timeout, etc.)
+ * ✅ Loader robuste:
+ * - attend que grecaptcha soit réellement dispo (poll)
+ * - retentable (reset promise en cas d’échec)
  */
-export async function tryGetRecaptchaToken(
-  action: string
-): Promise<string | null> {
-  if (typeof window === "undefined") return null;
+async function ensureRecaptchaLoaded(): Promise<void> {
+  if (!isBrowser()) {
+    throw new Error("reCAPTCHA: appelé côté serveur (SSR).");
+  }
+  if (!SITE_KEY) {
+    throw new Error("reCAPTCHA: NEXT_PUBLIC_RECAPTCHA_SITE_KEY manquant.");
+  }
+  if (hasUsableRecaptcha()) return;
+  if (recaptchaLoadPromise) return recaptchaLoadPromise;
 
-  const siteKey = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY;
-  if (!siteKey) return null;
+  recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
+    const selector = USE_ENTERPRISE
+      ? 'script[data-recaptcha="enterprise"]'
+      : 'script[data-recaptcha="v3"]';
+
+    const existing = document.querySelector<HTMLScriptElement>(selector);
+
+    const pollUntilReady = (ms: number) => {
+      const t0 = Date.now();
+      const tick = () => {
+        if (hasUsableRecaptcha()) return resolve();
+        if (Date.now() - t0 > ms) return reject(new Error(describeRecaptchaLoadFailure()));
+        requestAnimationFrame(tick);
+      };
+      tick();
+    };
+
+    // Script déjà présent => on attend juste l'exposition de grecaptcha
+    if (existing) {
+      pollUntilReady(10_000);
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.async = true;
+    script.defer = true;
+    script.setAttribute("data-recaptcha", USE_ENTERPRISE ? "enterprise" : "v3");
+
+    const base = USE_ENTERPRISE
+      ? "https://www.google.com/recaptcha/enterprise.js"
+      : "https://www.google.com/recaptcha/api.js";
+
+    script.src = `${base}?render=${encodeURIComponent(SITE_KEY)}`;
+
+    const timeout = window.setTimeout(() => {
+      reject(new Error(describeRecaptchaLoadFailure()));
+    }, 12_000);
+
+    script.onload = () => {
+      window.clearTimeout(timeout);
+      pollUntilReady(8_000);
+    };
+
+    script.onerror = () => {
+      window.clearTimeout(timeout);
+      reject(new Error(describeRecaptchaLoadFailure()));
+    };
+
+    document.head.appendChild(script);
+  }).catch((e) => {
+    recaptchaLoadPromise = null; // ✅ retentable
+    throw e;
+  });
+
+  return recaptchaLoadPromise;
+}
+
+/**
+ * ✅ Non bloquant :
+ * - retourne un token si possible
+ * - sinon null (adblock, script bloqué, timeout…)
+ */
+export async function tryGetRecaptchaToken(action: string): Promise<string | null> {
+  if (!isBrowser()) return null;
+  if (!SITE_KEY) return null;
 
   const normalizedAction = normalizeAction(action);
   if (!normalizedAction) return null;
 
-  const grecaptcha = (window as any).grecaptcha;
-
   try {
-    // ✅ Enterprise
-    if (grecaptcha?.enterprise) {
-      await withTimeout<void>(
-        new Promise<void>((resolve) => grecaptcha.enterprise.ready(resolve)),
-        4000,
-        "reCAPTCHA Enterprise ready timeout"
-      );
+    await ensureRecaptchaLoaded();
+    const client = pickRecaptchaClient();
+    if (!client) return null;
 
-      const token = await grecaptcha.enterprise.execute(siteKey, {
-        action: normalizedAction,
-      });
+    const token = await new Promise<string>((resolve, reject) => {
+      const runExecute = () => {
+        client
+          .execute(SITE_KEY, { action: normalizedAction })
+          .then((t) => resolve(t))
+          .catch(reject);
+      };
 
-      return typeof token === "string" && token ? token : null;
-    }
+      try {
+        if (typeof client.ready === "function") client.ready(runExecute);
+        else runExecute();
+      } catch (e) {
+        reject(e);
+      }
+    });
 
-    // ✅ Fallback v3 (dev / autre config)
-    if (
-      typeof grecaptcha?.ready === "function" &&
-      typeof grecaptcha?.execute === "function"
-    ) {
-      await withTimeout<void>(
-        new Promise<void>((resolve) => grecaptcha.ready(resolve)),
-        4000,
-        "reCAPTCHA ready timeout"
-      );
-
-      const token = await grecaptcha.execute(siteKey, {
-        action: normalizedAction,
-      });
-      return typeof token === "string" && token ? token : null;
-    }
-
-    return null;
+    return typeof token === "string" && token ? token : null;
   } catch {
     return null;
   }
 }
 
-/**
- * ✅ Version "stricte" (compat) : conserve ton ancien comportement
- * (utile si tu veux forcer reCAPTCHA dans certains écrans).
- */
+/** Version stricte */
 export async function getRecaptchaToken(action: string): Promise<string> {
   const token = await tryGetRecaptchaToken(action);
   if (!token) {
-    throw new Error("reCAPTCHA non chargé (script bloqué ? adblock ?)");
+    throw new Error(describeRecaptchaLoadFailure());
   }
   return token;
 }
 
-/**
- * Vérifie un token côté serveur (si tu gardes l'endpoint recaptchaVerify).
- */
-export async function verifyRecaptcha(
-  token: string,
-  action: string
-): Promise<VerifyResult> {
+export async function warmupRecaptcha(): Promise<void> {
+  await ensureRecaptchaLoaded();
+}
+
+/** Vérif optionnelle via endpoint /recaptchaVerify */
+export async function verifyRecaptcha(token: string, action: string): Promise<VerifyResult> {
   const normalizedAction = normalizeAction(action);
 
   if (!token) return { ok: false, reason: "missing_token" };
@@ -22133,22 +22940,16 @@ export async function verifyRecaptcha(
     if (!res.ok || !data?.ok) {
       return {
         ok: false,
-        reason: String(
-          data?.reason || data?.details?.reason || "recaptcha_failed"
-        ),
-        score:
-          typeof data?.score === "number"
-            ? data.score
-            : typeof data?.details?.score === "number"
+        reason: String(data?.reason || data?.details?.reason || "recaptcha_failed"),
+        score: typeof data?.score === "number"
+          ? data.score
+          : typeof data?.details?.score === "number"
             ? data.details.score
             : undefined,
       };
     }
 
-    return {
-      ok: true,
-      score: typeof data?.score === "number" ? data.score : undefined,
-    };
+    return { ok: true, score: typeof data?.score === "number" ? data.score : undefined };
   } catch {
     return { ok: false, reason: "network_error" };
   }
@@ -22548,29 +23349,6 @@ export type CvApiResponse = {
 };
 ````
 
-## File: .env.local
-````
-GEMINI_API_KEY=AIzaSyDo4t-q7boav3fUOL_hvxfhm6O9pMR2L04
-GEMINI_MODEL=models/gemini-2.5-flash
-NEXT_PUBLIC_API_BASE_URL=https://europe-west1-assistant-ia-v4.cloudfunctions.net
-ADZUNA_APP_ID=d0ca97ff
-ADZUNA_APP_KEY=eae26a8b844bdde5ff3672b7a8e43970
-
-POLAR_ACCESS_TOKEN=polar_oat_HDHIQiwJsP5JCcHWlbAudN4VFHvotix2teA9v0TNEJW
-POLAR_WEBHOOK_SECRET=polar_whs_3C6xUFewJuBoIoDO0iy2tIdGElBYmUYgyAdg42zwUjk
-POLAR_ENV=sandbox
-
-PPOLAR_PRODUCT_100_ID=1763420a-d2d7-42f7-af2d-7755da543d74
-POLAR_PRODUCT_20_ID=ef5c6b96-e40e-4f4a-85a1-1cecaf390f83
-POLAR_PRODUCT_50_ID=1d624448-9f7e-4658-a88d-e2ed9a6d64f7
-
-
-
-NEXT_PUBLIC_API_BASE_URL=https://europe-west1-assistant-ia-v4.cloudfunctions.net
-NEXT_PUBLIC_APP_URL=http://localhost:3000
-NEXT_PUBLIC_RECAPTCHA_SITE_KEY=6Ld4EDAsAAAAACiYb8q1Csvn1-fnKJGEdeMG_T3i
-````
-
 ## File: .firebaserc
 ````
 {
@@ -22580,6 +23358,19 @@ NEXT_PUBLIC_RECAPTCHA_SITE_KEY=6Ld4EDAsAAAAACiYb8q1Csvn1-fnKJGEdeMG_T3i
   "targets": {},
   "etags": {}
 }
+````
+
+## File: .gitignore
+````
+node_modules/
+.next/
+out/
+.env
+.env.*
+serviceAccountKey.json
+*.log
+.DS_Store
+serviceAccountKey*.json
 ````
 
 ## File: api.txt
@@ -22795,12 +23586,15 @@ export default nextConfig;
     "next-intl": "^4.5.5",
     "node-fetch": "^3.3.2",
     "openai": "^6.10.0",
+    "pdf-lib": "^1.17.1",
+    "pdfmake": "^0.2.21",
     "react": "18.2.0",
     "react-dom": "18.2.0"
   },
   "devDependencies": {
     "@types/aos": "^3.0.7",
     "@types/node": "^20.12.7",
+    "@types/pdfmake": "^0.2.12",
     "@types/react": "^18.2.66",
     "autoprefixer": "^10.4.19",
     "postcss": "^8.4.38",

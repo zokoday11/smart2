@@ -6,15 +6,19 @@ import {
   InterviewChannel,
   HistoryItem,
 } from "@/lib/interviewPrompt";
-import {
-  verifyUserAndCredits,
-  consumeCredit,
-} from "@/lib/server/credits";
+import { verifyUserAndCredits, consumeCredit } from "@/lib/server/credits";
 
 export const runtime = "nodejs";
 
-// ---- Sessions en mémoire (DEV) ---- //
+/**
+ * ✅ reCAPTCHA OFF par défaut
+ * -> Active uniquement si INTERVIEW_REQUIRE_RECAPTCHA=true
+ */
+const REQUIRE_RECAPTCHA =
+  (process.env.INTERVIEW_REQUIRE_RECAPTCHA || "").toLowerCase().trim() ===
+  "true";
 
+// ---- Sessions en mémoire (DEV) ---- //
 type InterviewSession = {
   userId: string;
   createdAt: string;
@@ -34,25 +38,134 @@ type InterviewSession = {
 const memorySessions = new Map<string, InterviewSession>();
 
 function createSessionId() {
-  return Math.random().toString(36).slice(2);
+  try {
+    // @ts-ignore
+    return crypto.randomUUID();
+  } catch {
+    return Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+  }
+}
+
+function purgeOldSessions(maxAgeMs = 1000 * 60 * 60 * 6) {
+  const now = Date.now();
+  for (const [sid, s] of memorySessions.entries()) {
+    const t = Date.parse(s.lastUpdated || s.createdAt);
+    if (!Number.isNaN(t) && now - t > maxAgeMs) memorySessions.delete(sid);
+  }
+}
+
+// ---------------- reCAPTCHA (Enterprise via CF recaptchaVerify) ----------------
+type RecaptchaVerifyResult =
+  | { ok: true; score?: number }
+  | { ok: false; reason: string; score?: number };
+
+function stripTrailingSlash(s: string) {
+  return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+
+function getApiBaseServer(): string {
+  return stripTrailingSlash(
+    process.env.CLOUD_FUNCTIONS_BASE_URL ||
+      process.env.API_BASE_URL ||
+      "https://europe-west1-assistant-ia-v4.cloudfunctions.net"
+  );
+}
+
+async function verifyRecaptchaEnterpriseViaCF(
+  token: string,
+  action: string
+): Promise<RecaptchaVerifyResult> {
+  const base = getApiBaseServer();
+  try {
+    const res = await fetch(`${base}/recaptchaVerify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, action: (action || "").trim() }),
+      cache: "no-store",
+    });
+
+    const data: any = await res.json().catch(() => null);
+
+    if (!res.ok || !data?.ok) {
+      return {
+        ok: false,
+        reason: String(data?.reason || data?.error || "recaptcha_failed"),
+        score: typeof data?.score === "number" ? data.score : undefined,
+      };
+    }
+
+    return {
+      ok: true,
+      score: typeof data?.score === "number" ? data.score : undefined,
+    };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || "network_error" };
+  }
 }
 
 // ---- Handler principal ---- //
-
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const { action } = body;
+    purgeOldSessions();
 
-    // ---------- DÉMARRER L'ENTRETIEN ---------- //
+    const body = await req.json().catch(() => null);
+    if (!body || typeof body !== "object") {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
+
+    const { action } = body as any;
+
+    // ✅ token peut venir de plusieurs endroits (selon ton front)
+    const recaptchaToken =
+      (body as any)?.recaptchaToken ||
+      (body as any)?.token ||
+      (body as any)?.recaptcha?.token ||
+      null;
+
+    const recaptchaAction =
+      (body as any)?.recaptchaAction ||
+      (body as any)?.recaptcha?.action ||
+      "interview";
+
+    // ✅ reCAPTCHA (optionnel)
+    if (REQUIRE_RECAPTCHA) {
+      if (!recaptchaToken || typeof recaptchaToken !== "string") {
+        return NextResponse.json(
+          {
+            error: "reCAPTCHA failed",
+            details: "token_missing_or_invalid",
+            requireRecaptcha: true,
+            expectedAction: recaptchaAction,
+          },
+          { status: 403 }
+        );
+      }
+
+      const rec = await verifyRecaptchaEnterpriseViaCF(
+        recaptchaToken,
+        recaptchaAction
+      );
+
+      if (!rec.ok) {
+        return NextResponse.json(
+          {
+            error: "reCAPTCHA failed",
+            details: rec.reason,
+            score: rec.score ?? null,
+            requireRecaptcha: true,
+            expectedAction: recaptchaAction,
+          },
+          { status: 403 }
+        );
+      }
+    }
+
+    // ---------- START ---------- //
     if (action === "start") {
-      const { userId, jobDesc, cvSummary, mode, channel, level } = body;
+      const { userId, jobDesc, cvSummary, mode, channel, level } = body as any;
 
       if (!userId) {
-        return NextResponse.json(
-          { error: "Missing userId" },
-          { status: 400 }
-        );
+        return NextResponse.json({ error: "Missing userId" }, { status: 400 });
       }
 
       const user = await verifyUserAndCredits(userId);
@@ -64,7 +177,6 @@ export async function POST(req: NextRequest) {
       }
 
       const nowIso = new Date().toISOString();
-
       const safeMode = (mode || "mixed") as string;
       const safeChannel = (channel || "written") as InterviewChannel;
       const safeLevel = (level || "junior") as InterviewLevel;
@@ -102,16 +214,11 @@ export async function POST(req: NextRequest) {
       let parsed: any;
       try {
         parsed = JSON.parse(llmResponseText);
-      } catch (err) {
-        console.error("JSON parse error (start):", err, llmResponseText);
-        return NextResponse.json(
-          { error: "LLM response parse error" },
-          { status: 500 }
-        );
+      } catch {
+        parsed = { next_question: "Parlez-moi de vous.", short_analysis: null };
       }
 
-      const firstQuestion =
-        parsed.next_question || "Parlez-moi de vous.";
+      const firstQuestion = parsed.next_question || "Parlez-moi de vous.";
 
       const historyItem: HistoryItem = {
         role: "interviewer",
@@ -136,9 +243,9 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // ---------- RÉPONDRE À UNE QUESTION ---------- //
+    // ---------- ANSWER ---------- //
     if (action === "answer") {
-      const { userId, sessionId, userMessage, channel, step } = body;
+      const { userId, sessionId, userMessage, channel, step } = body as any;
 
       if (!userId || !sessionId || !userMessage?.trim()) {
         return NextResponse.json(
@@ -157,22 +264,14 @@ export async function POST(req: NextRequest) {
 
       const session = memorySessions.get(sessionId);
       if (!session) {
-        return NextResponse.json(
-          { error: "Session not found" },
-          { status: 404 }
-        );
+        return NextResponse.json({ error: "Session not found" }, { status: 404 });
       }
 
       if (session.userId !== userId) {
-        return NextResponse.json(
-          { error: "Forbidden" },
-          { status: 403 }
-        );
+        return NextResponse.json({ error: "Forbidden" }, { status: 403 });
       }
 
-      const history = Array.isArray(session.history)
-        ? [...session.history]
-        : [];
+      const history = Array.isArray(session.history) ? [...session.history] : [];
 
       history.push({
         role: "candidate",
@@ -181,7 +280,7 @@ export async function POST(req: NextRequest) {
       });
 
       const nextStep =
-        typeof step === "number"
+        typeof step === "number" && Number.isFinite(step)
           ? step
           : (session.currentStep || 1) + 1;
 
@@ -200,12 +299,13 @@ export async function POST(req: NextRequest) {
       let parsed: any;
       try {
         parsed = JSON.parse(llmResponseText);
-        } catch (err) {
-        console.error("JSON parse error (answer):", err, llmResponseText);
-        return NextResponse.json(
-          { error: "LLM response parse error" },
-          { status: 500 }
-        );
+      } catch {
+        parsed = {
+          next_question: "Merci. Peux-tu illustrer avec un exemple concret ?",
+          short_analysis: "",
+          final_summary: null,
+          final_score: null,
+        };
       }
 
       const nextQuestion =
@@ -219,12 +319,10 @@ export async function POST(req: NextRequest) {
         createdAt: new Date().toISOString(),
       });
 
-      const nowIso = new Date().toISOString();
-
       const updated: InterviewSession = {
         ...session,
         history,
-        lastUpdated: nowIso,
+        lastUpdated: new Date().toISOString(),
         currentStep: nextStep,
       };
 
@@ -247,29 +345,18 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    return NextResponse.json(
-      { error: "Unknown action" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Unknown action" }, { status: 400 });
   } catch (err) {
     console.error("Interview API error:", err);
-    return NextResponse.json(
-      { error: "Internal error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Internal error" }, { status: 500 });
   }
 }
 
 // ---- APPEL GEMINI ---- //
-
 async function callLLM(prompt: string): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
-    console.warn(
-      "[Interview] GEMINI_API_KEY manquant → fallback démo."
-    );
-    // 👉 ici tu peux renvoyer une réponse “fake” simple
     return JSON.stringify({
       next_question:
         "Mode démo : peux-tu me résumer ton expérience la plus récente en lien avec ce poste ?",
@@ -280,50 +367,31 @@ async function callLLM(prompt: string): Promise<string> {
     });
   }
 
-  // 🔴 ICI tu choisis le modèle 2.5
-  const model =
-    process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
-
+  const modelRaw = process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
+  const model = modelRaw.startsWith("models/") ? modelRaw : `models/${modelRaw}`;
   const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
 
-  const payload = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: prompt }],
-      },
-    ],
-  };
+  const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
   if (!resp.ok) {
-    const errorText = await resp.text();
+    const errorText = await resp.text().catch(() => "");
     console.error("Gemini error (interview):", resp.status, errorText);
-
-    // Si c’est un 429 (quota dépassé), tu peux retourner un JSON “fallback”
-    if (resp.status === 429) {
-      console.warn("[Interview] Quota Gemini dépassé → fallback démo.");
-      return JSON.stringify({
-        next_question:
-          "Mode démo (quota dépassé) : peux-tu me raconter un de tes projets dont tu es fièr(e) ?",
-        short_analysis:
-          "Le quota de l’API Gemini est dépassé. Ceci est un scénario d’entretien simulé.",
-        final_summary: null,
-        final_score: null,
-      });
-    }
-
-    throw new Error("Gemini call failed");
+    return JSON.stringify({
+      next_question:
+        "Je n'arrive pas à joindre l’IA. Donne-moi : contexte / actions / résultats (STAR).",
+      short_analysis: `Fallback Gemini HTTP ${resp.status}`,
+      final_summary: null,
+      final_score: null,
+    });
   }
 
-  const data = await resp.json();
+  const data = await resp.json().catch(() => null);
 
   const textRaw: string =
     data?.candidates?.[0]?.content?.parts
@@ -332,11 +400,13 @@ async function callLLM(prompt: string): Promise<string> {
       .trim() || "";
 
   if (!textRaw) {
-    throw new Error("Empty Gemini response");
+    return JSON.stringify({
+      next_question: "Peux-tu préciser ?",
+      short_analysis: "",
+      final_summary: null,
+      final_score: null,
+    });
   }
 
-  const text = textRaw.trim();
-
-  // On laisse Gemini renvoyer directement un JSON ; le parse se fait dans le handler
-  return text;
+  return textRaw.trim();
 }

@@ -1,6 +1,7 @@
 // app/layout.tsx
 import "./globals.css";
 import type { Metadata, Viewport } from "next";
+import Script from "next/script";
 import { AuthProvider } from "@/context/AuthContext";
 import ActivityTracker from "@/components/ActivityTracker";
 
@@ -21,6 +22,22 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
+  const siteKey = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY || "";
+  const useEnterprise =
+    (process.env.NEXT_PUBLIC_RECAPTCHA_ENTERPRISE || "")
+      .toLowerCase()
+      .trim() === "true";
+
+  const recaptchaSrc = siteKey
+    ? useEnterprise
+      ? `https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(
+          siteKey
+        )}`
+      : `https://www.google.com/recaptcha/api.js?render=${encodeURIComponent(
+          siteKey
+        )}`
+    : "";
+
   return (
     <html lang="fr">
       <head>
@@ -33,6 +50,7 @@ export default function RootLayout({
           content="black-translucent"
         />
       </head>
+
       <body
         className="
           min-h-screen
@@ -42,6 +60,15 @@ export default function RootLayout({
           antialiased
         "
       >
+        {/* ✅ Charge reCAPTCHA v3 (standard ou enterprise selon env) */}
+        {siteKey ? (
+          <Script
+            src={recaptchaSrc}
+            strategy="afterInteractive"
+            data-recaptcha={useEnterprise ? "enterprise" : "v3"}
+          />
+        ) : null}
+
         <AuthProvider>
           <ActivityTracker />
           <div className="min-h-screen flex flex-col">{children}</div>

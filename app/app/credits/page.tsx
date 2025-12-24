@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useUserCredits } from "@/hooks/useUserCredits";
 import { useAuth } from "@/context/AuthContext";
 import { getRecaptchaToken } from "@/lib/recaptcha";
+import { useRechargeHistory } from "@/hooks/useRechargeHistory";
 
 type PackKey = "20" | "50" | "100";
 
@@ -36,11 +37,9 @@ const CREDIT_PACKS: {
 // ⚙️ Base de l'API :
 // - en prod : Cloud Functions
 // - en dev : tu peux override avec NEXT_PUBLIC_API_BASE_URL dans .env.local
-const DEFAULT_API_BASE =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+const DEFAULT_API_BASE = "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
 
-const API_BASE =
-  (process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE).replace(/\/+$/, "");
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE).replace(/\/+$/, "");
 
 export default function CreditsPage() {
   const { user } = useAuth();
@@ -65,9 +64,10 @@ export default function CreditsPage() {
   // ✅ IMPORTANT (Option B) :
   // on mémorise le solde AVANT l’achat, puis on ferme automatiquement la popup
   // dès que credits > soldeAvant (webhook OK -> Firestore se met à jour)
-  const [creditsBeforePurchase, setCreditsBeforePurchase] = useState<number | null>(
-    null
-  );
+  const [creditsBeforePurchase, setCreditsBeforePurchase] = useState<number | null>(null);
+
+  // ✅ Historique des recharges
+  const { items: recharges, loading: rechargesLoading, error: rechargesError } = useRechargeHistory(30);
 
   const triggerSuccessClose = (message?: string) => {
     setEmbedUrl(null);
@@ -78,10 +78,7 @@ export default function CreditsPage() {
     setShowSuccessAnimation(true);
     window.setTimeout(() => setShowSuccessAnimation(false), 4000);
 
-    setStatusMessage(
-      message ||
-        "✅ Paiement confirmé ! Tes crédits ont été ajoutés à ton compte."
-    );
+    setStatusMessage(message || "✅ Paiement confirmé ! Tes crédits ont été ajoutés à ton compte.");
   };
 
   const handleBuy = async (pack: PackKey) => {
@@ -138,10 +135,7 @@ export default function CreditsPage() {
         data = await res.json();
       } else {
         const text = await res.text();
-        console.error(
-          "[Credits] Réponse non JSON de /polarCheckout :",
-          text.slice(0, 300)
-        );
+        console.error("[Credits] Réponse non JSON de /polarCheckout :", text.slice(0, 300));
         throw new Error(
           "Le serveur de paiement a renvoyé une réponse invalide (HTML). Vérifie la fonction polarCheckout."
         );
@@ -156,16 +150,13 @@ export default function CreditsPage() {
       const origin = window.location.origin;
       const urlBase = data.url as string;
       const sep = urlBase.includes("?") ? "&" : "?";
-      const fullEmbedUrl = `${urlBase}${sep}embed=true&embed_origin=${encodeURIComponent(
-        origin
-      )}`;
+      const fullEmbedUrl = `${urlBase}${sep}embed=true&embed_origin=${encodeURIComponent(origin)}`;
 
       setEmbedUrl(fullEmbedUrl); // ouvre la popup
     } catch (e: any) {
       console.error("Erreur checkout Polar (iframe) :", e);
       setBuyError(
-        e?.message ||
-          "Erreur lors de la création du paiement. Essaie à nouveau dans quelques instants."
+        e?.message || "Erreur lors de la création du paiement. Essaie à nouveau dans quelques instants."
       );
       setBuyLoading(null);
       setCreditsBeforePurchase(null);
@@ -186,9 +177,7 @@ export default function CreditsPage() {
       const href = win.location.href; // accessible seulement si même origine
 
       if (href.includes("/app/credits") && href.includes("status=success")) {
-        triggerSuccessClose(
-          "✅ Paiement confirmé ! Tes crédits vont se mettre à jour dans quelques instants."
-        );
+        triggerSuccessClose("✅ Paiement confirmé ! Tes crédits vont se mettre à jour dans quelques instants.");
       }
 
       if (href.includes("/app/credits") && href.includes("status=cancel")) {
@@ -245,9 +234,7 @@ export default function CreditsPage() {
         <div className="fixed top-4 left-1/2 z-40 -translate-x-1/2">
           <div className="rounded-full border border-emerald-400/70 bg-emerald-500/10 px-4 py-2 shadow-lg backdrop-blur flex items-center gap-2 animate-[fadeInOut_4s_ease-in-out]">
             <span className="text-lg">⚡</span>
-            <span className="text-[13px] text-emerald-200">
-              Crédits ajoutés à ton compte !
-            </span>
+            <span className="text-[13px] text-emerald-200">Crédits ajoutés à ton compte !</span>
           </div>
         </div>
       )}
@@ -255,12 +242,10 @@ export default function CreditsPage() {
       {/* Titre + résumé */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
-          <h1 className="text-lg sm:text-xl font-semibold text-[var(--ink)]">
-            Crédits IA
-          </h1>
+          <h1 className="text-lg sm:text-xl font-semibold text-[var(--ink)]">Crédits IA</h1>
           <p className="text-[12px] text-[var(--muted)]">
-            Utilise tes crédits pour analyser ton CV, générer des lettres de motivation,
-            des pitchs, et préparer tes entretiens.
+            Utilise tes crédits pour analyser ton CV, générer des lettres de motivation, des pitchs, et préparer tes
+            entretiens.
           </p>
         </div>
 
@@ -285,12 +270,9 @@ export default function CreditsPage() {
       <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <div>
-            <h2 className="text-base font-semibold text-[var(--ink)]">
-              Recharger mes crédits
-            </h2>
+            <h2 className="text-base font-semibold text-[var(--ink)]">Recharger mes crédits</h2>
             <p className="text-[12px] text-[var(--muted)]">
-              Choisis un pack ci-dessous pour ajouter des crédits à ton compte.
-              Paiement sécurisé via Polar.
+              Choisis un pack ci-dessous pour ajouter des crédits à ton compte. Paiement sécurisé via Polar.
             </p>
           </div>
 
@@ -306,10 +288,7 @@ export default function CreditsPage() {
           </button>
         </div>
 
-        <div
-          id="credit-packs"
-          className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4 mt-2"
-        >
+        <div id="credit-packs" className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4 mt-2">
           {CREDIT_PACKS.map((pack) => (
             <div
               key={pack.key}
@@ -317,9 +296,7 @@ export default function CreditsPage() {
             >
               <div className="space-y-1">
                 <div className="flex items-center justify-between gap-2">
-                  <h3 className="text-[13px] font-semibold text-[var(--ink)]">
-                    {pack.label}
-                  </h3>
+                  <h3 className="text-[13px] font-semibold text-[var(--ink)]">{pack.label}</h3>
                   <span className="inline-flex items-center rounded-full px-2 py-[2px] text-[11px] bg-[var(--bg)] border border-[var(--border)]/80">
                     ⚡ {pack.credits} crédits
                   </span>
@@ -359,13 +336,59 @@ export default function CreditsPage() {
 
       {/* Explication d’usage */}
       <section className="text-[11px] text-[var(--muted)] space-y-1">
+        <p>1 crédit ≈ 1 action IA (analyse CV, génération de lettre, pitch, Q&A entretien…).</p>
         <p>
-          1 crédit ≈ 1 action IA (analyse CV, génération de lettre, pitch, Q&A entretien…).
+          Ton solde est mis à jour automatiquement après chaque achat dès que le paiement est confirmé (via le webhook
+          Polar).
         </p>
-        <p>
-          Ton solde est mis à jour automatiquement après chaque achat dès que le paiement est confirmé
-          (via le webhook Polar).
-        </p>
+      </section>
+
+      {/* ✅ Historique des recharges */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3">
+        <div>
+          <h2 className="text-base font-semibold text-[var(--ink)]">Historique des recharges</h2>
+          <p className="text-[12px] text-[var(--muted)]">
+            Liste des rechargements crédités sur ton compte (webhook Polar).
+          </p>
+        </div>
+
+        {rechargesError && <p className="text-[12px] text-red-400">{rechargesError}</p>}
+
+        {rechargesLoading ? (
+          <p className="text-[12px] text-[var(--muted)]">Chargement…</p>
+        ) : recharges.length === 0 ? (
+          <p className="text-[12px] text-[var(--muted)]">Aucune recharge pour le moment.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[12px]">
+              <thead className="text-[var(--muted)]">
+                <tr className="text-left">
+                  <th className="py-2 pr-4">Date</th>
+                  <th className="py-2 pr-4">Crédits</th>
+                  <th className="py-2 pr-4">Montant</th>
+                  <th className="py-2 pr-4">Statut</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recharges.map((r) => {
+                  const d = r.createdAt ? new Date(r.createdAt) : null;
+                  const amount = typeof r.amount === "number" ? (r.amount / 100).toFixed(2) : null;
+                  const cur = r.currency ? String(r.currency).toUpperCase() : "";
+                  return (
+                    <tr key={r.id} className="border-t border-[var(--border)]/80">
+                      <td className="py-2 pr-4">{d ? d.toLocaleString("fr-FR") : "—"}</td>
+                      <td className="py-2 pr-4">
+                        {typeof r.creditsAdded === "number" ? `+${r.creditsAdded}` : "—"}
+                      </td>
+                      <td className="py-2 pr-4">{amount ? `${amount} ${cur}` : "—"}</td>
+                      <td className="py-2 pr-4">{r.status || "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       {/* 🔥 POPUP CHECKOUT POLAR EN IFRAME */}
@@ -374,12 +397,8 @@ export default function CreditsPage() {
           <div className="relative w-full max-w-lg h-[520px] sm:h-[580px] bg-[var(--bg)] border border-[var(--border)]/80 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
             <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)]/70 bg-[var(--bg-soft)]/80">
               <div className="flex flex-col">
-                <span className="text-[12px] font-semibold text-[var(--ink)]">
-                  Paiement sécurisé
-                </span>
-                <span className="text-[11px] text-[var(--muted)]">
-                  Transaction gérée par Polar (Stripe)
-                </span>
+                <span className="text-[12px] font-semibold text-[var(--ink)]">Paiement sécurisé</span>
+                <span className="text-[11px] text-[var(--muted)]">Transaction gérée par Polar (Stripe)</span>
               </div>
               <button
                 type="button"

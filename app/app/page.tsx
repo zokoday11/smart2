@@ -18,6 +18,7 @@ import { useAuth } from "@/context/AuthContext";
 import { useUserProfile } from "@/hooks/useUserProfile";
 import { consumeCredits } from "@/lib/credits";
 import { logUsage } from "@/lib/userTracking";
+import { getRecaptchaToken } from "@/lib/recaptcha";
 
 // --- TYPES ---
 
@@ -83,9 +84,8 @@ type DashboardCounts = {
   lmCount: number;
 };
 
-// 🔗 URL de ta Firebase Function d'extraction de profil
-const WORKER_URL =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/extractProfile";
+// ✅ Appelle le proxy Next.js (pas la Cloud Function en direct)
+const WORKER_URL = "/api/extractProfile";
 
 // --- HELPERS GÉNÉRAUX ---
 
@@ -563,35 +563,9 @@ const DOMAIN_CORE_KEYWORDS: Record<string, string[]> = {
     "agile",
     "gestion de projet",
   ],
-  ops: [
-    "supply chain",
-    "logistique",
-    "exploitation",
-    "maintenance",
-    "production",
-  ],
-  health: [
-    "infirmier",
-    "infirmière",
-    "medecin",
-    "médecin",
-    "aide soignant",
-    "aide-soignant",
-    "soins",
-    "patients",
-  ],
-  education: [
-    "enseignant",
-    "professeur",
-    "formateur",
-    "formatrice",
-    "pedagogie",
-    "pédagogie",
-    "eleves",
-    "élèves",
-    "etudiants",
-    "étudiants",
-  ],
+  ops: ["supply chain", "logistique", "exploitation", "maintenance", "production"],
+  health: ["infirmier", "infirmière", "medecin", "médecin", "aide soignant", "aide-soignant", "soins", "patients"],
+  education: ["enseignant", "professeur", "formateur", "formatrice", "pedagogie", "pédagogie", "eleves", "élèves", "etudiants", "étudiants"],
 };
 
 const SOFT_SKILLS_KEYWORDS = [
@@ -719,7 +693,7 @@ function buildRadarData(profile: CvProfile | null) {
     relevant = domainScores
       .filter((d) => d.isRelevant)
       .sort((a, b) => b.totalHits - a.totalHits)
-      .slice(0, 4);
+      .slice(0, 4) as any;
   }
 
   let softHits = countHits(SOFT_SKILLS_KEYWORDS, lower);
@@ -999,25 +973,17 @@ export default function DashboardPage() {
             secondaryDomains: Array.isArray(data.secondaryDomains)
               ? data.secondaryDomains
               : [],
-            softSkills: Array.isArray(data.softSkills)
-              ? data.softSkills
-              : [],
+            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
             drivingLicense: data.drivingLicense || "",
             vehicle: data.vehicle || "",
             skills: {
               sections: Array.isArray(data.skills?.sections)
                 ? data.skills.sections
                 : [],
-              tools: Array.isArray(data.skills?.tools)
-                ? data.skills.tools
-                : [],
+              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
             },
-            experiences: Array.isArray(data.experiences)
-              ? data.experiences
-              : [],
-            education: Array.isArray(data.education)
-              ? data.education
-              : [],
+            experiences: Array.isArray(data.experiences) ? data.experiences : [],
+            education: Array.isArray(data.education) ? data.education : [],
             educationShort: Array.isArray(data.educationShort)
               ? data.educationShort
               : [],
@@ -1038,7 +1004,7 @@ export default function DashboardPage() {
         setLoadingProfileFromDb(false);
       }
 
-      // --- Stats candidatures (CV générés, LM générées, candidatures suivies)
+      // --- Stats candidatures
       setLoadingCounts(true);
 
       const q = query(
@@ -1071,9 +1037,7 @@ export default function DashboardPage() {
     });
 
     return () => {
-      if (unsubApps) {
-        unsubApps();
-      }
+      if (unsubApps) unsubApps();
       unsubAuth();
     };
   }, []);
@@ -1098,7 +1062,7 @@ export default function DashboardPage() {
     const ctx = radarCanvasRef.current.getContext("2d");
     if (!ctx) return;
 
-    const existingChart = Chart.getChart(ctx as any);
+    const existingChart = Chart.getChart(radarCanvasRef.current as any);
     if (existingChart) {
       existingChart.destroy();
     }
@@ -1147,9 +1111,7 @@ export default function DashboardPage() {
           },
         },
         plugins: {
-          legend: {
-            display: false,
-          },
+          legend: { display: false },
         },
       },
     });
@@ -1177,8 +1139,7 @@ export default function DashboardPage() {
   const fileToBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.onerror = () =>
-        reject(new Error("Impossible de lire le fichier."));
+      reader.onerror = () => reject(new Error("Impossible de lire le fichier."));
       reader.onload = () => {
         const result = reader.result as string;
         const base64 = result.split(",")[1];
@@ -1239,21 +1200,36 @@ export default function DashboardPage() {
         feature: "dashboard-cv-upload",
       });
 
-      // 3) Appel de la Cloud Function d'extraction
+      // 3) Appel via l'API Next.js (✅ auth + recaptcha)
       const base64Pdf = await fileToBase64(file);
+
+      const idToken = await user.getIdToken();
+      const recaptchaToken = await getRecaptchaToken("extract_profile");
 
       const res = await fetch(WORKER_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+          "X-Recaptcha-Token": recaptchaToken,
         },
-        body: JSON.stringify({ base64Pdf }),
+        body: JSON.stringify({
+          base64Pdf,
+          meta: {
+            fileName: file.name,
+            fileSize: file.size,
+            feature: "dashboard-cv-upload",
+          },
+        }),
       });
 
       const json = await res.json().catch(() => null);
 
       if (!res.ok) {
-        const msg = (json && json.error) || "Erreur pendant l'analyse du CV.";
+        const msg = (json && (json.error || json.message)) || `HTTP ${res.status}`;
+        if (res.status === 401 || msg === "unauthenticated") {
+          throw new Error("unauthenticated");
+        }
         throw new Error(msg);
       }
 
@@ -1300,9 +1276,7 @@ export default function DashboardPage() {
           : [],
         certs: rawProfile.certs || "",
         langLine: rawProfile.langLine || "",
-        hobbies: Array.isArray(rawProfile.hobbies)
-          ? rawProfile.hobbies
-          : [],
+        hobbies: Array.isArray(rawProfile.hobbies) ? rawProfile.hobbies : [],
         updatedAt: now,
       };
 
@@ -1314,7 +1288,9 @@ export default function DashboardPage() {
     } catch (err: any) {
       console.error(err);
       if (err instanceof Error) {
-        if (err.message === "NOT_ENOUGH_CREDITS") {
+        if (err.message === "unauthenticated") {
+          setError("Session expirée. Déconnecte-toi / reconnecte-toi puis réessaie.");
+        } else if (err.message === "NOT_ENOUGH_CREDITS" || err.message === "NO_CREDITS") {
           setError(
             "Tu n'as plus assez de crédits pour analyser un CV. Contacte l'administrateur."
           );
@@ -1327,9 +1303,7 @@ export default function DashboardPage() {
             "Profil utilisateur introuvable dans la base. Contacte l'administrateur."
           );
         } else {
-          setError(
-            err.message || "Impossible d'analyser ton CV pour le moment."
-          );
+          setError(err.message || "Impossible d'analyser ton CV pour le moment.");
         }
       } else {
         setError("Impossible d'analyser ton CV pour le moment.");
@@ -1639,9 +1613,7 @@ export default function DashboardPage() {
         .filter((l) => l.language.length > 0);
 
       const langLine = cleaned
-        .map((l) =>
-          l.level ? `${l.language} (${l.level})` : `${l.language}`
-        )
+        .map((l) => (l.level ? `${l.language} (${l.level})` : `${l.language}`))
         .join(" · ");
 
       updated = {
@@ -2158,9 +2130,7 @@ export default function DashboardPage() {
               className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3"
             >
               <div className="flex items-center justify-between gap-2 mb-1">
-                <h2 className="text-sm sm:text-base font-semibold">
-                  Langues
-                </h2>
+                <h2 className="text-sm sm:text-base font-semibold">Langues</h2>
                 <button
                   type="button"
                   onClick={openLanguagesModal}
@@ -2256,15 +2226,13 @@ export default function DashboardPage() {
             <div className="flex items-center justify-between gap-2">
               <h3 className="text-sm sm:text-base font-semibold">
                 {activeModal === "infos" && "Modifier tes informations clés"}
-                {activeModal === "skills" &&
-                  "Modifier tes compétences & outils"}
+                {activeModal === "skills" && "Modifier tes compétences & outils"}
                 {activeModal === "experience" &&
                   "Modifier tes expériences principales"}
                 {activeModal === "education" &&
                   "Modifier ta formation & tes certifications"}
                 {activeModal === "languages" && "Modifier tes langues"}
-                {activeModal === "hobbies" &&
-                  "Modifier tes centres d’intérêt"}
+                {activeModal === "hobbies" && "Modifier tes centres d’intérêt"}
               </h3>
               <button
                 type="button"
@@ -2481,11 +2449,7 @@ export default function DashboardPage() {
                             className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
                             value={exp.role}
                             onChange={(e) =>
-                              updateExperienceDraft(
-                                idx,
-                                "role",
-                                e.target.value
-                              )
+                              updateExperienceDraft(idx, "role", e.target.value)
                             }
                           />
                         </div>

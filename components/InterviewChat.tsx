@@ -4,6 +4,9 @@
 import { useState, useEffect, useRef } from "react";
 import { useAuth } from "@/context/AuthContext";
 
+// ✅ AJOUT reCAPTCHA
+import { tryGetRecaptchaToken } from "@/lib/recaptcha";
+
 type Message = {
   role: "interviewer" | "candidate" | "system";
   text: string;
@@ -37,8 +40,10 @@ const VOICE_PROFILES: Record<
   },
 };
 
-// Durée moyenne par question (en minutes) pour l'estimation
 const AVG_MIN_PER_QUESTION = 1.5;
+
+// ✅ reCAPTCHA action unique attendue côté serveur (Cloud Function + /api/interview)
+const RECAPTCHA_ACTION = "interview";
 
 // --- Helper : récup nom côté client (Firebase Auth) ---
 const getCandidateNameFromAuth = (user: any): string | null => {
@@ -65,10 +70,8 @@ const personalizeQuestionClient = (
   const firstName = safeName.split(" ")[0] || safeName;
 
   if (safeName) {
-    // FR
     q = q.replace(/\[Nom du candidat[^\]]*\]/gi, safeName);
     q = q.replace(/\[Prénom du candidat[^\]]*\]/gi, firstName);
-    // EN (au cas où)
     q = q.replace(/\[Name of the candidate[^\]]*\]/gi, safeName);
     q = q.replace(/\[First name of the candidate[^\]]*\]/gi, firstName);
   } else {
@@ -78,12 +81,9 @@ const personalizeQuestionClient = (
     q = q.replace(/\[First name of the candidate[^\]]*\]/gi, "");
   }
 
-  // Nettoyage "Bonjour ,", espaces multiples, etc.
   q = q.replace(/\s+,/g, ",");
   q = q.replace(/\s{2,}/g, " ").trim();
   q = q.replace(/^,\s*/, "");
-
-  // Harmonise les débuts de phrase
   q = q.replace(/^Bonjour\s*,/i, "Bonjour,");
   q = q.replace(/^Bonjour\s+$/, "Bonjour,");
 
@@ -98,31 +98,25 @@ export default function InterviewChat() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
-  // "started" = entretien en cours (questions qui s'enchaînent)
   const [started, setStarted] = useState(false);
-  // "finished" = bilan final reçu
   const [finished, setFinished] = useState(false);
 
-  // Config entretien
   const [jobTitle, setJobTitle] = useState("");
   const [jobDesc, setJobDesc] = useState("");
   const [interviewMode, setInterviewMode] =
     useState<InterviewMode>("complet");
   const [difficulty, setDifficulty] = useState<Difficulty>("standard");
 
-  // Profil du recruteur : voix + avatar
   const [voiceProfile, setVoiceProfile] =
     useState<VoiceProfileId>("femme");
   const [recruiterGender, setRecruiterGender] =
     useState<RecruiterGender>("f");
 
-  // Progression de l'entretien
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [totalQuestions, setTotalQuestions] = useState(
     INTERVIEW_QUESTION_PLAN["complet"]
   );
 
-  // États vocaux
   const [listening, setListening] = useState(false);
   const recognitionRef = useRef<any>(null);
   const [speechSupported, setSpeechSupported] = useState(false);
@@ -130,17 +124,58 @@ export default function InterviewChat() {
     useState(false);
   const [aiSpeaking, setAiSpeaking] = useState(false);
 
-  // Feedback final
   const [finalSummary, setFinalSummary] = useState<string | null>(null);
   const [finalScore, setFinalScore] = useState<number | null>(null);
   const [finalDecision, setFinalDecision] = useState<string | null>(null);
 
-  // Effet "texte qui s'écrit" pour la dernière question
   const [typing, setTyping] = useState(false);
   const [typingIndex, setTypingIndex] = useState(0);
 
-  // Auto-scroll du chat
   const chatRef = useRef<HTMLDivElement | null>(null);
+
+  // ✅ Helper fetch /api/interview + reCAPTCHA
+  const postInterview = async (payload: any) => {
+    const recaptchaToken = await tryGetRecaptchaToken(RECAPTCHA_ACTION).catch(
+      () => null
+    );
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (recaptchaToken) headers["X-Recaptcha-Token"] = recaptchaToken;
+
+    const body = {
+      ...payload,
+      recaptchaToken: recaptchaToken || undefined,
+      recaptchaAction: RECAPTCHA_ACTION,
+    };
+
+    const res = await fetch("/api/interview", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    const contentType = res.headers.get("content-type") || "";
+    const data = contentType.includes("application/json")
+      ? await res.json().catch(() => null)
+      : await res.text().catch(() => "");
+
+    if (!res.ok) {
+      const errMsg =
+        typeof data === "object" && data
+          ? data.error ||
+            `HTTP ${res.status}` +
+              (data.details ? ` — ${JSON.stringify(data.details)}` : "")
+          : typeof data === "string"
+          ? data || `HTTP ${res.status}`
+          : `HTTP ${res.status}`;
+
+      throw new Error(errMsg);
+    }
+
+    return data;
+  };
 
   // --- INIT VOIX (TTS) ---
   useEffect(() => {
@@ -159,7 +194,6 @@ export default function InterviewChat() {
     el.scrollTop = el.scrollHeight;
   }, [history, loading]);
 
-  // Index du dernier message "interviewer" (pour l'effet typewriter)
   const lastInterviewerIndex =
     history.length > 0
       ? [...history]
@@ -173,7 +207,7 @@ export default function InterviewChat() {
       ? history[lastInterviewerIndex]?.text || ""
       : "";
 
-  // --- TYPEWRITER (effet texte qui s'écrit pour la dernière question) ---
+  // --- TYPEWRITER ---
   useEffect(() => {
     if (!typing) return;
     if (lastInterviewerIndex === -1) return;
@@ -217,7 +251,7 @@ export default function InterviewChat() {
     }
   };
 
-  // --- PARLER (TTS) : NE LIT QUE LES QUESTIONS ---
+  // --- PARLER (TTS) ---
   const speak = (text: string) => {
     if (typeof window === "undefined") return;
     const toSpeak = (text || "").trim();
@@ -229,18 +263,14 @@ export default function InterviewChat() {
 
     try {
       const utterance = new SpeechSynthesisUtterance(toSpeak);
-
-      // Langue
       utterance.lang = "fr-FR";
 
-      // Pitch + vitesse selon profil (mais pas critique si ça ne marche pas)
       const profile = VOICE_PROFILES[voiceProfile];
       if (profile) {
         utterance.pitch = profile.pitch;
         utterance.rate = profile.rate;
       }
 
-      // Gestion des états UI
       utterance.onstart = () => setAiSpeaking(true);
       utterance.onend = () => setAiSpeaking(false);
       utterance.onerror = (e) => {
@@ -248,7 +278,6 @@ export default function InterviewChat() {
         setAiSpeaking(false);
       };
 
-      // On annule ce qui est en cours puis on parle
       try {
         window.speechSynthesis.cancel();
       } catch {
@@ -261,7 +290,7 @@ export default function InterviewChat() {
     }
   };
 
-  // --- PARSE des payloads backend (gère ```json ...``` + JSON cassé) ---
+  // --- PARSE payload backend ---
   const parseInterviewPayload = (raw: any): {
     nextQuestion: string | null;
     shortAnalysis: string | null;
@@ -274,7 +303,6 @@ export default function InterviewChat() {
       if (!txt) return null;
       let inner = txt.trim();
 
-      // On enlève d'abord les balises ```lang ... ```
       if (inner.startsWith("```")) {
         inner = inner
           .replace(/^```[a-zA-Z]*\s*\n?/, "")
@@ -283,35 +311,21 @@ export default function InterviewChat() {
       }
 
       try {
-        // Si c'est un JSON propre, on parse direct
         const parsed = JSON.parse(inner);
         return parsed;
       } catch {
-        // Sinon, on essaie d'extraire les champs à la main (regex)
         const result: any = {};
 
-        const extractField = (
-          field: string,
-          source: string
-        ): string | null => {
+        const extractField = (field: string, source: string): string | null => {
           const doubleQuote =
             source.match(
-              new RegExp(
-                `"${field}"\\s*:\\s*"([^"]*)"`,
-                "s"
-              )
+              new RegExp(`"${field}"\\s*:\\s*"([^"]*)"`, "s")
             ) ||
             source.match(
-              new RegExp(
-                `"${field}"\\s*:\\s*\\"([^"]*)\\"`,
-                "s"
-              )
+              new RegExp(`"${field}"\\s*:\\s*\\"([^"]*)\\"`, "s")
             );
           const singleQuote = source.match(
-            new RegExp(
-              `'${field}'\\s*:\\s*'([^']*)'`,
-              "s"
-            )
+            new RegExp(`'${field}'\\s*:\\s*'([^']*)'`, "s")
           );
           const m = doubleQuote || singleQuote;
           if (!m) return null;
@@ -339,86 +353,45 @@ export default function InterviewChat() {
           if (!Number.isNaN(num)) result.final_score = num;
         }
 
-        if (Object.keys(result).length > 0) {
-          return result;
-        }
-
-        // Dernier fallback : on considère que tout le texte est la question
+        if (Object.keys(result).length > 0) return result;
         return { next_question: inner };
       }
     };
 
-    // Si on reçoit une string brute (potentiellement avec ```json ...``` dedans)
-    if (typeof obj === "string") {
-      obj = tryParseString(obj);
-    }
+    if (typeof obj === "string") obj = tryParseString(obj);
 
-    // Si on reçoit un objet, mais que certains champs sont eux-mêmes du ```json ...```
     if (obj && typeof obj === "object") {
-      if (
-        typeof obj.nextQuestion === "string" &&
-        obj.nextQuestion.trim().startsWith("```")
-      ) {
+      if (typeof obj.nextQuestion === "string" && obj.nextQuestion.trim().startsWith("```")) {
         const nested = tryParseString(obj.nextQuestion);
         if (nested && typeof nested === "object") {
-          const q =
-            (nested as any).next_question ??
-            (nested as any).nextQuestion ??
-            null;
-          obj = {
-            ...obj,
-            ...nested,
-            next_question: q ?? obj.next_question,
-            nextQuestion: q ?? obj.nextQuestion,
-          };
+          const q = (nested as any).next_question ?? (nested as any).nextQuestion ?? null;
+          obj = { ...obj, ...nested, next_question: q ?? obj.next_question, nextQuestion: q ?? obj.nextQuestion };
         }
       }
-      if (
-        typeof obj.next_question === "string" &&
-        obj.next_question.trim().startsWith("```")
-      ) {
+      if (typeof obj.next_question === "string" && obj.next_question.trim().startsWith("```")) {
         const nested = tryParseString(obj.next_question);
         if (nested && typeof nested === "object") {
-          const q =
-            (nested as any).next_question ??
-            (nested as any).nextQuestion ??
-            null;
-          obj = {
-            ...obj,
-            ...nested,
-            next_question: q ?? obj.next_question,
-            nextQuestion: q ?? obj.nextQuestion,
-          };
+          const q = (nested as any).next_question ?? (nested as any).nextQuestion ?? null;
+          obj = { ...obj, ...nested, next_question: q ?? obj.next_question, nextQuestion: q ?? obj.nextQuestion };
         }
       }
     }
 
-    // ⚠️ IMPORTANT : on privilégie toujours next_question (propre) avant nextQuestion
     const nextQuestionRaw =
-      obj?.next_question ||
-      obj?.nextQuestion ||
-      obj?.question ||
-      null;
-    const shortAnalysis =
-      obj?.short_analysis || obj?.shortAnalysis || null;
-    const finalSummary =
-      obj?.final_summary || obj?.finalSummary || null;
-    const finalScoreRaw =
-      obj?.final_score ?? obj?.finalScore ?? null;
+      obj?.next_question || obj?.nextQuestion || obj?.question || null;
+    const shortAnalysis = obj?.short_analysis || obj?.shortAnalysis || null;
+    const finalSummary = obj?.final_summary || obj?.finalSummary || null;
+    const finalScoreRaw = obj?.final_score ?? obj?.finalScore ?? null;
 
     const nextQuestionText =
-      typeof nextQuestionRaw === "string"
-        ? nextQuestionRaw.trim()
-        : null;
+      typeof nextQuestionRaw === "string" ? nextQuestionRaw.trim() : null;
 
-    // --- NETTOYAGE : on retire tout bloc ```...``` éventuel du texte public ---
     let cleanNextQuestion = nextQuestionText;
     if (cleanNextQuestion) {
       cleanNextQuestion = cleanNextQuestion
         .replace(/```[a-zA-Z]*\s*\n?[\s\S]*?```/g, "")
         .trim();
     }
-    // -------------------------------------------------------------------------
 
     const scoreNum =
       typeof finalScoreRaw === "number"
@@ -429,14 +402,8 @@ export default function InterviewChat() {
 
     return {
       nextQuestion: cleanNextQuestion,
-      shortAnalysis:
-        typeof shortAnalysis === "string"
-          ? shortAnalysis.trim()
-          : null,
-      finalSummary:
-        typeof finalSummary === "string"
-          ? finalSummary.trim()
-          : null,
+      shortAnalysis: typeof shortAnalysis === "string" ? shortAnalysis.trim() : null,
+      finalSummary: typeof finalSummary === "string" ? finalSummary.trim() : null,
       finalScore: Number.isNaN(scoreNum) ? null : scoreNum,
     };
   };
@@ -448,12 +415,8 @@ export default function InterviewChat() {
       return;
     }
 
-    // 🔓 Débloque TTS dans le geste utilisateur (iOS / mobiles stricts)
     try {
-      if (
-        typeof window !== "undefined" &&
-        "speechSynthesis" in window
-      ) {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
         const silent = new SpeechSynthesisUtterance(" ");
         silent.volume = 0;
         silent.rate = 1;
@@ -474,49 +437,26 @@ export default function InterviewChat() {
     setTotalQuestions(INTERVIEW_QUESTION_PLAN[interviewMode]);
 
     try {
-      const res = await fetch("/api/interview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "start",
-          userId: user.uid,
-          jobTitle,
-          jobDesc,
-          interviewMode,
-          difficulty,
-          channel: "oral",
-        }),
+      // ✅ utilise postInterview (avec reCAPTCHA)
+      const data = await postInterview({
+        action: "start",
+        userId: user.uid,
+        jobTitle,
+        jobDesc,
+        interviewMode,
+        difficulty,
+        channel: "oral",
       });
 
-      const contentType = res.headers.get("content-type") || "";
-      if (!contentType.includes("application/json")) {
-        const text = await res.text();
-        console.error("Réponse non JSON de /api/interview (start):", text);
-        throw new Error(
-          "Réponse serveur invalide (non JSON). Vérifie le rewrite /api/interview."
-        );
-      }
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(
-          data.error || "Erreur lors du démarrage de l'entretien."
-        );
-      }
-
-      let rawFirst =
-        data.firstQuestion ||
-        data.first_question ||
-        data.nextQuestion ||
-        data.next_question ||
+      const rawFirst =
+        (data as any)?.firstQuestion ||
+        (data as any)?.first_question ||
+        (data as any)?.nextQuestion ||
+        (data as any)?.next_question ||
         data;
 
-      const {
-        nextQuestion,
-        shortAnalysis,
-        finalSummary,
-        finalScore,
-      } = parseInterviewPayload(rawFirst);
+      const { nextQuestion, shortAnalysis, finalSummary, finalScore } =
+        parseInterviewPayload(rawFirst);
 
       const firstQ = personalizeQuestionClient(
         nextQuestion ||
@@ -524,13 +464,11 @@ export default function InterviewChat() {
         user
       );
 
-      setSessionId(data.sessionId || data.session_id || null);
+      setSessionId((data as any)?.sessionId || (data as any)?.session_id || null);
       setStarted(true);
       setCurrentQuestionIndex(1);
 
-      const newHistory: Message[] = [
-        { role: "interviewer", text: firstQ },
-      ];
+      const newHistory: Message[] = [{ role: "interviewer", text: firstQ }];
 
       if (shortAnalysis) {
         newHistory.push({
@@ -552,9 +490,7 @@ export default function InterviewChat() {
       speak(firstQ);
     } catch (e: any) {
       console.error(e);
-      alert(
-        e.message || "Erreur lors du démarrage de la simulation."
-      );
+      alert(e?.message || "Erreur lors du démarrage de la simulation.");
       setStarted(false);
       setSessionId(null);
     } finally {
@@ -562,79 +498,46 @@ export default function InterviewChat() {
     }
   };
 
-  // --- RÉPONDRE (clavier + micro) ---
+  // --- RÉPONDRE ---
   const sendAnswer = async (text: string) => {
     const answer = text.trim();
     if (!answer) return;
 
     if (!started || !sessionId) {
-      console.warn(
-        "Réponse ignorée : entretien non démarré ou sessionId manquant."
-      );
+      console.warn("Réponse ignorée : entretien non démarré ou sessionId manquant.");
       return;
     }
 
-    setHistory((prev) => [
-      ...prev,
-      { role: "candidate", text: answer } as Message,
-    ]);
+    setHistory((prev) => [...prev, { role: "candidate", text: answer } as Message]);
     setInput("");
     setLoading(true);
 
     try {
-      const res = await fetch("/api/interview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "answer",
-          userId: user?.uid,
-          sessionId,
-          userMessage: answer,
-          interviewMode,
-          difficulty,
-        }),
+      // ✅ utilise postInterview (avec reCAPTCHA)
+      const data = await postInterview({
+        action: "answer",
+        userId: user?.uid,
+        sessionId,
+        userMessage: answer,
+        interviewMode,
+        difficulty,
       });
-
-      const contentType = res.headers.get("content-type") || "";
-      if (!contentType.includes("application/json")) {
-        const textErr = await res.text();
-        console.error("Réponse non JSON de /api/interview (answer):", textErr);
-        throw new Error(
-          "Réponse serveur invalide (non JSON) pendant l'entretien."
-        );
-      }
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(
-          data.error || "Erreur lors de l'envoi de la réponse."
-        );
-      }
 
       const payload = (() => {
         if (
-          data.nextQuestion ||
-          data.next_question ||
-          data.final_summary ||
-          data.finalSummary
+          (data as any)?.nextQuestion ||
+          (data as any)?.next_question ||
+          (data as any)?.final_summary ||
+          (data as any)?.finalSummary
         ) {
           return parseInterviewPayload(data);
         }
-        if (data.payload) {
-          return parseInterviewPayload(data.payload);
-        }
-        if (typeof data === "string") {
-          return parseInterviewPayload(data);
-        }
+        if ((data as any)?.payload) return parseInterviewPayload((data as any).payload);
+        if (typeof data === "string") return parseInterviewPayload(data);
         return parseInterviewPayload(data);
       })();
 
-      const {
-        nextQuestion,
-        shortAnalysis,
-        finalSummary,
-        finalScore,
-      } = payload;
+      const { nextQuestion, shortAnalysis, finalSummary, finalScore } = payload;
 
       const nextQClean = nextQuestion
         ? personalizeQuestionClient(nextQuestion, user)
@@ -651,10 +554,7 @@ export default function InterviewChat() {
         }
 
         if (nextQClean && !finalSummary) {
-          newHistory.push({
-            role: "interviewer",
-            text: nextQClean,
-          });
+          newHistory.push({ role: "interviewer", text: nextQClean });
         }
 
         return newHistory;
@@ -683,18 +583,14 @@ export default function InterviewChat() {
       }
 
       if (nextQClean && !finalSummary) {
-        setCurrentQuestionIndex((prev) =>
-          Math.min(prev + 1, totalQuestions)
-        );
+        setCurrentQuestionIndex((prev) => Math.min(prev + 1, totalQuestions));
         setTypingIndex(0);
         setTyping(true);
         speak(nextQClean);
       }
     } catch (e: any) {
       console.error(e);
-      alert(
-        e.message || "Erreur lors de l'envoi de ta réponse."
-      );
+      alert(e?.message || "Erreur lors de l'envoi de ta réponse.");
     } finally {
       setLoading(false);
     }
@@ -705,8 +601,7 @@ export default function InterviewChat() {
     if (typeof window === "undefined") return;
 
     const w = window as any;
-    const SpeechRecognition =
-      w.SpeechRecognition || w.webkitSpeechRecognition;
+    const SpeechRecognition = w.SpeechRecognition || w.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
       setRecognitionSupported(false);
@@ -744,14 +639,12 @@ export default function InterviewChat() {
         // ignore
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [started, sessionId]);
 
-  // --- ACTIONS UI ---
   const toggleMic = () => {
     if (!started) {
-      alert(
-        "Lance d'abord la simulation avant d'utiliser le micro."
-      );
+      alert("Lance d'abord la simulation avant d'utiliser le micro.");
       return;
     }
 
@@ -808,7 +701,6 @@ export default function InterviewChat() {
     setTypingIndex(0);
   };
 
-  // Progress / stepper / temps restant
   const progressPercent =
     totalQuestions > 0
       ? Math.min((currentQuestionIndex / totalQuestions) * 100, 100)
@@ -817,21 +709,11 @@ export default function InterviewChat() {
   const showConfig = !started || finished;
   const showInterviewPanel = started || finished;
 
-  const stepVisual = !started
-    ? 1
-    : finished || finalSummary || finalScore !== null
-    ? 3
-    : 2;
+  const stepVisual = !started ? 1 : finished || finalSummary || finalScore !== null ? 3 : 2;
 
-  const questionsLeft = Math.max(
-    totalQuestions - currentQuestionIndex,
-    0
-  );
+  const questionsLeft = Math.max(totalQuestions - currentQuestionIndex, 0);
   const estimatedMinutesLeft = questionsLeft * AVG_MIN_PER_QUESTION;
-  const estimatedMinutesRounded =
-    questionsLeft > 0
-      ? Math.max(1, Math.round(estimatedMinutesLeft))
-      : 0;
+  const estimatedMinutesRounded = questionsLeft > 0 ? Math.max(1, Math.round(estimatedMinutesLeft)) : 0;
 
   return (
     <section className="glass rounded-2xl p-5 space-y-4">
@@ -841,11 +723,8 @@ export default function InterviewChat() {
           Simulateur d&apos;entretien IA (mode vocal)
         </h2>
         <p className="text-[11px] text-[var(--muted)] max-w-2xl">
-          L&apos;IA joue le rôle du recruteur : elle te pose des
-          questions adaptées au poste et à ton profil à l&apos;oral,
-          tu réponds à l&apos;oral ou à l&apos;écrit, et elle lit
-          ensuite ses messages à voix haute. Idéal pour t&apos;entraîner
-          avec un casque ou des écouteurs.
+          L&apos;IA joue le rôle du recruteur : elle te pose des questions adaptées au poste et à ton profil à l&apos;oral,
+          tu réponds à l&apos;oral ou à l&apos;écrit, et elle lit ensuite ses messages à voix haute.
         </p>
       </div>
 
@@ -869,30 +748,22 @@ export default function InterviewChat() {
               >
                 {step.id}
               </div>
-              <span
-                className={
-                  stepVisual === step.id
-                    ? "text-emerald-300"
-                    : "text-[var(--muted)]"
-                }
-              >
+              <span className={stepVisual === step.id ? "text-emerald-300" : "text-[var(--muted)]"}>
                 {step.label}
               </span>
             </div>
           ))}
         </div>
 
-        {/* Bloc configuration avant / après l'entretien */}
+        {/* Bloc configuration */}
         {showConfig && (
           <div className="glass p-4 rounded-2xl border border-white/10 space-y-3">
             <p className="text-sm text-[var(--muted)]">
-              Configure ton entretien, choisis le type de simulation et
-              le profil du recruteur (voix + apparence), puis lance le
-              mode vocal.
+              Configure ton entretien, choisis le type de simulation et le profil du recruteur (voix + apparence),
+              puis lance le mode vocal.
             </p>
 
             <div className="grid gap-3 md:grid-cols-2">
-              {/* Colonne gauche : poste & description */}
               <div className="space-y-2">
                 <label className="block text-xs font-medium text-[var(--muted)]">
                   Poste visé
@@ -910,14 +781,13 @@ export default function InterviewChat() {
                 </label>
                 <textarea
                   className="w-full bg-black/20 border border-white/10 rounded-lg p-2 text-xs min-h-[100px]"
-                  placeholder="Colle ici l'annonce ou un extrait (missions, contexte...). Si tu laisses vide, l'IA fera un entretien plus général."
+                  placeholder="Colle ici l'annonce ou un extrait..."
                   value={jobDesc}
                   disabled={loading || started}
                   onChange={(e) => setJobDesc(e.target.value)}
                 />
               </div>
 
-              {/* Colonne droite : mode, niveau, profil recruteur */}
               <div className="space-y-2">
                 <div>
                   <label className="block text-xs font-medium text-[var(--muted)]">
@@ -927,25 +797,12 @@ export default function InterviewChat() {
                     className="w-full bg-black/20 border border-white/10 rounded-lg p-2 text-xs"
                     value={interviewMode}
                     disabled={loading || started}
-                    onChange={(e) =>
-                      setInterviewMode(
-                        e.target.value as InterviewMode
-                      )
-                    }
+                    onChange={(e) => setInterviewMode(e.target.value as InterviewMode)}
                   >
-                    <option value="complet">
-                      Entretien complet (général + motivation +
-                      compétences)
-                    </option>
-                    <option value="rapide">
-                      Flash 10 minutes (questions essentielles)
-                    </option>
-                    <option value="technique">
-                      Focalisé compétences / technique
-                    </option>
-                    <option value="comportemental">
-                      Comportemental (soft skills, situations)
-                    </option>
+                    <option value="complet">Entretien complet (général + motivation + compétences)</option>
+                    <option value="rapide">Flash 10 minutes (questions essentielles)</option>
+                    <option value="technique">Focalisé compétences / technique</option>
+                    <option value="comportemental">Comportemental (soft skills, situations)</option>
                   </select>
                 </div>
 
@@ -957,23 +814,14 @@ export default function InterviewChat() {
                     className="w-full bg-black/20 border border-white/10 rounded-lg p-2 text-xs"
                     value={difficulty}
                     disabled={loading || started}
-                    onChange={(e) =>
-                      setDifficulty(
-                        e.target.value as Difficulty
-                      )
-                    }
+                    onChange={(e) => setDifficulty(e.target.value as Difficulty)}
                   >
-                    <option value="facile">
-                      Facile / débutant
-                    </option>
+                    <option value="facile">Facile / débutant</option>
                     <option value="standard">Standard</option>
-                    <option value="difficile">
-                      Exigeant (questions poussées)
-                    </option>
+                    <option value="difficile">Exigeant (questions poussées)</option>
                   </select>
                 </div>
 
-                {/* Profil recruteur (voix + avatar) */}
                 <div className="mt-1">
                   <label className="block text-xs font-medium text-[var(--muted)]">
                     Profil du recruteur (voix + apparence)
@@ -996,9 +844,7 @@ export default function InterviewChat() {
                       <span className="text-left">
                         Recruteur homme
                         <br />
-                        <span className="text-[10px] text-[var(--muted)]">
-                          Voix masculine
-                        </span>
+                        <span className="text-[10px] text-[var(--muted)]">Voix masculine</span>
                       </span>
                     </button>
                     <button
@@ -1018,9 +864,7 @@ export default function InterviewChat() {
                       <span className="text-left">
                         Recruteuse femme
                         <br />
-                        <span className="text-[10px] text-[var(--muted)]">
-                          Voix féminine
-                        </span>
+                        <span className="text-[10px] text-[var(--muted)]">Voix féminine</span>
                       </span>
                     </button>
                   </div>
@@ -1028,27 +872,18 @@ export default function InterviewChat() {
 
                 <p className="text-[10px] text-[var(--muted)] mt-1">
                   L&apos;entretien durera environ{" "}
-                  <span className="font-semibold">
-                    {INTERVIEW_QUESTION_PLAN[interviewMode]} questions
-                  </span>
-                  .
+                  <span className="font-semibold">{INTERVIEW_QUESTION_PLAN[interviewMode]} questions</span>.
                 </p>
 
                 {!recognitionSupported && (
                   <p className="text-[10px] text-[var(--muted)] mt-1">
-                    ⚠️ La reconnaissance vocale n&apos;est pas
-                    disponible sur ce navigateur / appareil (par
-                    exemple iOS Safari). Tu pourras quand même répondre
-                    au clavier et écouter la voix du recruteur si elle
-                    est supportée.
+                    ⚠️ La reconnaissance vocale n&apos;est pas disponible sur ce navigateur / appareil.
                   </p>
                 )}
 
                 {!speechSupported && (
                   <p className="text-[10px] text-[var(--muted)] mt-1">
-                    ⚠️ La synthèse vocale n&apos;est pas supportée
-                    ici. L&apos;IA ne pourra pas lire les questions à
-                    voix haute.
+                    ⚠️ La synthèse vocale n&apos;est pas supportée ici.
                   </p>
                 )}
               </div>
@@ -1060,21 +895,18 @@ export default function InterviewChat() {
               className="btn-primary w-full mt-2"
               type="button"
             >
-              {loading
-                ? "Préparation de la simulation..."
-                : "Lancer la simulation vocale 🎙️"}
+              {loading ? "Préparation de la simulation..." : "Lancer la simulation vocale 🎙️"}
             </button>
 
             {!user && (
               <p className="text-[10px] text-[var(--muted)]">
-                Tu dois être connecté pour utiliser le simulateur
-                d&apos;entretien.
+                Tu dois être connecté pour utiliser le simulateur d&apos;entretien.
               </p>
             )}
           </div>
         )}
 
-        {/* Bloc entretien en direct */}
+        {/* Bloc entretien */}
         {showInterviewPanel && (
           <div className="glass p-4 rounded-2xl border border-white/10 h-[520px] flex flex-col">
             <div className="flex justify-between items-start mb-4 border-b border-white/5 pb-2 gap-3">
@@ -1084,29 +916,17 @@ export default function InterviewChat() {
                     aiSpeaking ? "animate-pulse" : ""
                   }`}
                 >
-                  <span className="text-2xl">
-                    {recruiterGender === "f" ? "👩‍💼" : "👨‍💼"}
-                  </span>
+                  <span className="text-2xl">{recruiterGender === "f" ? "👩‍💼" : "👨‍💼"}</span>
                 </div>
                 <div className="text-xs text-[var(--muted)]">
-                  <p className="font-semibold">
-                    {recruiterGender === "f"
-                      ? "Recruteuse IA"
-                      : "Recruteur IA"}
-                  </p>
+                  <p className="font-semibold">{recruiterGender === "f" ? "Recruteuse IA" : "Recruteur IA"}</p>
                   <p className="text-[11px]">
-                    {aiSpeaking
-                      ? "Te pose une question..."
-                      : finished
-                      ? "Entretien terminé"
-                      : "Attend ta réponse"}
+                    {aiSpeaking ? "Te pose une question..." : finished ? "Entretien terminé" : "Attend ta réponse"}
                   </p>
                   {lastInterviewerMessage && (
                     <button
                       type="button"
-                      onClick={() =>
-                        speak(lastInterviewerMessage)
-                      }
+                      onClick={() => speak(lastInterviewerMessage)}
                       className="mt-1 inline-flex items-center gap-1 text-[10px] px-2 py-[2px] rounded-full bg-white/5 hover:bg-white/10"
                     >
                       🔊 Réécouter la question
@@ -1116,70 +936,40 @@ export default function InterviewChat() {
               </div>
 
               <div className="flex flex-col items-end gap-1">
-                <span className="text-[10px] font-semibold text-emerald-400 uppercase tracking-wider">
-                  En direct
-                </span>
+                <span className="text-[10px] font-semibold text-emerald-400 uppercase tracking-wider">En direct</span>
                 <span className="text-[10px] text-[var(--muted)]">
-                  {finished
-                    ? "Entretien terminé"
-                    : `Question ${Math.max(
-                        1,
-                        currentQuestionIndex
-                      )} sur ${totalQuestions}`}
+                  {finished ? "Entretien terminé" : `Question ${Math.max(1, currentQuestionIndex)} sur ${totalQuestions}`}
                 </span>
                 <div className="w-32 h-1.5 bg-white/10 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-emerald-400 transition-all"
-                    style={{ width: `${progressPercent}%` }}
-                  />
+                  <div className="h-full bg-emerald-400 transition-all" style={{ width: `${progressPercent}%` }} />
                 </div>
+
                 {!finished && questionsLeft > 0 && (
                   <span className="text-[10px] text-[var(--muted)]">
-                    Il reste environ{" "}
-                    <span className="font-semibold">
-                      {questionsLeft} questions
-                    </span>{" "}
-                    (~{estimatedMinutesRounded} min)
+                    Il reste environ <span className="font-semibold">{questionsLeft} questions</span> (~
+                    {estimatedMinutesRounded} min)
                   </span>
                 )}
+
                 {finished && (
                   <span className="text-[10px] text-[var(--muted)]">
                     Entretien terminé • Bilan disponible ci-dessous
                   </span>
                 )}
-                <button
-                  onClick={stopSession}
-                  className="text-[11px] text-red-400 hover:underline mt-1"
-                  type="button"
-                >
+
+                <button onClick={stopSession} className="text-[11px] text-red-400 hover:underline mt-1" type="button">
                   Arrêter l&apos;entretien
                 </button>
               </div>
             </div>
 
-            {/* Zone de chat */}
-            <div
-              ref={chatRef}
-              className="flex-1 overflow-y-auto space-y-4 custom-scrollbar pr-2"
-            >
+            <div ref={chatRef} className="flex-1 overflow-y-auto space-y-4 custom-scrollbar pr-2">
               {history.map((m, i) => {
-                const isLastInterviewer =
-                  m.role === "interviewer" &&
-                  i === lastInterviewerIndex;
-                const showText =
-                  isLastInterviewer && typing
-                    ? m.text.slice(0, typingIndex)
-                    : m.text;
+                const isLastInterviewer = m.role === "interviewer" && i === lastInterviewerIndex;
+                const showText = isLastInterviewer && typing ? m.text.slice(0, typingIndex) : m.text;
 
                 return (
-                  <div
-                    key={i}
-                    className={`flex ${
-                      m.role === "candidate"
-                        ? "justify-end"
-                        : "justify-start"
-                    }`}
-                  >
+                  <div key={i} className={`flex ${m.role === "candidate" ? "justify-end" : "justify-start"}`}>
                     <div
                       className={`max-w-[85%] p-3 rounded-2xl text-sm ${
                         m.role === "candidate"
@@ -1202,46 +992,28 @@ export default function InterviewChat() {
                 </div>
               )}
 
-              {/* Résultat final */}
               {finished && (finalSummary || finalScore !== null) && (
                 <div className="mt-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-3 text-[11px] space-y-2">
-                  <p className="text-xs font-semibold text-emerald-300">
-                    Bilan de l&apos;entretien
-                  </p>
+                  <p className="text-xs font-semibold text-emerald-300">Bilan de l&apos;entretien</p>
                   {typeof finalScore === "number" && (
                     <p>
-                      <span className="font-semibold">
-                        Note globale :
-                      </span>{" "}
-                      {Math.round(finalScore)}/100
+                      <span className="font-semibold">Note globale :</span> {Math.round(finalScore)}/100
                     </p>
                   )}
                   {finalSummary && (
                     <p className="whitespace-pre-line">
-                      <span className="font-semibold">
-                        Synthèse :
-                      </span>{" "}
-                      {finalSummary}
+                      <span className="font-semibold">Synthèse :</span> {finalSummary}
                     </p>
                   )}
                   {finalDecision && (
                     <p className="whitespace-pre-line">
-                      <span className="font-semibold">
-                        Décision probable :
-                      </span>{" "}
-                      {finalDecision}
+                      <span className="font-semibold">Décision probable :</span> {finalDecision}
                     </p>
                   )}
-                  <p className="text-[10px] text-[var(--muted)]">
-                    Utilise ce bilan pour identifier les points à
-                    améliorer : structure des réponses, exemples
-                    concrets, mise en avant de tes résultats, etc.
-                  </p>
                 </div>
               )}
             </div>
 
-            {/* Zone de réponse */}
             <div className="mt-4 pt-4 border-t border-white/10 flex flex-col gap-2">
               <div className="flex items-center gap-2">
                 <button
@@ -1252,21 +1024,14 @@ export default function InterviewChat() {
                     listening
                       ? "bg-red-500/80 animate-pulse ring-2 ring-red-300/60"
                       : "bg-white/10 hover:bg-white/20"
-                  } ${
-                    !started || loading
-                      ? "opacity-50 cursor-not-allowed"
-                      : ""
-                  }`}
+                  } ${!started || loading ? "opacity-50 cursor-not-allowed" : ""}`}
                 >
                   <span>🎤</span>
                   {listening && (
-                    <span className="ml-1 text-[10px] uppercase tracking-widest text-red-100">
-                      REC
-                    </span>
+                    <span className="ml-1 text-[10px] uppercase tracking-widest text-red-100">REC</span>
                   )}
                 </button>
 
-                {/* Mini visualiseur audio (animation fake) */}
                 {listening && (
                   <div className="flex gap-[3px] h-4 items-end">
                     <span className="w-[3px] bg-red-100 rounded-sm animate-[ping_0.7s_ease-in-out_infinite]" />
@@ -1280,19 +1045,11 @@ export default function InterviewChat() {
               <div className="flex gap-2">
                 <input
                   className="flex-1 bg-black/20 border border-white/10 rounded-full px-4 text-sm"
-                  placeholder={
-                    started
-                      ? "Parle ou écris ta réponse..."
-                      : "Lance la simulation pour commencer l'entretien"
-                  }
+                  placeholder={started ? "Parle ou écris ta réponse..." : "Lance la simulation pour commencer l'entretien"}
                   value={input}
                   disabled={!started || loading}
                   onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) =>
-                    started &&
-                    e.key === "Enter" &&
-                    sendAnswer(input)
-                  }
+                  onKeyDown={(e) => started && e.key === "Enter" && sendAnswer(input)}
                 />
                 <button
                   onClick={() => sendAnswer(input)}
