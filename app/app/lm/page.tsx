@@ -7,6 +7,9 @@ import { auth, db } from "@/lib/firebase";
 import { onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, collection, addDoc, serverTimestamp } from "firebase/firestore";
 
+// ✅ reCAPTCHA centralisé
+import { getRecaptchaToken } from "@/lib/recaptcha";
+
 // ✅ PDF (génération locale, rendu identique à tes HTML pdfmake)
 import { makePdfColors } from "@/lib/pdf/colors";
 import { fitOnePage } from "@/lib/pdf/fitOnePage";
@@ -69,99 +72,7 @@ type CvProfile = {
 type Lang = "fr" | "en";
 
 // 🔗 ENDPOINT LOCAL (Proxy Next.js)
-// On pointe vers notre API locale pour gérer l'auth proprement
 const LETTER_AND_PITCH_URL = "/api/generateLetterAndPitch";
-
-// =============================
-// ✅ reCAPTCHA Enterprise (client)
-// =============================
-
-const RECAPTCHA_SITE_KEY = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY || "";
-let recaptchaLoadPromise: Promise<void> | null = null;
-
-function loadRecaptchaEnterprise(siteKey: string): Promise<void> {
-  if (typeof window === "undefined") {
-    return Promise.reject(new Error("reCAPTCHA: window indisponible (SSR)."));
-  }
-  if ((window as any).grecaptcha?.enterprise) return Promise.resolve();
-  if (recaptchaLoadPromise) return recaptchaLoadPromise;
-
-  recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
-    const existing = document.querySelector(
-      'script[data-recaptcha-enterprise="true"]'
-    ) as HTMLScriptElement | null;
-
-    if (existing) {
-      const t = window.setInterval(() => {
-        if ((window as any).grecaptcha?.enterprise) {
-          window.clearInterval(t);
-          resolve();
-        }
-      }, 50);
-
-      window.setTimeout(() => {
-        window.clearInterval(t);
-        if (!(window as any).grecaptcha?.enterprise) {
-          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
-        }
-      }, 6000);
-      return;
-    }
-
-    const s = document.createElement("script");
-    s.src = `https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(
-      siteKey
-    )}`;
-    s.async = true;
-    s.defer = true;
-    s.setAttribute("data-recaptcha-enterprise", "true");
-
-    s.onload = () => {
-      const t = window.setInterval(() => {
-        if ((window as any).grecaptcha?.enterprise) {
-          window.clearInterval(t);
-          resolve();
-        }
-      }, 50);
-
-      window.setTimeout(() => {
-        window.clearInterval(t);
-        if (!(window as any).grecaptcha?.enterprise) {
-          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
-        }
-      }, 6000);
-    };
-
-    s.onerror = () =>
-      reject(new Error("Impossible de charger reCAPTCHA Enterprise."));
-    document.head.appendChild(s);
-  });
-
-  return recaptchaLoadPromise;
-}
-
-async function getRecaptchaToken(action: string): Promise<string> {
-  if (!RECAPTCHA_SITE_KEY) {
-    throw new Error("reCAPTCHA: NEXT_PUBLIC_RECAPTCHA_SITE_KEY manquante.");
-  }
-
-  await loadRecaptchaEnterprise(RECAPTCHA_SITE_KEY);
-
-  const g = (window as any).grecaptcha;
-  if (!g?.enterprise?.ready || !g?.enterprise?.execute) {
-    throw new Error(
-      "reCAPTCHA Enterprise indisponible (grecaptcha.enterprise manquant)."
-    );
-  }
-
-  await new Promise<void>((resolve) => g.enterprise.ready(() => resolve()));
-  const token = await g.enterprise.execute(RECAPTCHA_SITE_KEY, { action });
-
-  if (!token || typeof token !== "string") {
-    throw new Error("reCAPTCHA: token vide.");
-  }
-  return token;
-}
 
 // =============================
 // ✅ Helpers (texte & PDF locaux)
@@ -233,7 +144,8 @@ function profileToCvDocModel(profile: CvProfile, params: { targetJob: string; co
   const titleParts: string[] = [];
   if (params.targetJob?.trim()) titleParts.push(params.targetJob.trim());
   if (params.contract?.trim()) titleParts.push(params.contract.trim());
-  const title = titleParts.length ? titleParts.join(" — ") : (profile.contractType || "Candidature");
+  const title =
+    titleParts.length ? titleParts.join(" — ") : profile.contractType || "Candidature";
 
   const skills = categorizeSkills(profile);
 
@@ -242,7 +154,9 @@ function profileToCvDocModel(profile: CvProfile, params: { targetJob: string; co
     city: safeText(x.location || ""),
     role: safeText(x.role),
     dates: safeText(x.dates),
-    bullets: Array.isArray(x.bullets) ? x.bullets.map(safeText).filter(Boolean) : [],
+    bullets: Array.isArray(x.bullets)
+      ? x.bullets.map(safeText).filter(Boolean)
+      : [],
   }));
 
   const educationLines =
@@ -257,8 +171,11 @@ function profileToCvDocModel(profile: CvProfile, params: { targetJob: string; co
         });
 
   return {
-    name: safeText(profile.fullName) || safeText(profile.email) || "Candidat",
-    title,
+    name:
+      safeText(profile.fullName) ||
+      safeText(profile.email) ||
+      "Candidat",
+  title,
     contactLine: buildContactLine(profile),
     profile: safeText(profile.profileSummary),
     skills,
@@ -266,21 +183,33 @@ function profileToCvDocModel(profile: CvProfile, params: { targetJob: string; co
     education: educationLines,
     certs: safeText(profile.certs),
     langLine: safeText(profile.langLine),
-    hobbies: Array.isArray(profile.hobbies) ? profile.hobbies.map(safeText).filter(Boolean) : [],
+    hobbies: Array.isArray(profile.hobbies)
+      ? profile.hobbies.map(safeText).filter(Boolean)
+      : [],
   };
 }
 
 // --- Pour que l’IA écrive une VRAIE lettre (expériences, résultats, outils) ---
 function buildCandidateHighlights(profile: CvProfile) {
-  const topXp = (profile.experiences || []).slice(0, 3).map((xp, i) => {
-    const bullets = (xp.bullets || []).slice(0, 4).map((b) => `- ${b}`).join("\n");
-    return `EXP${i + 1}: ${xp.role} @ ${xp.company} (${xp.dates}${xp.location ? `, ${xp.location}` : ""})
+  const topXp = (profile.experiences || [])
+    .slice(0, 3)
+    .map((xp, i) => {
+      const bullets = (xp.bullets || [])
+        .slice(0, 4)
+        .map((b) => `- ${b}`)
+        .join("\n");
+      return `EXP${i + 1}: ${xp.role} @ ${xp.company} (${xp.dates}${
+        xp.location ? `, ${xp.location}` : ""
+      })
 ${bullets}`;
-  });
+    });
 
   const skillLines = (profile.skills?.sections || [])
     .slice(0, 4)
-    .map((s) => `${s.title}: ${(s.items || []).slice(0, 10).join(", ")}`);
+    .map(
+      (s) =>
+        `${s.title}: ${(s.items || []).slice(0, 10).join(", ")}`
+    );
 
   const tools = (profile.skills?.tools || []).slice(0, 18);
 
@@ -355,17 +284,28 @@ ${buildCandidateHighlights(args.profile)}
   return `${base}\n\n${injected}`;
 }
 
-function extractBodyFromLetterText(letterText: string, lang: Lang, fullName: string) {
+function extractBodyFromLetterText(
+  letterText: string,
+  lang: Lang,
+  fullName: string
+) {
   const raw = safeText(letterText);
   if (!raw) return "";
 
-  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
   if (!lines.length) return raw;
 
   const first = lines[0].toLowerCase();
   const isGreeting =
-    (lang === "fr" && (first.startsWith("madame") || first.startsWith("bonjour"))) ||
-    (lang === "en" && (first.startsWith("dear") || first.startsWith("hello")));
+    (lang === "fr" &&
+      (first.startsWith("madame") ||
+        first.startsWith("bonjour"))) ||
+    (lang === "en" &&
+      (first.startsWith("dear") ||
+        first.startsWith("hello")));
 
   if (isGreeting) lines.shift();
 
@@ -393,12 +333,33 @@ function extractBodyFromLetterText(letterText: string, lang: Lang, fullName: str
   return body || raw;
 }
 
-function buildLmModel(profile: CvProfile, lang: Lang, companyName: string, jobTitle: string, letterText: string): LmModel {
+function buildLmModel(
+  profile: CvProfile,
+  lang: Lang,
+  companyName: string,
+  jobTitle: string,
+  letterText: string
+): LmModel {
   const name = safeText(profile.fullName) || "Candidat";
   const contactLines: string[] = [];
-  if (profile.phone) contactLines.push(lang === "fr" ? `Téléphone : ${safeText(profile.phone)}` : `Phone: ${safeText(profile.phone)}`);
-  if (profile.email) contactLines.push(lang === "fr" ? `Email : ${safeText(profile.email)}` : `Email: ${safeText(profile.email)}`);
-  if (profile.linkedin) contactLines.push(lang === "fr" ? `LinkedIn : ${safeText(profile.linkedin)}` : `LinkedIn: ${safeText(profile.linkedin)}`);
+  if (profile.phone)
+    contactLines.push(
+      lang === "fr"
+        ? `Téléphone : ${safeText(profile.phone)}`
+        : `Phone: ${safeText(profile.phone)}`
+    );
+  if (profile.email)
+    contactLines.push(
+      lang === "fr"
+        ? `Email : ${safeText(profile.email)}`
+        : `Email: ${safeText(profile.email)}`
+    );
+  if (profile.linkedin)
+    contactLines.push(
+      lang === "fr"
+        ? `LinkedIn : ${safeText(profile.linkedin)}`
+        : `LinkedIn: ${safeText(profile.linkedin)}`
+    );
 
   const city = safeText(profile.city) || "Paris";
   const dateStr =
@@ -411,7 +372,8 @@ function buildLmModel(profile: CvProfile, lang: Lang, companyName: string, jobTi
       ? `Objet : Candidature – ${jobTitle || "poste"}`
       : `Subject: Application – ${jobTitle || "role"}`;
 
-  const salutation = lang === "fr" ? "Madame, Monsieur," : "Dear Hiring Manager,";
+  const salutation =
+    lang === "fr" ? "Madame, Monsieur," : "Dear Hiring Manager,";
   const closing = lang === "fr" ? "Cordialement," : "Sincerely,";
 
   const body = extractBodyFromLetterText(letterText, lang, name);
@@ -420,8 +382,11 @@ function buildLmModel(profile: CvProfile, lang: Lang, companyName: string, jobTi
     lang,
     name,
     contactLines,
-    service: lang === "fr" ? "Service Recrutement" : "Recruitment Team",
-    companyName: safeText(companyName) || (lang === "fr" ? "Entreprise" : "Company"),
+    service:
+      lang === "fr" ? "Service Recrutement" : "Recruitment Team",
+    companyName:
+      safeText(companyName) ||
+      (lang === "fr" ? "Entreprise" : "Company"),
     companyAddr: "",
     city,
     dateStr,
@@ -445,7 +410,8 @@ export default function AssistanceCandidaturePage() {
   const [loadingProfile, setLoadingProfile] = useState(true);
 
   // Bandeau global "IA en cours"
-  const [globalLoadingMessage, setGlobalLoadingMessage] = useState<string | null>(null);
+  const [globalLoadingMessage, setGlobalLoadingMessage] =
+    useState<string | null>(null);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
@@ -475,25 +441,47 @@ export default function AssistanceCandidaturePage() {
             profileSummary: data.profileSummary || "",
             city: data.city || "",
             address: data.address || "",
-            contractType: data.contractType || data.contractTypeStandard || "",
+            contractType:
+              data.contractType || data.contractTypeStandard || "",
             contractTypeStandard: data.contractTypeStandard || "",
             contractTypeFull: data.contractTypeFull || "",
             primaryDomain: data.primaryDomain || "",
-            secondaryDomains: Array.isArray(data.secondaryDomains) ? data.secondaryDomains : [],
-            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
+            secondaryDomains: Array.isArray(
+              data.secondaryDomains
+            )
+              ? data.secondaryDomains
+              : [],
+            softSkills: Array.isArray(data.softSkills)
+              ? data.softSkills
+              : [],
             drivingLicense: data.drivingLicense || "",
             vehicle: data.vehicle || "",
             skills: {
-              sections: Array.isArray(data.skills?.sections) ? data.skills.sections : [],
-              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
+              sections: Array.isArray(data.skills?.sections)
+                ? data.skills.sections
+                : [],
+              tools: Array.isArray(data.skills?.tools)
+                ? data.skills.tools
+                : [],
             },
-            experiences: Array.isArray(data.experiences) ? data.experiences : [],
-            education: Array.isArray(data.education) ? data.education : [],
-            educationShort: Array.isArray(data.educationShort) ? data.educationShort : [],
+            experiences: Array.isArray(data.experiences)
+              ? data.experiences
+              : [],
+            education: Array.isArray(data.education)
+              ? data.education
+              : [],
+            educationShort: Array.isArray(data.educationShort)
+              ? data.educationShort
+              : [],
             certs: data.certs || "",
             langLine: data.langLine || "",
-            hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
-            updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : undefined,
+            hobbies: Array.isArray(data.hobbies)
+              ? data.hobbies
+              : [],
+            updatedAt:
+              typeof data.updatedAt === "number"
+                ? data.updatedAt
+                : undefined,
           };
 
           setProfile(loadedProfile);
@@ -501,7 +489,10 @@ export default function AssistanceCandidaturePage() {
           setProfile(null);
         }
       } catch (e) {
-        console.error("Erreur chargement profil Firestore (assistance):", e);
+        console.error(
+          "Erreur chargement profil Firestore (assistance):",
+          e
+        );
       } finally {
         setLoadingProfile(false);
       }
@@ -553,17 +544,22 @@ export default function AssistanceCandidaturePage() {
   const [subjectPreview, setSubjectPreview] = useState("");
 
   // --- DERIVÉS ---
-  const visibilityLabel = userId ? "Associé à ton compte" : "Invité";
+  const visibilityLabel = userId
+    ? "Associé à ton compte"
+    : "Invité";
 
   const miniHeadline =
     profile?.profileSummary?.split(".")[0] ||
     profile?.contractType ||
     "Analyse ton CV PDF dans l’onglet « CV IA » pour activer l’assistant.";
 
-  const profileName = profile?.fullName || userEmail || "Profil non détecté";
+  const profileName =
+    profile?.fullName || userEmail || "Profil non détecté";
 
-  const targetedJob = jobTitle || cvTargetJob || "Poste cible non renseigné";
-  const targetedCompany = companyName || "Entreprise non renseignée";
+  const targetedJob =
+    jobTitle || cvTargetJob || "Poste cible non renseigné";
+  const targetedCompany =
+    companyName || "Entreprise non renseignée";
 
   // --- Auto create /applications ---
   type GenerationKind = "cv" | "cv_lm" | "lm" | "pitch";
@@ -591,28 +587,40 @@ export default function AssistanceCandidaturePage() {
         langPitch: pitchLang,
       });
     } catch (e) {
-      console.error("Erreur création entrée suivi de candidature :", e);
+      console.error(
+        "Erreur création entrée suivi de candidature :",
+        e
+      );
     }
   };
 
   // =============================
-  // ✅ Génération IA (lettre / pitch) - MODIFIÉ POUR TOKEN
+  // ✅ Génération IA (lettre / pitch)
   // =============================
 
-  const generateCoverLetterText = async (lang: Lang): Promise<string> => {
+  const generateCoverLetterText = async (
+    lang: Lang
+  ): Promise<string> => {
     if (!profile) throw new Error("Profil manquant.");
     if (!jobTitle && !jobDescription) {
-      throw new Error("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
+      throw new Error(
+        "Ajoute au moins l'intitulé du poste ou un extrait de la description."
+      );
     }
 
     // 1. Récupérer l'utilisateur pour le token
     const user = auth.currentUser;
-    if (!user) throw new Error("Vous devez être connecté pour générer une lettre.");
-    
+    if (!user)
+      throw new Error(
+        "Vous devez être connecté pour générer une lettre."
+      );
+
     // 2. Récupérer le token Auth
     const token = await user.getIdToken();
 
-    const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
+    const recaptchaToken = await getRecaptchaToken(
+      "generate_letter_pitch"
+    );
 
     // ✅ injection pour forcer une VRAIE lettre (expériences, outils, concret)
     const enrichedJobDescription = buildJobDescWithInstructions({
@@ -627,9 +635,9 @@ export default function AssistanceCandidaturePage() {
     // 3. Appel vers l'API locale avec le TOKEN dans les headers
     const resp = await fetch(LETTER_AND_PITCH_URL, {
       method: "POST",
-      headers: { 
+      headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}` // <--- CLÉ DE L'AUTHENTIFICATION
+        Authorization: `Bearer ${token}`, // <--- Auth
       },
       body: JSON.stringify({
         profile,
@@ -643,12 +651,18 @@ export default function AssistanceCandidaturePage() {
 
     const json = await resp.json().catch(() => null);
     if (!resp.ok) {
-      const msg = (json && json.error) || "Erreur pendant la génération de la lettre de motivation.";
+      const msg =
+        (json && json.error) ||
+        "Erreur pendant la génération de la lettre de motivation.";
       throw new Error(msg);
     }
 
-    const coverLetter = typeof json.coverLetter === "string" ? json.coverLetter.trim() : "";
-    if (!coverLetter) throw new Error("Lettre vide renvoyée par l'API.");
+    const coverLetter =
+      typeof json.coverLetter === "string"
+        ? json.coverLetter.trim()
+        : "";
+    if (!coverLetter)
+      throw new Error("Lettre vide renvoyée par l'API.");
     return coverLetter;
   };
 
@@ -656,11 +670,16 @@ export default function AssistanceCandidaturePage() {
   // ✅ PDF locaux (CV + LM)
   // =============================
 
-  const colors = useMemo(() => makePdfColors(pdfBrand), [pdfBrand]);
+  const colors = useMemo(
+    () => makePdfColors(pdfBrand),
+    [pdfBrand]
+  );
 
   const handleGenerateCv = async () => {
     if (!profile) {
-      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      setCvError(
+        "Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF."
+      );
       return;
     }
 
@@ -671,20 +690,33 @@ export default function AssistanceCandidaturePage() {
 
     try {
       if (cvTemplate !== "ats") {
-        setCvStatus("Note : génération locale disponible en ATS (sobre) pour le moment.");
+        setCvStatus(
+          "Note : génération locale disponible en ATS (sobre) pour le moment."
+        );
       }
 
-      const cvModel: CvDocModel = profileToCvDocModel(profile, {
-        targetJob: cvTargetJob,
-        contract: cvContract,
-      });
+      const cvModel: CvDocModel = profileToCvDocModel(
+        profile,
+        {
+          targetJob: cvTargetJob,
+          contract: cvContract,
+        }
+      );
 
       const { blob, bestScale } = await fitOnePage((scale) =>
-        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
+        buildCvAtsPdf(
+          cvModel,
+          cvLang,
+          colors,
+          "auto",
+          scale
+        )
       );
 
       downloadBlob(blob, "cv-ia.pdf");
-      setCvStatus(`CV généré (1 page) ✅ (scale=${bestScale.toFixed(2)})`);
+      setCvStatus(
+        `CV généré (1 page) ✅ (scale=${bestScale.toFixed(2)})`
+      );
 
       await autoCreateApplication("cv");
 
@@ -699,7 +731,10 @@ export default function AssistanceCandidaturePage() {
       }
     } catch (err: any) {
       console.error("Erreur génération CV locale:", err);
-      setCvError(err?.message || "Impossible de générer le CV pour le moment.");
+      setCvError(
+        err?.message ||
+          "Impossible de générer le CV pour le moment."
+      );
     } finally {
       setCvLoading(false);
       setGlobalLoadingMessage(null);
@@ -708,35 +743,56 @@ export default function AssistanceCandidaturePage() {
 
   const handleGenerateCvLmPdf = async () => {
     if (!profile) {
-      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      setCvError(
+        "Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF."
+      );
       return;
     }
 
     setCvError(null);
     setCvStatus(null);
     setCvZipLoading(true);
-    setGlobalLoadingMessage("Mise en page CV + lettre (1 page + 1 page)…");
+    setGlobalLoadingMessage(
+      "Mise en page CV + lettre (1 page + 1 page)…"
+    );
 
     try {
       // 1) CV
-      const cvModel: CvDocModel = profileToCvDocModel(profile, {
-        targetJob: cvTargetJob,
-        contract: cvContract,
-      });
+      const cvModel: CvDocModel = profileToCvDocModel(
+        profile,
+        {
+          targetJob: cvTargetJob,
+          contract: cvContract,
+        }
+      );
 
       const cvFit = await fitOnePage((scale) =>
-        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
+        buildCvAtsPdf(
+          cvModel,
+          cvLang,
+          colors,
+          "auto",
+          scale
+        )
       );
 
       // 2) Lettre : si pas encore générée -> IA
       let cover = letterText?.trim();
       if (!cover) {
-        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
+        setGlobalLoadingMessage(
+          "Génération du texte de la lettre (IA)…"
+        );
         cover = await generateCoverLetterText(lmLang);
         setLetterText(cover);
       }
 
-      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
+      const lmModel: LmModel = buildLmModel(
+        profile,
+        lmLang,
+        companyName,
+        jobTitle,
+        cover
+      );
 
       const lmFit = await fitOnePage(
         (scale) => buildLmStyledPdf(lmModel, colors, scale),
@@ -744,10 +800,15 @@ export default function AssistanceCandidaturePage() {
       );
 
       // 3) Fusion -> 2 pages
-      const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
+      const merged = await mergePdfBlobs([
+        cvFit.blob,
+        lmFit.blob,
+      ]);
       downloadBlob(merged, "cv-lm-ia.pdf");
 
-      setCvStatus("CV (1 page) + LM (1 page) générés ✅ (PDF 2 pages)");
+      setCvStatus(
+        "CV (1 page) + LM (1 page) générés ✅ (PDF 2 pages)"
+      );
       await autoCreateApplication("cv_lm");
 
       if (auth.currentUser) {
@@ -769,7 +830,10 @@ export default function AssistanceCandidaturePage() {
       }
     } catch (err: any) {
       console.error("Erreur génération CV+LM locale:", err);
-      setCvError(err?.message || "Impossible de générer CV + LM pour le moment.");
+      setCvError(
+        err?.message ||
+          "Impossible de générer CV + LM pour le moment."
+      );
     } finally {
       setCvZipLoading(false);
       setGlobalLoadingMessage(null);
@@ -780,11 +844,15 @@ export default function AssistanceCandidaturePage() {
   const handleGenerateLetter = async (e?: FormEvent) => {
     if (e) e.preventDefault();
     if (!profile) {
-      setLmError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      setLmError(
+        "Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF."
+      );
       return;
     }
     if (!jobTitle && !jobDescription) {
-      setLmError("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
+      setLmError(
+        "Ajoute au moins l'intitulé du poste ou un extrait de la description."
+      );
       return;
     }
 
@@ -793,10 +861,14 @@ export default function AssistanceCandidaturePage() {
     setPitchError(null);
     setLmLoading(true);
     setLetterCopied(false);
-    setGlobalLoadingMessage("L’IA rédige ta lettre de motivation…");
+    setGlobalLoadingMessage(
+      "L’IA rédige ta lettre de motivation…"
+    );
 
     try {
-      const coverLetter = await generateCoverLetterText(lmLang);
+      const coverLetter = await generateCoverLetterText(
+        lmLang
+      );
       setLetterText(coverLetter);
 
       await autoCreateApplication("lm");
@@ -812,7 +884,10 @@ export default function AssistanceCandidaturePage() {
       }
     } catch (err: any) {
       console.error("Erreur generateLetter:", err);
-      setLmError(err?.message || "Impossible de générer la lettre de motivation pour le moment.");
+      setLmError(
+        err?.message ||
+          "Impossible de générer la lettre de motivation pour le moment."
+      );
     } finally {
       setLmLoading(false);
       setGlobalLoadingMessage(null);
@@ -826,23 +901,35 @@ export default function AssistanceCandidaturePage() {
       return;
     }
     if (!jobTitle && !jobDescription && !letterText) {
-      setLmPdfError("Renseigne au moins le poste ou colle un extrait d’offre, puis génère/télécharge.");
+      setLmPdfError(
+        "Renseigne au moins le poste ou colle un extrait d’offre, puis génère/télécharge."
+      );
       return;
     }
 
     setLmPdfError(null);
     setLmPdfLoading(true);
-    setGlobalLoadingMessage("Mise en forme PDF (lettre 1 page)…");
+    setGlobalLoadingMessage(
+      "Mise en forme PDF (lettre 1 page)…"
+    );
 
     try {
       let cover = letterText?.trim();
       if (!cover) {
-        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
+        setGlobalLoadingMessage(
+          "Génération du texte de la lettre (IA)…"
+        );
         cover = await generateCoverLetterText(lmLang);
         setLetterText(cover);
       }
 
-      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
+      const lmModel: LmModel = buildLmModel(
+        profile,
+        lmLang,
+        companyName,
+        jobTitle,
+        cover
+      );
 
       const { blob } = await fitOnePage(
         (scale) => buildLmStyledPdf(lmModel, colors, scale),
@@ -862,7 +949,10 @@ export default function AssistanceCandidaturePage() {
       }
     } catch (err: any) {
       console.error("Erreur LM PDF (local):", err);
-      setLmPdfError(err?.message || "Impossible de générer le PDF pour le moment.");
+      setLmPdfError(
+        err?.message ||
+          "Impossible de générer le PDF pour le moment."
+      );
     } finally {
       setLmPdfLoading(false);
       setGlobalLoadingMessage(null);
@@ -874,7 +964,10 @@ export default function AssistanceCandidaturePage() {
     try {
       await navigator.clipboard.writeText(letterText);
       setLetterCopied(true);
-      setTimeout(() => setLetterCopied(false), 1500);
+      setTimeout(
+        () => setLetterCopied(false),
+        1500
+      );
     } catch (e) {
       console.error("Erreur copie LM:", e);
     }
@@ -883,32 +976,42 @@ export default function AssistanceCandidaturePage() {
   // --- PITCH ---
   const handleGeneratePitch = async () => {
     if (!profile) {
-      setPitchError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      setPitchError(
+        "Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF."
+      );
       return;
     }
 
-    const effectiveJobTitle = jobTitle || cvTargetJob || "Candidature cible";
+    const effectiveJobTitle =
+      jobTitle || cvTargetJob || "Candidature cible";
     const effectiveDesc = jobDescription || cvJobDesc || "";
 
     setPitchError(null);
     setPitchLoading(true);
     setPitchCopied(false);
-    setGlobalLoadingMessage("L’IA prépare ton pitch d’ascenseur…");
+    setGlobalLoadingMessage(
+      "L’IA prépare ton pitch d’ascenseur…"
+    );
 
     try {
       // 1. Récupérer User + Token
       const user = auth.currentUser;
-      if (!user) throw new Error("Connecte-toi pour générer un pitch.");
+      if (!user)
+        throw new Error(
+          "Connecte-toi pour générer un pitch."
+        );
       const token = await user.getIdToken();
 
-      const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
+      const recaptchaToken = await getRecaptchaToken(
+        "generate_letter_pitch"
+      );
 
       // 2. Appel API Locale avec Token
       const resp = await fetch(LETTER_AND_PITCH_URL, {
         method: "POST",
-        headers: { 
+        headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}` 
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
           profile,
@@ -923,12 +1026,18 @@ export default function AssistanceCandidaturePage() {
       const json = await resp.json().catch(() => null);
 
       if (!resp.ok) {
-        const msg = (json && json.error) || "Erreur pendant la génération du pitch.";
+        const msg =
+          (json && json.error) ||
+          "Erreur pendant la génération du pitch.";
         throw new Error(msg);
       }
 
-      const pitch = typeof json.pitch === "string" ? json.pitch.trim() : "";
-      if (!pitch) throw new Error("Pitch vide renvoyé par l'API.");
+      const pitch =
+        typeof json.pitch === "string"
+          ? json.pitch.trim()
+          : "";
+      if (!pitch)
+        throw new Error("Pitch vide renvoyé par l'API.");
 
       setPitchText(pitch);
       await autoCreateApplication("pitch");
@@ -944,7 +1053,10 @@ export default function AssistanceCandidaturePage() {
       }
     } catch (err: any) {
       console.error("Erreur generatePitch:", err);
-      setPitchError(err?.message || "Impossible de générer le pitch pour le moment.");
+      setPitchError(
+        err?.message ||
+          "Impossible de générer le pitch pour le moment."
+      );
     } finally {
       setPitchLoading(false);
       setGlobalLoadingMessage(null);
@@ -956,7 +1068,10 @@ export default function AssistanceCandidaturePage() {
     try {
       await navigator.clipboard.writeText(pitchText);
       setPitchCopied(true);
-      setTimeout(() => setPitchCopied(false), 1500);
+      setTimeout(
+        () => setPitchCopied(false),
+        1500
+      );
     } catch (e) {
       console.error("Erreur copie pitch:", e);
     }
@@ -965,12 +1080,17 @@ export default function AssistanceCandidaturePage() {
   // --- MAIL ---
   const buildEmailContent = () => {
     const name = profile?.fullName || "Je";
-    const subject = `Candidature – ${jobTitle || "poste"} – ${name}`;
-    const recruiter = recruiterName.trim() || "Madame, Monsieur";
+    const subject = `Candidature – ${
+      jobTitle || "poste"
+    } – ${name}`;
+    const recruiter =
+      recruiterName.trim() || "Madame, Monsieur";
 
     const body = `Bonjour ${recruiter},
 
-Je me permets de vous adresser ma candidature pour le poste de ${jobTitle || "..."} au sein de ${
+Je me permets de vous adresser ma candidature pour le poste de ${
+      jobTitle || "..."
+    } au sein de ${
       companyName || "votre entreprise"
     }.
 
@@ -1022,28 +1142,45 @@ ${name}
             <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
               Profil IA :{" "}
               <span className="ml-1 font-medium">
-                {loadingProfile ? "Chargement…" : profile ? "Détecté ✅" : "Non détecté"}
+                {loadingProfile
+                  ? "Chargement…"
+                  : profile
+                  ? "Détecté ✅"
+                  : "Non détecté"}
               </span>
             </span>
             <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
-              Visibilité : <span className="ml-1 font-medium">{visibilityLabel}</span>
+              Visibilité :{" "}
+              <span className="ml-1 font-medium">
+                {visibilityLabel}
+              </span>
             </span>
           </div>
         </div>
 
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="space-y-1">
-            <h1 className="text-lg sm:text-xl font-semibold">Prépare ta candidature avec ton CV IA</h1>
+            <h1 className="text-lg sm:text-xl font-semibold">
+              Prépare ta candidature avec ton CV IA
+            </h1>
             <p className="text-[12px] text-[var(--muted)] max-w-xl">
-              Génère un <strong>CV 1 page</strong>, une <strong>lettre de motivation</strong> (1 page), un{" "}
-              <strong>pitch</strong> et un <strong>mail</strong>.
+              Génère un <strong>CV 1 page</strong>, une{" "}
+              <strong>lettre de motivation</strong> (1 page), un{" "}
+              <strong>pitch</strong> et un{" "}
+              <strong>mail</strong>.
             </p>
           </div>
 
           <div className="w-full sm:w-[220px] rounded-2xl border border-[var(--border)] bg-[var(--bg-soft)] px-3 py-2.5 text-[11px]">
-            <p className="text-[var(--muted)] mb-1">Résumé du profil</p>
-            <p className="font-semibold text-[var(--ink)] leading-tight">{profileName}</p>
-            <p className="mt-0.5 text-[var(--muted)] line-clamp-2">{miniHeadline}</p>
+            <p className="text-[var(--muted)] mb-1">
+              Résumé du profil
+            </p>
+            <p className="font-semibold text-[var(--ink)] leading-tight">
+              {profileName}
+            </p>
+            <p className="mt-0.5 text-[var(--muted)] line-clamp-2">
+              {miniHeadline}
+            </p>
           </div>
         </div>
 
@@ -1075,9 +1212,12 @@ ${name}
               Étape 1
             </span>
             <div>
-              <h2 className="text-base sm:text-lg font-semibold text-[var(--ink)]">CV IA – 1 page A4</h2>
+              <h2 className="text-base sm:text-lg font-semibold text-[var(--ink)]">
+                CV IA – 1 page A4
+              </h2>
               <p className="text-[11px] text-[var(--muted)]">
-                Génération locale (PDF) – rendu identique aux templates HTML.
+                Génération locale (PDF) – rendu identique aux
+                templates HTML.
               </p>
             </div>
           </div>
@@ -1085,50 +1225,79 @@ ${name}
 
         <div className="space-y-3 text-[13px]">
           <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Titre / objectif du CV</label>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+              Titre / objectif du CV
+            </label>
             <input
               id="cvTargetJob"
               type="text"
               className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
               placeholder="Ex : Ingénieur Cybersécurité"
               value={cvTargetJob}
-              onChange={(e) => setCvTargetJob(e.target.value)}
+              onChange={(e) =>
+                setCvTargetJob(e.target.value)
+              }
             />
           </div>
 
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Modèle</label>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Modèle
+              </label>
               <select
                 id="cvTemplate"
                 className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
                 value={cvTemplate}
-                onChange={(e) => setCvTemplate(e.target.value)}
+                onChange={(e) =>
+                  setCvTemplate(e.target.value)
+                }
               >
-                <option value="ats">ATS (sobre) ✅</option>
-                <option value="design">Design (CLOUD)</option>
-                <option value="magazine">Magazine</option>
-                <option value="classic">Classique</option>
-                <option value="modern">Moderne</option>
-                <option value="minimalist">Minimaliste</option>
-                <option value="academic">Académique</option>
+                <option value="ats">
+                  ATS (sobre) ✅
+                </option>
+                <option value="design">
+                  Design (CLOUD)
+                </option>
+                <option value="magazine">
+                  Magazine
+                </option>
+                <option value="classic">
+                  Classique
+                </option>
+                <option value="modern">
+                  Moderne
+                </option>
+                <option value="minimalist">
+                  Minimaliste
+                </option>
+                <option value="academic">
+                  Académique
+                </option>
               </select>
               {cvTemplate !== "ats" && (
                 <p className="mt-1 text-[10px] text-[var(--muted)]">
-                  Génération locale disponible en <strong>ATS</strong> pour l’instant.
+                  Génération locale disponible en{" "}
+                  <strong>ATS</strong> pour l’instant.
                 </p>
               )}
             </div>
 
             <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Langue</label>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Langue
+              </label>
               <select
                 id="cvLang"
                 className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
                 value={cvLang}
-                onChange={(e) => setCvLang(e.target.value as Lang)}
+                onChange={(e) =>
+                  setCvLang(e.target.value as Lang)
+                }
               >
-                <option value="fr">Français</option>
+                <option value="fr">
+                  Français
+                </option>
                 <option value="en">English</option>
               </select>
             </div>
@@ -1136,18 +1305,26 @@ ${name}
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Contrat visé</label>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Contrat visé
+              </label>
               <select
                 id="cvContract"
                 className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
                 value={cvContract}
-                onChange={(e) => setCvContract(e.target.value)}
+                onChange={(e) =>
+                  setCvContract(e.target.value)
+                }
               >
                 <option value="CDI">CDI</option>
                 <option value="CDD">CDD</option>
-                <option value="Alternance">Alternance</option>
+                <option value="Alternance">
+                  Alternance
+                </option>
                 <option value="Stage">Stage</option>
-                <option value="Freelance">Freelance</option>
+                <option value="Freelance">
+                  Freelance
+                </option>
               </select>
             </div>
 
@@ -1160,20 +1337,25 @@ ${name}
                 <input
                   type="color"
                   value={pdfBrand}
-                  onChange={(e) => setPdfBrand(e.target.value)}
+                  onChange={(e) =>
+                    setPdfBrand(e.target.value)
+                  }
                   className="h-9 w-12 rounded-lg border border-[var(--border)] bg-[var(--bg-soft)]"
                   aria-label="Couleur du PDF"
                 />
                 <input
                   type="text"
                   value={pdfBrand}
-                  onChange={(e) => setPdfBrand(e.target.value)}
+                  onChange={(e) =>
+                    setPdfBrand(e.target.value)
+                  }
                   className="input flex-1 text-[var(--ink)] bg-[var(--bg)]"
                   placeholder="#ef4444"
                 />
               </div>
               <p className="mt-1 text-[10px] text-[var(--muted)]">
-                Par défaut : <strong>rouge</strong> (#ef4444).
+                Par défaut :{" "}
+                <strong>rouge</strong> (#ef4444).
               </p>
             </div>
           </div>
@@ -1189,7 +1371,9 @@ ${name}
                 className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
                 placeholder="https://"
                 value={cvJobLink}
-                onChange={(e) => setCvJobLink(e.target.value)}
+                onChange={(e) =>
+                  setCvJobLink(e.target.value)
+                }
               />
             </div>
 
@@ -1203,7 +1387,9 @@ ${name}
                 className="input textarea w-full text-[13px] text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
                 placeholder="Colle quelques missions / outils / mots-clés de l’offre."
                 value={cvJobDesc}
-                onChange={(e) => setCvJobDesc(e.target.value)}
+                onChange={(e) =>
+                  setCvJobDesc(e.target.value)
+                }
               />
             </div>
           </div>
@@ -1215,10 +1401,14 @@ ${name}
                 type="checkbox"
                 className="toggle-checkbox"
                 checked={cvAutoCreate}
-                onChange={(e) => setCvAutoCreate(e.target.checked)}
+                onChange={(e) =>
+                  setCvAutoCreate(e.target.checked)
+                }
               />
               <span className="text-[var(--muted)]">
-                Créer automatiquement une entrée dans le <strong>Suivi 📌</strong> à chaque génération.
+                Créer automatiquement une entrée dans le{" "}
+                <strong>Suivi 📌</strong> à chaque
+                génération.
               </span>
             </label>
           </div>
@@ -1232,8 +1422,17 @@ ${name}
             disabled={cvLoading || !profile}
             className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            <span>{cvLoading ? "Génération du CV..." : "Générer le CV (PDF) — 1 page"}</span>
-            <div id="cvBtnSpinner" className={`loader absolute inset-0 m-auto ${cvLoading ? "" : "hidden"}`} />
+            <span>
+              {cvLoading
+                ? "Génération du CV..."
+                : "Générer le CV (PDF) — 1 page"}
+            </span>
+            <div
+              id="cvBtnSpinner"
+              className={`loader absolute inset-0 m-auto ${
+                cvLoading ? "" : "hidden"
+              }`}
+            />
           </button>
 
           <button
@@ -1243,20 +1442,36 @@ ${name}
             disabled={cvZipLoading || !profile}
             className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            <span>{cvZipLoading ? "Génération PDF..." : "CV + LM (PDF) — 2 pages"}</span>
-            <div id="cvLmZipBtnSpinner" className={`loader absolute inset-0 m-auto ${cvZipLoading ? "" : "hidden"}`} />
+            <span>
+              {cvZipLoading
+                ? "Génération PDF..."
+                : "CV + LM (PDF) — 2 pages"}
+            </span>
+            <div
+              id="cvLmZipBtnSpinner"
+              className={`loader absolute inset-0 m-auto ${
+                cvZipLoading ? "" : "hidden"
+              }`}
+            />
           </button>
         </div>
 
         <div className="mt-2 p-2.5 rounded-md border border-dashed border-[var(--border)]/70 text-[11px] text-[var(--muted)]">
           {cvStatus ? (
-            <p className="text-center text-emerald-400 text-[12px]">{cvStatus}</p>
+            <p className="text-center text-emerald-400 text-[12px]">
+              {cvStatus}
+            </p>
           ) : (
             <p className="text-center">
-              Génération locale : téléchargement direct (CV 1 page, ou CV+LM 2 pages).
+              Génération locale : téléchargement direct (CV
+              1 page, ou CV+LM 2 pages).
             </p>
           )}
-          {cvError && <p className="mt-1 text-center text-red-400 text-[12px]">{cvError}</p>}
+          {cvError && (
+            <p className="mt-1 text-center text-red-400 text-[12px]">
+              {cvError}
+            </p>
+          )}
         </div>
       </section>
 
@@ -1264,23 +1479,36 @@ ${name}
       <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
         <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
           <span>
-            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
+            🎯 Poste ciblé :{" "}
+            <span className="font-medium text-[var(--ink)]">
+              {targetedJob}
+            </span>
           </span>
           <span>
-            🏢 <span className="font-medium text-[var(--ink)]">{targetedCompany}</span>
+            🏢{" "}
+            <span className="font-medium text-[var(--ink)]">
+              {targetedCompany}
+            </span>
           </span>
         </div>
 
-        <form onSubmit={handleGenerateLetter} className="space-y-3">
+        <form
+          onSubmit={handleGenerateLetter}
+          className="space-y-3"
+        >
           <div className="flex items-start justify-between gap-2">
             <div className="flex items-center gap-2">
               <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
                 Étape 2
               </span>
               <div>
-                <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Lettre de motivation IA</h3>
+                <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">
+                  Lettre de motivation IA
+                </h3>
                 <p className="text-[11px] text-[var(--muted)]">
-                  La lettre est générée en s’appuyant sur <strong>tes expériences</strong> (et outils), puis exportée en PDF (1 page).
+                  La lettre est générée en s’appuyant sur{" "}
+                  <strong>tes expériences</strong> (et
+                  outils), puis exportée en PDF (1 page).
                 </p>
               </div>
             </div>
@@ -1288,7 +1516,9 @@ ${name}
               id="lmLang"
               className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
               value={lmLang}
-              onChange={(e) => setLmLang(e.target.value as Lang)}
+              onChange={(e) =>
+                setLmLang(e.target.value as Lang)
+              }
             >
               <option value="fr">FR</option>
               <option value="en">EN</option>
@@ -1298,54 +1528,74 @@ ${name}
           <div className="space-y-3 text-[13px]">
             <div className="grid sm:grid-cols-2 gap-3">
               <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
+                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                  Nom de l&apos;entreprise
+                </label>
                 <input
                   id="companyName"
                   type="text"
                   className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
                   placeholder="Ex : IMOGATE"
                   value={companyName}
-                  onChange={(e) => setCompanyName(e.target.value)}
+                  onChange={(e) =>
+                    setCompanyName(e.target.value)
+                  }
                 />
               </div>
               <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
+                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                  Intitulé du poste
+                </label>
                 <input
                   id="jobTitle"
                   type="text"
                   className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
                   placeholder="Ex : Ingénieur Réseaux & Sécurité"
                   value={jobTitle}
-                  onChange={(e) => setJobTitle(e.target.value)}
+                  onChange={(e) =>
+                    setJobTitle(e.target.value)
+                  }
                 />
               </div>
             </div>
 
             <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Extraits de l&apos;offre (optionnel)</label>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Extraits de l&apos;offre (optionnel)
+              </label>
               <textarea
                 id="jobDescription"
                 rows={3}
                 className="input textarea w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
                 placeholder="Colle quelques missions / outils / contexte de l’offre."
                 value={jobDescription}
-                onChange={(e) => setJobDescription(e.target.value)}
+                onChange={(e) =>
+                  setJobDescription(e.target.value)
+                }
               />
             </div>
 
             <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Lien de l&apos;offre (optionnel)</label>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Lien de l&apos;offre (optionnel)
+              </label>
               <input
                 id="jobLink"
                 type="url"
                 className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
                 placeholder="https://"
                 value={jobLink}
-                onChange={(e) => setJobLink(e.target.value)}
+                onChange={(e) =>
+                  setJobLink(e.target.value)
+                }
               />
             </div>
 
-            {lmError && <p className="text-[11px] text-red-400">{lmError}</p>}
+            {lmError && (
+              <p className="text-[11px] text-red-400">
+                {lmError}
+              </p>
+            )}
 
             <div className="flex flex-col sm:flex-row gap-2 pt-1">
               <button
@@ -1354,8 +1604,17 @@ ${name}
                 disabled={lmLoading || !profile}
                 className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <span>{lmLoading ? "Génération de la LM..." : "Générer la lettre"}</span>
-                <div id="lmBtnSpinner" className={`loader absolute inset-0 m-auto ${lmLoading ? "" : "hidden"}`} />
+                <span>
+                  {lmLoading
+                    ? "Génération de la LM..."
+                    : "Générer la lettre"}
+                </span>
+                <div
+                  id="lmBtnSpinner"
+                  className={`loader absolute inset-0 m-auto ${
+                    lmLoading ? "" : "hidden"
+                  }`}
+                />
               </button>
 
               <button
@@ -1365,8 +1624,16 @@ ${name}
                 disabled={lmPdfLoading || !profile}
                 className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <span>{lmPdfLoading ? "Création du PDF..." : "Télécharger en PDF (1 page)"}</span>
-                <div className={`loader absolute inset-0 m-auto ${lmPdfLoading ? "" : "hidden"}`} />
+                <span>
+                  {lmPdfLoading
+                    ? "Création du PDF..."
+                    : "Télécharger en PDF (1 page)"}
+                </span>
+                <div
+                  className={`loader absolute inset-0 m-auto ${
+                    lmPdfLoading ? "" : "hidden"
+                  }`}
+                />
               </button>
             </div>
 
@@ -1378,23 +1645,35 @@ ${name}
                 disabled={!letterText}
                 className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <span>{letterCopied ? "Texte copié ✅" : "Copier le texte"}</span>
+                <span>
+                  {letterCopied
+                    ? "Texte copié ✅"
+                    : "Copier le texte"}
+                </span>
               </button>
             </div>
 
-            {lmPdfError && <p className="text-[11px] text-red-400">{lmPdfError}</p>}
+            {lmPdfError && (
+              <p className="text-[11px] text-red-400">
+                {lmPdfError}
+              </p>
+            )}
           </div>
         </form>
 
         <div className="mt-2 p-3 card-soft rounded-md border border-dashed border-[var(--brand)]/50">
           <p className="text-[11px] text-[var(--muted)] mb-1 text-center">
-            Dernière lettre générée (tu peux l&apos;adapter avant envoi ou PDF).
+            Dernière lettre générée (tu peux l&apos;adapter
+            avant envoi ou PDF).
           </p>
           <div className="letter-pre text-[13px] text-[var(--ink)] overflow-auto max-h-[220px] whitespace-pre-line">
             {letterText ? (
               <p>{letterText}</p>
             ) : (
-              <p className="text-center text-[var(--muted)]">Lance une génération pour voir ici le texte de la LM IA.</p>
+              <p className="text-center text-[var(--muted)]">
+                Lance une génération pour voir ici le texte
+                de la LM IA.
+              </p>
             )}
           </div>
         </div>
@@ -1404,9 +1683,15 @@ ${name}
       <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3">
         <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
           <span>
-            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
+            🎯 Poste ciblé :{" "}
+            <span className="font-medium text-[var(--ink)]">
+              {targetedJob}
+            </span>
           </span>
-          <span>🧩 Utilise ce pitch pour mails, LinkedIn et entretiens.</span>
+          <span>
+            🧩 Utilise ce pitch pour mails, LinkedIn et
+            entretiens.
+          </span>
         </div>
 
         <div className="flex items-start justify-between gap-2">
@@ -1415,9 +1700,12 @@ ${name}
               Étape 3
             </span>
             <div>
-              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Pitch d&apos;ascenseur</h3>
+              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">
+                Pitch d&apos;ascenseur
+              </h3>
               <p className="text-[11px] text-[var(--muted)]">
-                Résumé percutant de 2–4 phrases pour te présenter en 30–40 secondes.
+                Résumé percutant de 2–4 phrases pour te
+                présenter en 30–40 secondes.
               </p>
             </div>
           </div>
@@ -1425,14 +1713,20 @@ ${name}
             id="pitchLang"
             className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
             value={pitchLang}
-            onChange={(e) => setPitchLang(e.target.value as Lang)}
+            onChange={(e) =>
+              setPitchLang(e.target.value as Lang)
+            }
           >
             <option value="fr">FR</option>
             <option value="en">EN</option>
           </select>
         </div>
 
-        {pitchError && <p className="text-[11px] text-red-400">{pitchError}</p>}
+        {pitchError && (
+          <p className="text-[11px] text-red-400">
+            {pitchError}
+          </p>
+        )}
 
         <div className="flex flex-col sm:flex-row gap-2 pt-1">
           <button
@@ -1442,8 +1736,17 @@ ${name}
             disabled={pitchLoading || !profile}
             className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            <span>{pitchLoading ? "Génération du pitch..." : "Générer le pitch"}</span>
-            <div id="pitchBtnSpinner" className={`loader absolute inset-0 m-auto ${pitchLoading ? "" : "hidden"}`} />
+            <span>
+              {pitchLoading
+                ? "Génération du pitch..."
+                : "Générer le pitch"}
+            </span>
+            <div
+              id="pitchBtnSpinner"
+              className={`loader absolute inset-0 m-auto ${
+                pitchLoading ? "" : "hidden"
+              }`}
+            />
           </button>
           <button
             id="copyPitchBtn"
@@ -1452,7 +1755,11 @@ ${name}
             disabled={!pitchText}
             className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            <span>{pitchCopied ? "Pitch copié ✅" : "Copier le pitch"}</span>
+            <span>
+              {pitchCopied
+                ? "Pitch copié ✅"
+                : "Copier le pitch"}
+            </span>
           </button>
         </div>
 
@@ -1475,44 +1782,65 @@ ${name}
               Étape 4
             </span>
             <div>
-              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Mail de candidature</h3>
+              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">
+                Mail de candidature
+              </h3>
               <p className="text-[11px] text-[var(--muted)] max-w-xl">
-                Génère un <strong>objet</strong> et un <strong>corps de mail</strong> à copier.
+                Génère un <strong>objet</strong> et un{" "}
+                <strong>corps de mail</strong> à copier.
               </p>
             </div>
           </div>
         </div>
 
-        <form onSubmit={handleGenerateEmail} className="grid md:grid-cols-2 gap-4 text-sm mt-1">
+        <form
+          onSubmit={handleGenerateEmail}
+          className="grid md:grid-cols-2 gap-4 text-sm mt-1"
+        >
           <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+              Nom de l&apos;entreprise
+            </label>
             <input
               className="input w-full"
               value={companyName}
-              onChange={(e) => setCompanyName(e.target.value)}
+              onChange={(e) =>
+                setCompanyName(e.target.value)
+              }
               placeholder="Ex : IMOGATE"
             />
           </div>
           <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+              Intitulé du poste
+            </label>
             <input
               className="input w-full"
               value={jobTitle}
-              onChange={(e) => setJobTitle(e.target.value)}
+              onChange={(e) =>
+                setJobTitle(e.target.value)
+              }
               placeholder="Ex : Ingénieur Réseaux & Sécurité"
             />
           </div>
           <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom du recruteur (optionnel)</label>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+              Nom du recruteur (optionnel)
+            </label>
             <input
               className="input w-full"
               value={recruiterName}
-              onChange={(e) => setRecruiterName(e.target.value)}
+              onChange={(e) =>
+                setRecruiterName(e.target.value)
+              }
               placeholder="Ex : Mme Dupont"
             />
           </div>
           <div className="md:col-span-2 flex justify-end">
-            <button type="submit" className="btn-primary min-w-[200px]">
+            <button
+              type="submit"
+              className="btn-primary min-w-[200px]"
+            >
               Générer le mail
             </button>
           </div>
@@ -1520,21 +1848,28 @@ ${name}
 
         <div className="grid md:grid-cols-2 gap-4 mt-3 text-sm">
           <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
-            <h4 className="font-semibold text-sm mb-2">Objet</h4>
+            <h4 className="font-semibold text-sm mb-2">
+              Objet
+            </h4>
             <div className="text-xs text-[var(--muted)] whitespace-pre-line">
-              {subjectPreview || "L'objet généré apparaîtra ici."}
+              {subjectPreview ||
+                "L'objet généré apparaîtra ici."}
             </div>
           </div>
           <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
-            <h4 className="font-semibold text-sm mb-2">Corps du mail</h4>
+            <h4 className="font-semibold text-sm mb-2">
+              Corps du mail
+            </h4>
             <div className="text-xs text-[var(--muted)] whitespace-pre-line max-h-64 overflow-auto">
-              {emailPreview || "Le texte du mail apparaîtra ici après génération."}
+              {emailPreview ||
+                "Le texte du mail apparaîtra ici après génération."}
             </div>
           </div>
         </div>
 
         <p className="text-[10px] text-[var(--muted)] mt-3">
-          📌 Copie-colle l&apos;objet et le texte, puis joins le CV et la lettre PDF.
+          📌 Copie-colle l&apos;objet et le texte, puis joins
+          le CV et la lettre PDF.
         </p>
       </section>
     </motion.div>

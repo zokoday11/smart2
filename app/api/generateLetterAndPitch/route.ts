@@ -8,7 +8,7 @@ const CF_LETTER_AND_PITCH_URL =
     : "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
 
 export async function POST(req: Request) {
-  // 1) On récupère le body envoyé par ton front
+  // 1) Récupération du body JSON
   let body: any = null;
   try {
     body = await req.json();
@@ -20,19 +20,21 @@ export async function POST(req: Request) {
   }
 
   try {
-    // 2) On prépare les headers pour la Cloud Function
+    // 2) Préparation des headers pour la Cloud Function
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
     };
 
-    // 👉 On propage l'Authorization si ton front en envoie une (idToken Firebase)
+    // On propage l'Authorization si le front en envoie une (idToken Firebase éventuel)
     const authHeader = req.headers.get("authorization");
     if (authHeader) {
       headers["Authorization"] = authHeader;
     }
 
-    // 👉 On propage aussi éventuellement le header reCAPTCHA s’il existe
-    const recaptchaHeader = req.headers.get("x-recaptcha-token");
+    // On propage aussi le token reCAPTCHA en header si présent
+    const recaptchaHeader =
+      req.headers.get("x-recaptcha-token") ||
+      req.headers.get("X-Recaptcha-Token");
     if (recaptchaHeader) {
       headers["X-Recaptcha-Token"] = recaptchaHeader;
     }
@@ -44,10 +46,10 @@ export async function POST(req: Request) {
       body: JSON.stringify(body),
     });
 
-    const contentType = cfRes.headers.get("content-type") || "";
     const status = cfRes.status;
+    const contentType = cfRes.headers.get("content-type") || "";
 
-    // 4) Si la fonction ne renvoie pas du JSON → on renvoie une erreur lisible
+    // 4) Si ce n’est pas du JSON, on renvoie un message explicite
     if (!contentType.includes("application/json")) {
       const text = await cfRes.text().catch(() => "");
       return NextResponse.json(
@@ -63,7 +65,7 @@ export async function POST(req: Request) {
 
     const json = await cfRes.json().catch(() => null);
 
-    // 5) Si la Cloud Function renvoie une erreur HTTP → on la propage
+    // 5) Propager proprement l’erreur backend
     if (!cfRes.ok) {
       return NextResponse.json(
         json || { error: "Erreur backend generateLetterAndPitch" },
@@ -71,7 +73,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 6) Succès → on renvoie directement la réponse JSON au front
+    // 6) Succès → renvoyer le JSON directement au front
     return NextResponse.json(json, { status });
   } catch (e: any) {
     console.error("Erreur proxy /api/generateLetterAndPitch :", e);

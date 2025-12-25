@@ -2558,689 +2558,6 @@ ENTREPRISE : ${companyName || "votre entreprise"}`;
 }
 ````
 
-## File: app/api/generate-cv/route.ts
-````typescript
-import { NextResponse } from "next/server";
-
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-// URL de ta Cloud Function Google
-const UPSTREAM =
-  process.env.GENERATE_LETTER_UPSTREAM ||
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
-
-export async function POST(req: Request) {
-  try {
-    // 1. Récupération des headers (Auth + Recaptcha)
-    const auth = req.headers.get("authorization") || "";
-    const headerRecaptcha = req.headers.get("x-recaptcha-token") || "";
-
-    const body = await req.json().catch(() => null);
-    if (!body) {
-      return NextResponse.json({ error: "Body JSON invalide." }, { status: 400 });
-    }
-
-    // 2. Support recaptcha dans header OU body
-    const bodyRecaptcha =
-      typeof body?.recaptchaToken === "string" ? body.recaptchaToken : "";
-    const recaptcha = headerRecaptcha || bodyRecaptcha;
-
-    // 3. Appel Cloud Function (Server-to-Server)
-    const upstreamRes = await fetch(UPSTREAM, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(auth ? { Authorization: auth } : {}), // On transmet le token
-        ...(recaptcha ? { "X-Recaptcha-Token": recaptcha } : {}),
-      },
-      body: JSON.stringify(body),
-      cache: "no-store",
-    });
-
-    // 4. Renvoi de la réponse
-    const contentType =
-      upstreamRes.headers.get("content-type") || "application/json";
-    const text = await upstreamRes.text();
-
-    return new NextResponse(text, {
-      status: upstreamRes.status,
-      headers: { "Content-Type": contentType },
-    });
-  } catch (e: any) {
-    console.error("API /generateLetterAndPitch error:", e);
-    return NextResponse.json({ error: "internal_error" }, { status: 500 });
-  }
-}
-````
-
-## File: app/api/generate-zip/route.ts
-````typescript
-// app/api/generate-zip/route.ts
-
-import { NextResponse } from "next/server";
-import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
-import { getAuth } from "firebase-admin/auth";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
-import JSZip from "jszip";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
-
-// ⚠️ Pour typer proprement le cast à la fin
-type BodyInitCompat = BodyInit | null | undefined;
-
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-function getAdminApp() {
-  if (getApps().length) return getApps()[0];
-
-  const projectId = process.env.FIREBASE_ADMIN_PROJECT_ID || process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_ADMIN_CLIENT_EMAIL;
-  const privateKeyRaw = process.env.FIREBASE_ADMIN_PRIVATE_KEY;
-
-  if (projectId && clientEmail && privateKeyRaw) {
-    const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
-    return initializeApp({
-      credential: cert({ projectId, clientEmail, privateKey }),
-    });
-  }
-
-  return initializeApp({
-    credential: applicationDefault(),
-  });
-}
-
-async function requireUser(req: Request) {
-  getAdminApp();
-
-  const authHeader = req.headers.get("authorization") || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
-
-  if (!token) {
-    return { ok: false as const, status: 401, error: "Missing Authorization Bearer token" };
-  }
-
-  try {
-    const decoded = await getAuth().verifyIdToken(token);
-    return { ok: true as const, uid: decoded.uid, email: decoded.email || "" };
-  } catch (e) {
-    console.error("verifyIdToken error:", e);
-    return { ok: false as const, status: 401, error: "Invalid token" };
-  }
-}
-
-async function consumeCreditsAndLog(params: {
-  uid: string;
-  email: string;
-  cost: number; // ex 2
-  tool: string; // generateCvLmZip
-  docType: "cv" | "lm" | "other";
-  meta?: any;
-}) {
-  getAdminApp();
-  const db = getFirestore();
-
-  const userRef = db.collection("users").doc(params.uid);
-  const usageRef = db.collection("usageLogs").doc();
-  const now = Date.now();
-
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(userRef);
-    const data = snap.exists ? snap.data() || {} : {};
-    const currentCredits = typeof data.credits === "number" ? data.credits : 0;
-
-    if (currentCredits < params.cost) {
-      const err: any = new Error("NO_CREDITS");
-      err.code = "NO_CREDITS";
-      throw err;
-    }
-
-    tx.set(
-      userRef,
-      {
-        credits: currentCredits - params.cost,
-        totalIaCalls: FieldValue.increment(1),
-        totalDocumentsGenerated: FieldValue.increment(2), // zip = 2 docs (cv + lm)
-        totalCvGenerated: FieldValue.increment(1),
-        totalLmGenerated: FieldValue.increment(1),
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    tx.set(
-      usageRef,
-      {
-        userId: params.uid,
-        email: params.email || "",
-        action: "generate_document",
-        docType: params.docType,
-        eventType: "generate",
-        tool: params.tool,
-        creditsDelta: -params.cost,
-        meta: params.meta || null,
-        createdAt: now,
-        createdAtServer: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-  });
-}
-
-function buildProfileContextForIA(profile: any) {
-  const p = profile || {};
-
-  let skillsArr: any[] = [];
-  if (Array.isArray(p.skills)) {
-    skillsArr = p.skills;
-  } else if (p.skills && typeof p.skills === "object") {
-    if (Array.isArray(p.skills.sections)) {
-      p.skills.sections.forEach((sec: any) => {
-        if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
-      });
-    }
-    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
-  }
-
-  const skillsStr = (skillsArr || []).join(", ");
-
-  const expStr = Array.isArray(p.experiences)
-    ? p.experiences
-        .map(
-          (e: any) =>
-            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
-        )
-        .join("; \n")
-    : "";
-
-  const eduStr = Array.isArray(p.education)
-    ? p.education
-        .map((e: any) => `${e.degree || e.title || ""} - ${e.school || e.institution || ""} (${e.dates || ""})`)
-        .join("; \n")
-    : "";
-
-  return `Nom: ${p.fullName || p.name || ""}
-Titre: ${p.profileHeadline || p.title || ""}
-Contact: ${p.email || ""} | ${p.phone || ""} | ${p.linkedin || ""} | ${p.city || ""}
-Résumé de profil: ${p.profileSummary || p.summary || ""}
-Compétences: ${skillsStr}
-Expériences: 
-${expStr}
-Formations: 
-${eduStr}
-Certifications: ${p.certs || ""}
-Langues: ${p.langLine || p.lang || ""}`.trim();
-}
-
-async function callGeminiText(
-  prompt: string,
-  apiKey: string,
-  temperature = 0.65,
-  maxOutputTokens = 1400
-) {
-  const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-
-  const body = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { temperature, maxOutputTokens },
-  };
-
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const errorText = await resp.text();
-    throw new Error("Erreur Gemini (texte): " + errorText);
-  }
-
-  const data = await resp.json();
-  const parts = data?.candidates?.[0]?.content?.parts || [];
-  const text = parts
-    .map((p: any) => (typeof p.text === "string" ? p.text : ""))
-    .join("\n")
-    .trim();
-
-  if (!text) throw new Error("Réponse Gemini (texte) vide");
-  return text;
-}
-
-function buildFallbackLetterBody(profile: any, jobTitle: string, companyName: string, lang: string) {
-  const p = profile || {};
-  const primaryDomain = p.primaryDomain || "";
-  const summary = p.profileSummary || "";
-  const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
-  const role = firstExp?.role || firstExp?.title || "";
-  const company = firstExp?.company || "";
-  const years = Array.isArray(p.experiences) && p.experiences.length > 0 ? p.experiences.length : null;
-
-  if (lang === "en") {
-    return `I am writing to express my interest in the position of ${jobTitle || "your advertised role"} at ${
-      companyName || "your company"
-    }. ${summary || ""}
-
-With ${years ? years + " years of experience" : "solid experience"} in ${primaryDomain || "my field"}, I have developed skills relevant to this opportunity.
-
-In my previous experience at ${company || "my last company"}, I contributed to projects and collaborated with different stakeholders.
-
-I would be delighted to discuss how I can contribute to your team.`;
-  }
-
-  return `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
-    companyName || "votre entreprise"
-  }. ${summary || ""}
-
-Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
-    primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
-  }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
-
-Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`;
-}
-
-async function createSimpleCvPdf(profile: any, options: any) {
-  const { targetJob = "", lang = "fr", contract = "", jobLink = "", jobDescription = "" } = options || {};
-
-  const p = profile || {};
-  const pdfDoc = await PDFDocument.create();
-  const page = pdfDoc.addPage([595.28, 841.89]); // A4
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-  const { width, height } = page.getSize();
-  const marginX = 50;
-  let y = height - 60;
-
-  function drawLine(text: string, size = 11, bold = false) {
-    if (!text || y < 50) return;
-    const f = bold ? fontBold : font;
-    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
-    y -= size + 4;
-  }
-
-  function drawParagraph(text: string, size = 10) {
-    if (!text) return;
-    const f = font;
-    const maxWidth = width - marginX * 2;
-    const paragraphs = text.split(/\n{2,}/);
-
-    for (const paragraph of paragraphs) {
-      const words = paragraph.split(/\s+/);
-      let line = "";
-
-      for (const w of words) {
-        const testLine = line ? line + " " + w : w;
-        const testWidth = f.widthOfTextAtSize(testLine, size);
-        if (testWidth > maxWidth) {
-          if (y < 50) return;
-          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
-          y -= size + 3;
-          line = w;
-        } else {
-          line = testLine;
-        }
-      }
-
-      if (line && y >= 50) {
-        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
-        y -= size + 6;
-      }
-      y -= 2;
-    }
-  }
-
-  function drawSectionTitle(title: string) {
-    if (!title || y < 60) return;
-    page.drawText(title, { x: marginX, y, size: 11, font: fontBold, color: rgb(0.08, 0.15, 0.45) });
-    y -= 14;
-  }
-
-  function drawBullet(text: string, size = 9) {
-    if (!text || y < 50) return;
-    const f = font;
-    const bulletX = marginX + 8;
-    const maxWidth = width - marginX * 2 - 10;
-    const words = text.split(/\s+/);
-    let line = "";
-    let firstLine = true;
-
-    for (const w of words) {
-      const testLine = line ? line + " " + w : w;
-      const testWidth = f.widthOfTextAtSize(testLine, size);
-      if (testWidth > maxWidth) {
-        if (y < 50) return;
-        page.drawText(firstLine ? "• " + line : "  " + line, {
-          x: bulletX,
-          y,
-          size,
-          font: f,
-          color: rgb(0.1, 0.12, 0.16),
-        });
-        y -= size + 3;
-        line = w;
-        firstLine = false;
-      } else {
-        line = testLine;
-      }
-    }
-
-    if (line && y >= 50) {
-      page.drawText(firstLine ? "• " + line : "  " + line, {
-        x: bulletX,
-        y,
-        size,
-        font: f,
-        color: rgb(0.1, 0.12, 0.16),
-      });
-      y -= size + 3;
-    }
-  }
-
-  // Header
-  drawLine(p.fullName || "", 16, true);
-  const jobLine = targetJob || contract || p.contractType || (lang === "en" ? "Target position" : "Poste recherché");
-  drawLine(jobLine, 11, false);
-
-  const contactParts = [p.email || "", p.phone || "", p.city || "", p.linkedin || ""].filter(Boolean);
-  if (contactParts.length) drawLine(contactParts.join(" · "), 9, false);
-
-  if (jobLink) drawLine((lang === "en" ? "Job link: " : "Lien de l'offre : ") + jobLink, 8, false);
-
-  y -= 6;
-
-  if (p.profileSummary) {
-    drawSectionTitle(lang === "en" ? "Profile" : "Profil");
-    drawParagraph(p.profileSummary, 9.5);
-    y -= 4;
-  }
-
-  if (p.skills && Array.isArray(p.skills.sections) && p.skills.sections.length) {
-    drawSectionTitle(lang === "en" ? "Key skills" : "Compétences clés");
-    p.skills.sections.forEach((sec: any) => {
-      if (!sec || (!sec.title && !Array.isArray(sec.items))) return;
-      if (sec.title) drawLine(sec.title, 9.5, true);
-      if (Array.isArray(sec.items)) drawParagraph(sec.items.join(" · "), 9);
-      y -= 2;
-    });
-  }
-
-  if (Array.isArray(p.experiences) && p.experiences.length) {
-    drawSectionTitle(lang === "en" ? "Experience" : "Expériences professionnelles");
-    p.experiences.forEach((exp: any) => {
-      if (y < 90) return;
-      const header = [exp.role, exp.company].filter(Boolean).join(" — ");
-      if (header) drawLine(header, 10, true);
-      if (exp.dates) drawLine(exp.dates, 8.5, false);
-      if (Array.isArray(exp.bullets)) exp.bullets.slice(0, 4).forEach((b: string) => drawBullet(b, 8.5));
-      y -= 4;
-    });
-  }
-
-  if (Array.isArray(p.education) && p.education.length && y > 80) {
-    drawSectionTitle(lang === "en" ? "Education" : "Formation");
-    p.education.forEach((ed: any) => {
-      if (y < 60) return;
-      const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
-      if (header) drawLine(header, 9.5, true);
-      if (ed.dates) drawLine(ed.dates, 8.5, false);
-      y -= 4;
-    });
-  }
-
-  if (p.langLine && y > 60) {
-    drawSectionTitle(lang === "en" ? "Languages" : "Langues");
-    drawParagraph(p.langLine, 9);
-  }
-
-  if (Array.isArray(p.hobbies) && p.hobbies.length && y > 60) {
-    drawSectionTitle(lang === "en" ? "Interests" : "Centres d'intérêt");
-    drawParagraph(p.hobbies.join(" · "), 9);
-  }
-
-  const pdfBytes = await pdfDoc.save();
-  return Buffer.from(pdfBytes);
-}
-
-async function createLetterPdf(coverLetter: string, meta: any) {
-  const { jobTitle = "", companyName = "", candidateName = "", lang = "fr" } = meta || {};
-
-  const pdfDoc = await PDFDocument.create();
-  const page = pdfDoc.addPage([595.28, 841.89]); // A4
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-  const { width, height } = page.getSize();
-  const marginX = 60;
-  let y = height - 70;
-
-  function drawLine(text: string, size = 11, bold = false) {
-    if (!text || y < 60) return;
-    const f = bold ? fontBold : font;
-    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
-    y -= size + 4;
-  }
-
-  function drawParagraph(text: string, size = 11) {
-    if (!text) return;
-    const f = font;
-    const maxWidth = width - marginX * 2;
-    const paragraphs = text.split(/\n{2,}/);
-
-    for (const paragraph of paragraphs) {
-      const words = paragraph.split(/\s+/);
-      let line = "";
-
-      for (const w of words) {
-        const testLine = line ? line + " " + w : w;
-        const testWidth = f.widthOfTextAtSize(testLine, size);
-        if (testWidth > maxWidth) {
-          if (y < 60) return;
-          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
-          y -= size + 4;
-          line = w;
-        } else {
-          line = testLine;
-        }
-      }
-
-      if (line && y >= 60) {
-        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
-        y -= size + 8;
-      }
-
-      y -= 4;
-    }
-  }
-
-  if (candidateName) drawLine(candidateName, 14, true);
-
-  if (jobTitle || companyName) {
-    const titleLine =
-      lang === "en"
-        ? `Application for ${jobTitle || "the position"} – ${companyName || "Company"}`
-        : `Candidature : ${jobTitle || "poste"} – ${companyName || "Entreprise"}`;
-    drawLine(titleLine, 11, false);
-  }
-
-  y -= 10;
-  drawParagraph(coverLetter, 11);
-
-  const pdfBytes = await pdfDoc.save();
-  return Buffer.from(pdfBytes);
-}
-
-export async function POST(req: Request) {
-  const auth = await requireUser(req);
-  if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
-
-  let body: any = null;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
-  }
-
-  const profile = body?.profile;
-  const targetJob = body?.targetJob || "";
-  const langRaw = body?.lang || "fr";
-  const contract = body?.contract || "";
-  const jobLink = body?.jobLink || "";
-  const jobDescription = body?.jobDescription || "";
-
-  const lm = body?.lm || {};
-  const companyName = lm?.companyName || "";
-  const jobTitle = lm?.jobTitle || targetJob || "";
-  const lmJobDescription = lm?.jobDescription || jobDescription || "";
-  const lmLangRaw = lm?.lang || langRaw;
-
-  const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
-  const lmLang = String(lmLangRaw).toLowerCase().startsWith("en") ? "en" : "fr";
-
-  if (!profile) return NextResponse.json({ ok: false, error: "Missing profile" }, { status: 400 });
-
-  // ✅ Débit -2 crédits (CV + LM) + log
-  try {
-    await consumeCreditsAndLog({
-      uid: auth.uid,
-      email: auth.email,
-      cost: 2,
-      tool: "generateCvLmZip",
-      docType: "other",
-      meta: { targetJob, jobTitle, companyName, lang, lmLang },
-    });
-  } catch (e: any) {
-    if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
-      return NextResponse.json({ ok: false, error: "NO_CREDITS" }, { status: 402 });
-    }
-    console.error("consumeCreditsAndLog error:", e);
-    return NextResponse.json({ ok: false, error: "CREDITS_ERROR" }, { status: 500 });
-  }
-
-  // CV PDF
-  let cvBuffer: Buffer;
-  try {
-    cvBuffer = await createSimpleCvPdf(profile, {
-      targetJob,
-      lang,
-      contract,
-      jobLink,
-      jobDescription,
-    });
-  } catch (e: any) {
-    console.error("CV PDF error:", e);
-    return NextResponse.json({ ok: false, error: e?.message || "CV_PDF_ERROR" }, { status: 500 });
-  }
-
-  // LM BODY via Gemini
-  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-  const cvText = buildProfileContextForIA(profile);
-
-  let coverLetterBody = "";
-
-  if (GEMINI_API_KEY) {
-    const promptLm =
-      lmLang === "en"
-        ? `
-You are a senior career coach and recruiter.
-
-TASK:
-Write ONLY the BODY of a cover letter tailored to the job, using ONLY the provided information (CV + job description).
-
-INPUTS:
-- Job title: "${jobTitle || "the role"}"
-- Company: "${companyName || "your company"}"
-- Job description:
-${lmJobDescription || "—"}
-
-- Candidate profile (source of truth):
-${cvText}
-
-STRICT RULES:
-- Do NOT invent facts (no fake metrics, clients, tools, dates).
-- 3 to 5 paragraphs separated by ONE blank line.
-- No header, no subject line, no greeting, no signature.
-- Output MUST be STRICT JSON only:
-{ "body": "..." }
-`.trim()
-        : `
-Tu es un coach carrières senior et recruteur.
-
-MISSION :
-Rédige UNIQUEMENT le CORPS d’une lettre de motivation adaptée au poste, basée UNIQUEMENT sur les infos fournies (CV + fiche de poste).
-
-ENTRÉES :
-- Intitulé : "${jobTitle || targetJob || "le poste"}"
-- Entreprise : "${companyName || "votre entreprise"}"
-- Fiche de poste :
-${lmJobDescription || "—"}
-
-- Profil candidat :
-${cvText}
-
-RÈGLES :
-- Ne pas inventer (pas de chiffres/clients/technos non présents).
-- 3 à 5 paragraphes séparés par une ligne vide.
-- Pas d’en-tête, pas d’objet, pas de salutation, pas de signature.
-- Réponds STRICTEMENT en JSON :
-{ "body": "..." }
-`.trim();
-
-    try {
-      const rawLm = await callGeminiText(promptLm, GEMINI_API_KEY, 0.65, 1400);
-      const cleaned = String(rawLm).replace(/```json|```/gi, "").trim();
-      try {
-        const parsed = JSON.parse(cleaned);
-        coverLetterBody = typeof parsed.body === "string" ? parsed.body.trim() : "";
-      } catch {
-        coverLetterBody = String(rawLm || "").trim();
-      }
-    } catch (e) {
-      console.error("Gemini LM error:", e);
-    }
-  }
-
-  if (!coverLetterBody) {
-    coverLetterBody = buildFallbackLetterBody(profile, jobTitle, companyName, lmLang);
-  }
-
-  // LM PDF
-  let lmBuffer: Buffer;
-  try {
-    lmBuffer = await createLetterPdf(coverLetterBody, {
-      jobTitle,
-      companyName,
-      candidateName: profile.fullName || "",
-      lang: lmLang,
-    });
-  } catch (e: any) {
-    console.error("LM PDF error:", e);
-    return NextResponse.json({ ok: false, error: e?.message || "LM_PDF_ERROR" }, { status: 500 });
-  }
-
-  // ZIP ✅ (avec cast pour calmer TypeScript)
-  try {
-    const zip = new JSZip();
-    zip.file("cv-ia.pdf", cvBuffer);
-    zip.file(lmLang === "en" ? "cover-letter.pdf" : "lettre-motivation.pdf", lmBuffer);
-
-    const zipContent = await zip.generateAsync({ type: "uint8array" });
-
-    return new NextResponse(zipContent as unknown as BodyInitCompat, {
-      status: 200,
-      headers: {
-        "Content-Type": "application/zip",
-        "Content-Disposition": 'attachment; filename="cv-lm-ia.zip"',
-        "Content-Length": String(zipContent.byteLength),
-      },
-    });
-  } catch (e: any) {
-    console.error("ZIP error:", e);
-    return NextResponse.json({ ok: false, error: e?.message || "ZIP_ERROR" }, { status: 500 });
-  }
-}
-````
-
 ## File: app/api/generateInterviewQA/route.ts
 ````typescript
 // app/api/generateInterviewQA/route.ts
@@ -3482,358 +2799,6 @@ Missions / résultats :
     console.error("generateInterviewQA API error:", err);
     return NextResponse.json(
       { error: "Internal error" },
-      { status: 500 }
-    );
-  }
-}
-````
-
-## File: app/api/generateLetterAndPitch/route.ts
-````typescript
-import { NextRequest, NextResponse } from "next/server";
-import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
-import { getAuth } from "firebase-admin/auth";
-// Si tu veux consommer des crédits / logs plus tard :
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
-
-export const runtime = "nodejs";
-
-/**
- * Initialisation Firebase Admin
- */
-function getAdminApp() {
-  if (getApps().length) return getApps()[0];
-
-  const projectId = process.env.FIREBASE_ADMIN_PROJECT_ID || process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_ADMIN_CLIENT_EMAIL;
-  const privateKeyRaw = process.env.FIREBASE_ADMIN_PRIVATE_KEY;
-
-  if (projectId && clientEmail && privateKeyRaw) {
-    const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
-    return initializeApp({
-      credential: cert({ projectId, clientEmail, privateKey }),
-    });
-  }
-
-  return initializeApp({
-    credential: applicationDefault(),
-  });
-}
-
-/**
- * Vérifie le token Firebase envoyé par le front
- */
-async function requireUser(req: NextRequest) {
-  getAdminApp();
-
-  const authHeader = req.headers.get("authorization") || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
-
-  if (!token) {
-    return {
-      ok: false as const,
-      status: 401,
-      error: "Missing Authorization Bearer token",
-    };
-  }
-
-  try {
-    const decoded = await getAuth().verifyIdToken(token);
-    return {
-      ok: true as const,
-      uid: decoded.uid,
-      email: decoded.email || "",
-    };
-  } catch (e) {
-    console.error("verifyIdToken error:", e);
-    return {
-      ok: false as const,
-      status: 401,
-      error: "Invalid or expired token",
-    };
-  }
-}
-
-/**
- * Construction d’un contexte texte à partir du profil CV
- * (inspiré de ce que tu fais ailleurs)
- */
-function buildProfileContext(profile: any): string {
-  if (!profile) return "";
-
-  const p = profile || {};
-
-  const experiences = Array.isArray(p.experiences) ? p.experiences : [];
-  const education = Array.isArray(p.education) ? p.education : [];
-  const skillsSections =
-    p.skills && Array.isArray(p.skills.sections) ? p.skills.sections : [];
-  const tools = p.skills && Array.isArray(p.skills.tools) ? p.skills.tools : [];
-
-  const xpLines = experiences
-    .slice(0, 5)
-    .map((xp: any, i: number) => {
-      const bullets = Array.isArray(xp.bullets)
-        ? xp.bullets.slice(0, 4).map((b: string) => `- ${b}`).join("\n")
-        : "";
-      return `XP${i + 1} : ${xp.role || xp.title || ""} @ ${xp.company || ""} (${xp.dates || ""})
-${bullets}`;
-    })
-    .join("\n\n");
-
-  const skillLines = skillsSections
-    .slice(0, 4)
-    .map((s: any) => `${s.title || ""}: ${(Array.isArray(s.items) ? s.items.slice(0, 10) : []).join(", ")}`)
-    .join("\n");
-
-  const toolsLine = tools.slice(0, 20).join(", ");
-
-  const eduLines = education
-    .slice(0, 4)
-    .map(
-      (e: any) =>
-        `${e.degree || e.title || ""} - ${e.school || e.institution || ""} (${e.dates || ""})`
-    )
-    .join("\n");
-
-  return `
-NOM: ${p.fullName || p.name || ""}
-EMAIL: ${p.email || ""}
-TITRE: ${p.contractTypeFull || p.contractType || ""}
-
-RÉSUMÉ:
-${p.profileSummary || ""}
-
-EXPÉRIENCES:
-${xpLines}
-
-COMPÉTENCES:
-${skillLines}
-
-OUTILS:
-${toolsLine}
-
-FORMATION:
-${eduLines}
-
-CERTIFICATIONS:
-${p.certs || ""}
-
-LANGUES:
-${p.langLine || ""}
-
-SOFT SKILLS:
-${Array.isArray(p.softSkills) ? p.softSkills.join(", ") : ""}
-`.trim();
-}
-
-/**
- * Appel à l’API Gemini (comme dans ton autre route)
- */
-async function callGeminiText(
-  prompt: string,
-  apiKey: string,
-  temperature = 0.7,
-  maxOutputTokens = 1400
-) {
-  const endpoint =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-
-  const body = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { temperature, maxOutputTokens },
-  };
-
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text();
-    console.error("Gemini error:", text);
-    throw new Error("Erreur Gemini: " + text);
-  }
-
-  const data = await resp.json();
-  const parts = data?.candidates?.[0]?.content?.parts || [];
-  const text = parts
-    .map((p: any) => (typeof p.text === "string" ? p.text : ""))
-    .join("\n")
-    .trim();
-
-  if (!text) throw new Error("Réponse Gemini vide");
-  return text;
-}
-
-/**
- * Route POST /api/generateLetterAndPitch
- */
-export async function POST(req: NextRequest) {
-  // 1) Auth Firebase (token envoyé par le front)
-  const auth = await requireUser(req);
-  if (!auth.ok) {
-    return NextResponse.json(
-      { ok: false, error: auth.error },
-      { status: auth.status }
-    );
-  }
-
-  // 2) Lecture du body
-  let body: any;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json(
-      { ok: false, error: "Invalid JSON body" },
-      { status: 400 }
-    );
-  }
-
-  const {
-    profile,
-    jobTitle = "",
-    companyName = "",
-    jobDescription = "",
-    lang = "fr",
-    // recaptchaToken, // tu peux le vérifier ici si tu veux
-  } = body || {};
-
-  if (!profile) {
-    return NextResponse.json(
-      { ok: false, error: "Missing profile" },
-      { status: 400 }
-    );
-  }
-
-  const langNorm = String(lang).toLowerCase().startsWith("en") ? "en" : "fr";
-
-  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-  if (!GEMINI_API_KEY) {
-    return NextResponse.json(
-      { ok: false, error: "Missing GEMINI_API_KEY server-side" },
-      { status: 500 }
-    );
-  }
-
-  // 3) Contexte pour l’IA
-  const profileContext = buildProfileContext(profile);
-
-  // 4) Prompt combiné Lettre + Pitch (JSON strict)
-  const prompt =
-    langNorm === "en"
-      ? `
-You are a senior career coach and tech recruiter.
-
-Write TWO things for a job application, using ONLY the information below.
-
-JOB:
-- Title: "${jobTitle || "the role"}"
-- Company: "${companyName || "the company"}"
-- Job description (may include extra instructions from the user):
-${jobDescription || "—"}
-
-CANDIDATE PROFILE (source of truth, do not invent):
-${profileContext}
-
-TASKS:
-1) A strong, concrete COVER LETTER BODY (no header, no address, no signature).
-   - 3 to 5 paragraphs.
-   - 220 to 320 words.
-   - Explicitly use 2–3 experiences, skills, and tools from the profile.
-   - Tone: professional, specific, no fluff.
-   - Adapt to the job and company.
-
-2) A short ELEVATOR PITCH:
-   - 2 to 4 sentences.
-   - Can be used orally or in emails / LinkedIn.
-   - Direct, impactful, summarising value for this role.
-
-STRICT OUTPUT FORMAT:
-Return ONLY valid JSON:
-{
-  "coverLetter": "...",
-  "pitch": "..."
-}
-`.trim()
-      : `
-Tu es un coach carrières senior et un recruteur IT.
-
-Rédige DEUX éléments pour une candidature, en utilisant UNIQUEMENT les infos ci-dessous.
-
-POSTE :
-- Intitulé : "${jobTitle || "le poste"}"
-- Entreprise : "${companyName || "l'entreprise"}"
-- Description de l'offre (peut inclure des instructions utilisateur) :
-${jobDescription || "—"}
-
-PROFIL CANDIDAT (source de vérité, ne rien inventer) :
-${profileContext}
-
-TÂCHES :
-1) CORPS de LETTRE DE MOTIVATION :
-   - 3 à 5 paragraphes.
-   - 220 à 320 mots.
-   - Pas d’en-tête, pas d’adresse, pas de signature.
-   - Utilise explicitement 2–3 expériences, compétences et outils cités.
-   - Ton professionnel, concret, adapté au poste et à l’entreprise.
-
-2) PITCH D’ASCENSEUR :
-   - 2 à 4 phrases.
-   - Utilisable à l’oral / mail / LinkedIn.
-   - Direct, percutant, orienté valeur.
-
-FORMAT DE SORTIE STRICT :
-Rends UNIQUEMENT du JSON valide :
-{
-  "coverLetter": "...",
-  "pitch": "..."
-}
-`.trim();
-
-  try {
-    const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.7, 1600);
-
-    // On nettoie les éventuels ```json ``` etc.
-    const cleaned = String(raw).replace(/```json|```/gi, "").trim();
-
-    let coverLetter = "";
-    let pitch = "";
-
-    try {
-      const parsed = JSON.parse(cleaned);
-      coverLetter =
-        typeof parsed.coverLetter === "string" ? parsed.coverLetter.trim() : "";
-      pitch = typeof parsed.pitch === "string" ? parsed.pitch.trim() : "";
-    } catch (e) {
-      console.warn("JSON parse error on Gemini response, returning raw text:", e);
-      // Fallback : tout dans coverLetter
-      coverLetter = cleaned;
-      pitch = "";
-    }
-
-    if (!coverLetter) {
-      coverLetter = "Lettre non générée correctement par l'IA.";
-    }
-
-    return NextResponse.json(
-      {
-        ok: true,
-        coverLetter,
-        pitch,
-      },
-      { status: 200 }
-    );
-  } catch (e: any) {
-    console.error("generateLetterAndPitch server error:", e);
-    return NextResponse.json(
-      {
-        ok: false,
-        error: e?.message || "GENERATION_ERROR",
-      },
       { status: 500 }
     );
   }
@@ -14755,52 +13720,6 @@ firebase functions:config:set smtp.from='"Assistant IA" <no-reply@tondomaine.com
 firebase functions:config:set smtp.from='"Assistant IA" <no-reply@assistant-ia-v4.com>'
 ````
 
-## File: firebase.json
-````json
-{
-  "hosting": {
-    "site": "assistant-ia-v4",
-    "public": "out",
-    "ignore": [
-      "firebase.json",
-      "**/.*",
-      "**/node_modules/**"
-    ],
-    "rewrites": [
-      {
-        "source": "/api/interview",
-        "function": "interview"
-      },
-      {
-        "source": "/api/extractProfile",
-        "function": "extractProfile"
-      },
-      {
-        "source": "/api/polar/webhook",
-        "function": "polarWebhook"
-      },
-      {
-        "source": "/api/jobs",
-        "function": "jobs"
-      },
-      {
-        "source": "**",
-        "destination": "/index.html"
-      }
-    ],
-    "cleanUrls": true,
-    "trailingSlash": false
-  },
-  "firestore": {
-    "rules": "firestore.rules",
-    "indexes": "firestore.indexes.json"
-  },
-  "functions": {
-    "source": "functions"
-  }
-}
-````
-
 ## File: firestore.indexes.json
 ````json
 {
@@ -14903,31 +13822,6 @@ service cloud.firestore {
 
 // NOTE: This file should not be edited
 // see https://nextjs.org/docs/app/building-your-application/configuring/typescript for more information.
-````
-
-## File: next.config.mjs
-````javascript
-/** @type {import('next').NextConfig} */
-const nextConfig = {
-  // ❌ IMPORTANT : on ne met PAS "output: 'export'"
-  // car ton projet utilise des routes API (/api/...)
-  // qui nécessitent un runtime Node.js.
-
-  reactStrictMode: true,
-
-  // Tu peux garder cette option si tu veux éviter l’optimisation d'images
-  // (utile par ex. pour un déploiement static sur certains hébergeurs)
-  images: {
-    unoptimized: true,
-  },
-
-  // (Optionnel) : si tu veux être explicite sur le runtime Node :
-  experimental: {
-    serverRuntime: "nodejs",
-  },
-};
-
-export default nextConfig;
 ````
 
 ## File: postcss.config.js
@@ -15200,6 +14094,689 @@ _next/static/chunks/app/admin/login/page-d0fa36fddfc7acd4.js,1766516747515,b90b8
 _next/static/chunks/app/_not-found/page-7494094633467ef3.js,1766516747508,dcfa115b285fc1e7d920913e1a0464349f8c270c107df17678afbcaee62abec0
 _next/static/IlA4IUG3fQpM1zdQiAMyW/_ssgManifest.js,1766516747501,02dbc1aeab6ef0a6ff2ff9a1643158cf9bb38929945eaa343a3627dee9ba6778
 _next/static/IlA4IUG3fQpM1zdQiAMyW/_buildManifest.js,1766516747503,f46b17d6e2e887329d388286773626796e64b52f4cd965c9b0fe037e97f3ad58
+````
+
+## File: app/api/generate-cv/route.ts
+````typescript
+import { NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+// URL de ta Cloud Function Google
+const UPSTREAM =
+  process.env.GENERATE_LETTER_UPSTREAM ||
+  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
+
+export async function POST(req: Request) {
+  try {
+    // 1. Récupération des headers (Auth + Recaptcha)
+    const auth = req.headers.get("authorization") || "";
+    const headerRecaptcha = req.headers.get("x-recaptcha-token") || "";
+
+    const body = await req.json().catch(() => null);
+    if (!body) {
+      return NextResponse.json({ error: "Body JSON invalide." }, { status: 400 });
+    }
+
+    // 2. Support recaptcha dans header OU body
+    const bodyRecaptcha =
+      typeof body?.recaptchaToken === "string" ? body.recaptchaToken : "";
+    const recaptcha = headerRecaptcha || bodyRecaptcha;
+
+    // 3. Appel Cloud Function (Server-to-Server)
+    const upstreamRes = await fetch(UPSTREAM, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth ? { Authorization: auth } : {}), // On transmet le token
+        ...(recaptcha ? { "X-Recaptcha-Token": recaptcha } : {}),
+      },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+
+    // 4. Renvoi de la réponse
+    const contentType =
+      upstreamRes.headers.get("content-type") || "application/json";
+    const text = await upstreamRes.text();
+
+    return new NextResponse(text, {
+      status: upstreamRes.status,
+      headers: { "Content-Type": contentType },
+    });
+  } catch (e: any) {
+    console.error("API /generateLetterAndPitch error:", e);
+    return NextResponse.json({ error: "internal_error" }, { status: 500 });
+  }
+}
+````
+
+## File: app/api/generate-zip/route.ts
+````typescript
+// app/api/generate-zip/route.ts
+
+import { NextResponse } from "next/server";
+import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import JSZip from "jszip";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+
+// ⚠️ Pour typer proprement le cast à la fin
+type BodyInitCompat = BodyInit | null | undefined;
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+function getAdminApp() {
+  if (getApps().length) return getApps()[0];
+
+  const projectId = process.env.FIREBASE_ADMIN_PROJECT_ID || process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_ADMIN_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.FIREBASE_ADMIN_PRIVATE_KEY;
+
+  if (projectId && clientEmail && privateKeyRaw) {
+    const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+    return initializeApp({
+      credential: cert({ projectId, clientEmail, privateKey }),
+    });
+  }
+
+  return initializeApp({
+    credential: applicationDefault(),
+  });
+}
+
+async function requireUser(req: Request) {
+  getAdminApp();
+
+  const authHeader = req.headers.get("authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+
+  if (!token) {
+    return { ok: false as const, status: 401, error: "Missing Authorization Bearer token" };
+  }
+
+  try {
+    const decoded = await getAuth().verifyIdToken(token);
+    return { ok: true as const, uid: decoded.uid, email: decoded.email || "" };
+  } catch (e) {
+    console.error("verifyIdToken error:", e);
+    return { ok: false as const, status: 401, error: "Invalid token" };
+  }
+}
+
+async function consumeCreditsAndLog(params: {
+  uid: string;
+  email: string;
+  cost: number; // ex 2
+  tool: string; // generateCvLmZip
+  docType: "cv" | "lm" | "other";
+  meta?: any;
+}) {
+  getAdminApp();
+  const db = getFirestore();
+
+  const userRef = db.collection("users").doc(params.uid);
+  const usageRef = db.collection("usageLogs").doc();
+  const now = Date.now();
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const data = snap.exists ? snap.data() || {} : {};
+    const currentCredits = typeof data.credits === "number" ? data.credits : 0;
+
+    if (currentCredits < params.cost) {
+      const err: any = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      throw err;
+    }
+
+    tx.set(
+      userRef,
+      {
+        credits: currentCredits - params.cost,
+        totalIaCalls: FieldValue.increment(1),
+        totalDocumentsGenerated: FieldValue.increment(2), // zip = 2 docs (cv + lm)
+        totalCvGenerated: FieldValue.increment(1),
+        totalLmGenerated: FieldValue.increment(1),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    tx.set(
+      usageRef,
+      {
+        userId: params.uid,
+        email: params.email || "",
+        action: "generate_document",
+        docType: params.docType,
+        eventType: "generate",
+        tool: params.tool,
+        creditsDelta: -params.cost,
+        meta: params.meta || null,
+        createdAt: now,
+        createdAtServer: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+function buildProfileContextForIA(profile: any) {
+  const p = profile || {};
+
+  let skillsArr: any[] = [];
+  if (Array.isArray(p.skills)) {
+    skillsArr = p.skills;
+  } else if (p.skills && typeof p.skills === "object") {
+    if (Array.isArray(p.skills.sections)) {
+      p.skills.sections.forEach((sec: any) => {
+        if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
+      });
+    }
+    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
+  }
+
+  const skillsStr = (skillsArr || []).join(", ");
+
+  const expStr = Array.isArray(p.experiences)
+    ? p.experiences
+        .map(
+          (e: any) =>
+            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
+        )
+        .join("; \n")
+    : "";
+
+  const eduStr = Array.isArray(p.education)
+    ? p.education
+        .map((e: any) => `${e.degree || e.title || ""} - ${e.school || e.institution || ""} (${e.dates || ""})`)
+        .join("; \n")
+    : "";
+
+  return `Nom: ${p.fullName || p.name || ""}
+Titre: ${p.profileHeadline || p.title || ""}
+Contact: ${p.email || ""} | ${p.phone || ""} | ${p.linkedin || ""} | ${p.city || ""}
+Résumé de profil: ${p.profileSummary || p.summary || ""}
+Compétences: ${skillsStr}
+Expériences: 
+${expStr}
+Formations: 
+${eduStr}
+Certifications: ${p.certs || ""}
+Langues: ${p.langLine || p.lang || ""}`.trim();
+}
+
+async function callGeminiText(
+  prompt: string,
+  apiKey: string,
+  temperature = 0.65,
+  maxOutputTokens = 1400
+) {
+  const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature, maxOutputTokens },
+  };
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const errorText = await resp.text();
+    throw new Error("Erreur Gemini (texte): " + errorText);
+  }
+
+  const data = await resp.json();
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const text = parts
+    .map((p: any) => (typeof p.text === "string" ? p.text : ""))
+    .join("\n")
+    .trim();
+
+  if (!text) throw new Error("Réponse Gemini (texte) vide");
+  return text;
+}
+
+function buildFallbackLetterBody(profile: any, jobTitle: string, companyName: string, lang: string) {
+  const p = profile || {};
+  const primaryDomain = p.primaryDomain || "";
+  const summary = p.profileSummary || "";
+  const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
+  const role = firstExp?.role || firstExp?.title || "";
+  const company = firstExp?.company || "";
+  const years = Array.isArray(p.experiences) && p.experiences.length > 0 ? p.experiences.length : null;
+
+  if (lang === "en") {
+    return `I am writing to express my interest in the position of ${jobTitle || "your advertised role"} at ${
+      companyName || "your company"
+    }. ${summary || ""}
+
+With ${years ? years + " years of experience" : "solid experience"} in ${primaryDomain || "my field"}, I have developed skills relevant to this opportunity.
+
+In my previous experience at ${company || "my last company"}, I contributed to projects and collaborated with different stakeholders.
+
+I would be delighted to discuss how I can contribute to your team.`;
+  }
+
+  return `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
+    companyName || "votre entreprise"
+  }. ${summary || ""}
+
+Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
+    primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
+  }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
+
+Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`;
+}
+
+async function createSimpleCvPdf(profile: any, options: any) {
+  const { targetJob = "", lang = "fr", contract = "", jobLink = "", jobDescription = "" } = options || {};
+
+  const p = profile || {};
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([595.28, 841.89]); // A4
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const { width, height } = page.getSize();
+  const marginX = 50;
+  let y = height - 60;
+
+  function drawLine(text: string, size = 11, bold = false) {
+    if (!text || y < 50) return;
+    const f = bold ? fontBold : font;
+    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+    y -= size + 4;
+  }
+
+  function drawParagraph(text: string, size = 10) {
+    if (!text) return;
+    const f = font;
+    const maxWidth = width - marginX * 2;
+    const paragraphs = text.split(/\n{2,}/);
+
+    for (const paragraph of paragraphs) {
+      const words = paragraph.split(/\s+/);
+      let line = "";
+
+      for (const w of words) {
+        const testLine = line ? line + " " + w : w;
+        const testWidth = f.widthOfTextAtSize(testLine, size);
+        if (testWidth > maxWidth) {
+          if (y < 50) return;
+          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+          y -= size + 3;
+          line = w;
+        } else {
+          line = testLine;
+        }
+      }
+
+      if (line && y >= 50) {
+        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+        y -= size + 6;
+      }
+      y -= 2;
+    }
+  }
+
+  function drawSectionTitle(title: string) {
+    if (!title || y < 60) return;
+    page.drawText(title, { x: marginX, y, size: 11, font: fontBold, color: rgb(0.08, 0.15, 0.45) });
+    y -= 14;
+  }
+
+  function drawBullet(text: string, size = 9) {
+    if (!text || y < 50) return;
+    const f = font;
+    const bulletX = marginX + 8;
+    const maxWidth = width - marginX * 2 - 10;
+    const words = text.split(/\s+/);
+    let line = "";
+    let firstLine = true;
+
+    for (const w of words) {
+      const testLine = line ? line + " " + w : w;
+      const testWidth = f.widthOfTextAtSize(testLine, size);
+      if (testWidth > maxWidth) {
+        if (y < 50) return;
+        page.drawText(firstLine ? "• " + line : "  " + line, {
+          x: bulletX,
+          y,
+          size,
+          font: f,
+          color: rgb(0.1, 0.12, 0.16),
+        });
+        y -= size + 3;
+        line = w;
+        firstLine = false;
+      } else {
+        line = testLine;
+      }
+    }
+
+    if (line && y >= 50) {
+      page.drawText(firstLine ? "• " + line : "  " + line, {
+        x: bulletX,
+        y,
+        size,
+        font: f,
+        color: rgb(0.1, 0.12, 0.16),
+      });
+      y -= size + 3;
+    }
+  }
+
+  // Header
+  drawLine(p.fullName || "", 16, true);
+  const jobLine = targetJob || contract || p.contractType || (lang === "en" ? "Target position" : "Poste recherché");
+  drawLine(jobLine, 11, false);
+
+  const contactParts = [p.email || "", p.phone || "", p.city || "", p.linkedin || ""].filter(Boolean);
+  if (contactParts.length) drawLine(contactParts.join(" · "), 9, false);
+
+  if (jobLink) drawLine((lang === "en" ? "Job link: " : "Lien de l'offre : ") + jobLink, 8, false);
+
+  y -= 6;
+
+  if (p.profileSummary) {
+    drawSectionTitle(lang === "en" ? "Profile" : "Profil");
+    drawParagraph(p.profileSummary, 9.5);
+    y -= 4;
+  }
+
+  if (p.skills && Array.isArray(p.skills.sections) && p.skills.sections.length) {
+    drawSectionTitle(lang === "en" ? "Key skills" : "Compétences clés");
+    p.skills.sections.forEach((sec: any) => {
+      if (!sec || (!sec.title && !Array.isArray(sec.items))) return;
+      if (sec.title) drawLine(sec.title, 9.5, true);
+      if (Array.isArray(sec.items)) drawParagraph(sec.items.join(" · "), 9);
+      y -= 2;
+    });
+  }
+
+  if (Array.isArray(p.experiences) && p.experiences.length) {
+    drawSectionTitle(lang === "en" ? "Experience" : "Expériences professionnelles");
+    p.experiences.forEach((exp: any) => {
+      if (y < 90) return;
+      const header = [exp.role, exp.company].filter(Boolean).join(" — ");
+      if (header) drawLine(header, 10, true);
+      if (exp.dates) drawLine(exp.dates, 8.5, false);
+      if (Array.isArray(exp.bullets)) exp.bullets.slice(0, 4).forEach((b: string) => drawBullet(b, 8.5));
+      y -= 4;
+    });
+  }
+
+  if (Array.isArray(p.education) && p.education.length && y > 80) {
+    drawSectionTitle(lang === "en" ? "Education" : "Formation");
+    p.education.forEach((ed: any) => {
+      if (y < 60) return;
+      const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
+      if (header) drawLine(header, 9.5, true);
+      if (ed.dates) drawLine(ed.dates, 8.5, false);
+      y -= 4;
+    });
+  }
+
+  if (p.langLine && y > 60) {
+    drawSectionTitle(lang === "en" ? "Languages" : "Langues");
+    drawParagraph(p.langLine, 9);
+  }
+
+  if (Array.isArray(p.hobbies) && p.hobbies.length && y > 60) {
+    drawSectionTitle(lang === "en" ? "Interests" : "Centres d'intérêt");
+    drawParagraph(p.hobbies.join(" · "), 9);
+  }
+
+  const pdfBytes = await pdfDoc.save();
+  return Buffer.from(pdfBytes);
+}
+
+async function createLetterPdf(coverLetter: string, meta: any) {
+  const { jobTitle = "", companyName = "", candidateName = "", lang = "fr" } = meta || {};
+
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([595.28, 841.89]); // A4
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const { width, height } = page.getSize();
+  const marginX = 60;
+  let y = height - 70;
+
+  function drawLine(text: string, size = 11, bold = false) {
+    if (!text || y < 60) return;
+    const f = bold ? fontBold : font;
+    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
+    y -= size + 4;
+  }
+
+  function drawParagraph(text: string, size = 11) {
+    if (!text) return;
+    const f = font;
+    const maxWidth = width - marginX * 2;
+    const paragraphs = text.split(/\n{2,}/);
+
+    for (const paragraph of paragraphs) {
+      const words = paragraph.split(/\s+/);
+      let line = "";
+
+      for (const w of words) {
+        const testLine = line ? line + " " + w : w;
+        const testWidth = f.widthOfTextAtSize(testLine, size);
+        if (testWidth > maxWidth) {
+          if (y < 60) return;
+          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
+          y -= size + 4;
+          line = w;
+        } else {
+          line = testLine;
+        }
+      }
+
+      if (line && y >= 60) {
+        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
+        y -= size + 8;
+      }
+
+      y -= 4;
+    }
+  }
+
+  if (candidateName) drawLine(candidateName, 14, true);
+
+  if (jobTitle || companyName) {
+    const titleLine =
+      lang === "en"
+        ? `Application for ${jobTitle || "the position"} – ${companyName || "Company"}`
+        : `Candidature : ${jobTitle || "poste"} – ${companyName || "Entreprise"}`;
+    drawLine(titleLine, 11, false);
+  }
+
+  y -= 10;
+  drawParagraph(coverLetter, 11);
+
+  const pdfBytes = await pdfDoc.save();
+  return Buffer.from(pdfBytes);
+}
+
+export async function POST(req: Request) {
+  const auth = await requireUser(req);
+  if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
+
+  let body: any = null;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const profile = body?.profile;
+  const targetJob = body?.targetJob || "";
+  const langRaw = body?.lang || "fr";
+  const contract = body?.contract || "";
+  const jobLink = body?.jobLink || "";
+  const jobDescription = body?.jobDescription || "";
+
+  const lm = body?.lm || {};
+  const companyName = lm?.companyName || "";
+  const jobTitle = lm?.jobTitle || targetJob || "";
+  const lmJobDescription = lm?.jobDescription || jobDescription || "";
+  const lmLangRaw = lm?.lang || langRaw;
+
+  const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+  const lmLang = String(lmLangRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+
+  if (!profile) return NextResponse.json({ ok: false, error: "Missing profile" }, { status: 400 });
+
+  // ✅ Débit -2 crédits (CV + LM) + log
+  try {
+    await consumeCreditsAndLog({
+      uid: auth.uid,
+      email: auth.email,
+      cost: 2,
+      tool: "generateCvLmZip",
+      docType: "other",
+      meta: { targetJob, jobTitle, companyName, lang, lmLang },
+    });
+  } catch (e: any) {
+    if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
+      return NextResponse.json({ ok: false, error: "NO_CREDITS" }, { status: 402 });
+    }
+    console.error("consumeCreditsAndLog error:", e);
+    return NextResponse.json({ ok: false, error: "CREDITS_ERROR" }, { status: 500 });
+  }
+
+  // CV PDF
+  let cvBuffer: Buffer;
+  try {
+    cvBuffer = await createSimpleCvPdf(profile, {
+      targetJob,
+      lang,
+      contract,
+      jobLink,
+      jobDescription,
+    });
+  } catch (e: any) {
+    console.error("CV PDF error:", e);
+    return NextResponse.json({ ok: false, error: e?.message || "CV_PDF_ERROR" }, { status: 500 });
+  }
+
+  // LM BODY via Gemini
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+  const cvText = buildProfileContextForIA(profile);
+
+  let coverLetterBody = "";
+
+  if (GEMINI_API_KEY) {
+    const promptLm =
+      lmLang === "en"
+        ? `
+You are a senior career coach and recruiter.
+
+TASK:
+Write ONLY the BODY of a cover letter tailored to the job, using ONLY the provided information (CV + job description).
+
+INPUTS:
+- Job title: "${jobTitle || "the role"}"
+- Company: "${companyName || "your company"}"
+- Job description:
+${lmJobDescription || "—"}
+
+- Candidate profile (source of truth):
+${cvText}
+
+STRICT RULES:
+- Do NOT invent facts (no fake metrics, clients, tools, dates).
+- 3 to 5 paragraphs separated by ONE blank line.
+- No header, no subject line, no greeting, no signature.
+- Output MUST be STRICT JSON only:
+{ "body": "..." }
+`.trim()
+        : `
+Tu es un coach carrières senior et recruteur.
+
+MISSION :
+Rédige UNIQUEMENT le CORPS d’une lettre de motivation adaptée au poste, basée UNIQUEMENT sur les infos fournies (CV + fiche de poste).
+
+ENTRÉES :
+- Intitulé : "${jobTitle || targetJob || "le poste"}"
+- Entreprise : "${companyName || "votre entreprise"}"
+- Fiche de poste :
+${lmJobDescription || "—"}
+
+- Profil candidat :
+${cvText}
+
+RÈGLES :
+- Ne pas inventer (pas de chiffres/clients/technos non présents).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Pas d’en-tête, pas d’objet, pas de salutation, pas de signature.
+- Réponds STRICTEMENT en JSON :
+{ "body": "..." }
+`.trim();
+
+    try {
+      const rawLm = await callGeminiText(promptLm, GEMINI_API_KEY, 0.65, 1400);
+      const cleaned = String(rawLm).replace(/```json|```/gi, "").trim();
+      try {
+        const parsed = JSON.parse(cleaned);
+        coverLetterBody = typeof parsed.body === "string" ? parsed.body.trim() : "";
+      } catch {
+        coverLetterBody = String(rawLm || "").trim();
+      }
+    } catch (e) {
+      console.error("Gemini LM error:", e);
+    }
+  }
+
+  if (!coverLetterBody) {
+    coverLetterBody = buildFallbackLetterBody(profile, jobTitle, companyName, lmLang);
+  }
+
+  // LM PDF
+  let lmBuffer: Buffer;
+  try {
+    lmBuffer = await createLetterPdf(coverLetterBody, {
+      jobTitle,
+      companyName,
+      candidateName: profile.fullName || "",
+      lang: lmLang,
+    });
+  } catch (e: any) {
+    console.error("LM PDF error:", e);
+    return NextResponse.json({ ok: false, error: e?.message || "LM_PDF_ERROR" }, { status: 500 });
+  }
+
+  // ZIP ✅ (avec cast pour calmer TypeScript)
+  try {
+    const zip = new JSZip();
+    zip.file("cv-ia.pdf", cvBuffer);
+    zip.file(lmLang === "en" ? "cover-letter.pdf" : "lettre-motivation.pdf", lmBuffer);
+
+    const zipContent = await zip.generateAsync({ type: "uint8array" });
+
+    return new NextResponse(zipContent as unknown as BodyInitCompat, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Disposition": 'attachment; filename="cv-lm-ia.zip"',
+        "Content-Length": String(zipContent.byteLength),
+      },
+    });
+  } catch (e: any) {
+    console.error("ZIP error:", e);
+    return NextResponse.json({ ok: false, error: e?.message || "ZIP_ERROR" }, { status: 500 });
+  }
+}
 ````
 
 ## File: app/api/interview/route.ts
@@ -16043,1552 +15620,6 @@ export default function CreditsPage() {
         </div>
       )}
     </div>
-  );
-}
-````
-
-## File: app/app/lm/page.tsx
-````typescript
-"use client";
-
-import { logUsage } from "@/lib/logUsage";
-import { useEffect, useMemo, useState, FormEvent } from "react";
-import { motion } from "framer-motion";
-import { auth, db } from "@/lib/firebase";
-import { onAuthStateChanged } from "firebase/auth";
-import { doc, getDoc, collection, addDoc, serverTimestamp } from "firebase/firestore";
-
-// ✅ PDF (génération locale, rendu identique à tes HTML pdfmake)
-import { makePdfColors } from "@/lib/pdf/colors";
-import { fitOnePage } from "@/lib/pdf/fitOnePage";
-import { mergePdfBlobs } from "@/lib/pdf/mergePdfs";
-import { downloadBlob } from "@/lib/pdf/pdfmakeClient";
-import { buildCvAtsPdf, type CvDocModel } from "@/lib/pdf/templates/cvAts";
-import { buildLmStyledPdf, type LmModel } from "@/lib/pdf/templates/letter";
-
-// --- TYPES ---
-
-type CvSkillsSection = { title: string; items: string[] };
-type CvSkills = { sections: CvSkillsSection[]; tools: string[] };
-
-type CvExperience = {
-  company: string;
-  role: string;
-  dates: string;
-  bullets: string[];
-  location?: string;
-};
-
-type CvEducation = {
-  school: string;
-  degree: string;
-  dates: string;
-  location?: string;
-};
-
-type CvProfile = {
-  fullName: string;
-  email: string;
-  phone: string;
-  linkedin: string;
-  profileSummary: string;
-
-  city?: string;
-  address?: string;
-
-  contractType: string;
-  contractTypeStandard?: string;
-  contractTypeFull?: string;
-
-  primaryDomain?: string;
-  secondaryDomains?: string[];
-  softSkills?: string[];
-
-  drivingLicense?: string;
-  vehicle?: string;
-
-  skills: CvSkills;
-  experiences: CvExperience[];
-  education: CvEducation[];
-  educationShort: string[];
-  certs: string;
-  langLine: string;
-  hobbies: string[];
-  updatedAt?: number;
-};
-
-type Lang = "fr" | "en";
-
-// 🔗 ENDPOINT LOCAL (Proxy Next.js)
-// On pointe vers notre API locale pour gérer l'auth proprement
-const LETTER_AND_PITCH_URL = "/api/generateLetterAndPitch";
-
-// =============================
-// ✅ reCAPTCHA Enterprise (client)
-// =============================
-
-const RECAPTCHA_SITE_KEY = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY || "";
-let recaptchaLoadPromise: Promise<void> | null = null;
-
-function loadRecaptchaEnterprise(siteKey: string): Promise<void> {
-  if (typeof window === "undefined") {
-    return Promise.reject(new Error("reCAPTCHA: window indisponible (SSR)."));
-  }
-  if ((window as any).grecaptcha?.enterprise) return Promise.resolve();
-  if (recaptchaLoadPromise) return recaptchaLoadPromise;
-
-  recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
-    const existing = document.querySelector(
-      'script[data-recaptcha-enterprise="true"]'
-    ) as HTMLScriptElement | null;
-
-    if (existing) {
-      const t = window.setInterval(() => {
-        if ((window as any).grecaptcha?.enterprise) {
-          window.clearInterval(t);
-          resolve();
-        }
-      }, 50);
-
-      window.setTimeout(() => {
-        window.clearInterval(t);
-        if (!(window as any).grecaptcha?.enterprise) {
-          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
-        }
-      }, 6000);
-      return;
-    }
-
-    const s = document.createElement("script");
-    s.src = `https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(
-      siteKey
-    )}`;
-    s.async = true;
-    s.defer = true;
-    s.setAttribute("data-recaptcha-enterprise", "true");
-
-    s.onload = () => {
-      const t = window.setInterval(() => {
-        if ((window as any).grecaptcha?.enterprise) {
-          window.clearInterval(t);
-          resolve();
-        }
-      }, 50);
-
-      window.setTimeout(() => {
-        window.clearInterval(t);
-        if (!(window as any).grecaptcha?.enterprise) {
-          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
-        }
-      }, 6000);
-    };
-
-    s.onerror = () =>
-      reject(new Error("Impossible de charger reCAPTCHA Enterprise."));
-    document.head.appendChild(s);
-  });
-
-  return recaptchaLoadPromise;
-}
-
-async function getRecaptchaToken(action: string): Promise<string> {
-  if (!RECAPTCHA_SITE_KEY) {
-    throw new Error("reCAPTCHA: NEXT_PUBLIC_RECAPTCHA_SITE_KEY manquante.");
-  }
-
-  await loadRecaptchaEnterprise(RECAPTCHA_SITE_KEY);
-
-  const g = (window as any).grecaptcha;
-  if (!g?.enterprise?.ready || !g?.enterprise?.execute) {
-    throw new Error(
-      "reCAPTCHA Enterprise indisponible (grecaptcha.enterprise manquant)."
-    );
-  }
-
-  await new Promise<void>((resolve) => g.enterprise.ready(() => resolve()));
-  const token = await g.enterprise.execute(RECAPTCHA_SITE_KEY, { action });
-
-  if (!token || typeof token !== "string") {
-    throw new Error("reCAPTCHA: token vide.");
-  }
-  return token;
-}
-
-// =============================
-// ✅ Helpers (texte & PDF locaux)
-// =============================
-
-function safeText(v: any) {
-  return String(v ?? "").trim();
-}
-
-function buildContactLine(p: CvProfile) {
-  const parts: string[] = [];
-  if (p.city) parts.push(safeText(p.city));
-  if (p.phone) parts.push(safeText(p.phone));
-  if (p.email) parts.push(safeText(p.email));
-  if (p.linkedin) parts.push(safeText(p.linkedin));
-  return parts.filter(Boolean).join(" | ");
-}
-
-function categorizeSkills(profile: CvProfile) {
-  const cloud: string[] = [];
-  const sec: string[] = [];
-  const sys: string[] = [];
-  const auto: string[] = [];
-  const tools: string[] = [];
-  const soft: string[] = Array.isArray(profile.softSkills) ? profile.softSkills : [];
-
-  const sections = profile.skills?.sections || [];
-  for (const s of sections) {
-    const title = (s?.title || "").toLowerCase();
-    const items = (s?.items || []).filter(Boolean);
-
-    const pushAll = (arr: string[], vals: string[]) => vals.forEach((x) => arr.push(x));
-
-    if (title.includes("cloud") || title.includes("azure") || title.includes("aws") || title.includes("gcp")) {
-      pushAll(cloud, items);
-    } else if (title.includes("sécu") || title.includes("secu") || title.includes("security") || title.includes("cyber")) {
-      pushAll(sec, items);
-    } else if (
-      title.includes("réseau") ||
-      title.includes("reseau") ||
-      title.includes("system") ||
-      title.includes("système") ||
-      title.includes("sys")
-    ) {
-      pushAll(sys, items);
-    } else if (title.includes("autom") || title.includes("devops") || title.includes("ia") || title.includes("api")) {
-      pushAll(auto, items);
-    } else {
-      pushAll(tools, items);
-    }
-  }
-
-  const extraTools = Array.isArray(profile.skills?.tools) ? profile.skills.tools : [];
-  extraTools.forEach((t) => tools.push(t));
-
-  const uniq = (arr: string[]) => Array.from(new Set(arr.map((x) => safeText(x)).filter(Boolean)));
-
-  return {
-    cloud: uniq(cloud),
-    sec: uniq(sec),
-    sys: uniq(sys),
-    auto: uniq(auto),
-    tools: uniq(tools),
-    soft: uniq(soft),
-  };
-}
-
-function profileToCvDocModel(profile: CvProfile, params: { targetJob: string; contract: string }): CvDocModel {
-  const titleParts: string[] = [];
-  if (params.targetJob?.trim()) titleParts.push(params.targetJob.trim());
-  if (params.contract?.trim()) titleParts.push(params.contract.trim());
-  const title = titleParts.length ? titleParts.join(" — ") : (profile.contractType || "Candidature");
-
-  const skills = categorizeSkills(profile);
-
-  const xp = (profile.experiences || []).map((x) => ({
-    company: safeText(x.company),
-    city: safeText(x.location || ""),
-    role: safeText(x.role),
-    dates: safeText(x.dates),
-    bullets: Array.isArray(x.bullets) ? x.bullets.map(safeText).filter(Boolean) : [],
-  }));
-
-  const educationLines =
-    Array.isArray(profile.educationShort) && profile.educationShort.length
-      ? profile.educationShort.map(safeText).filter(Boolean)
-      : (profile.education || []).map((e) => {
-          const a = safeText(e.degree);
-          const b = safeText(e.school);
-          const c = safeText(e.dates);
-          const d = safeText(e.location || "");
-          return [a, b, c, d].filter(Boolean).join(" — ");
-        });
-
-  return {
-    name: safeText(profile.fullName) || safeText(profile.email) || "Candidat",
-    title,
-    contactLine: buildContactLine(profile),
-    profile: safeText(profile.profileSummary),
-    skills,
-    xp,
-    education: educationLines,
-    certs: safeText(profile.certs),
-    langLine: safeText(profile.langLine),
-    hobbies: Array.isArray(profile.hobbies) ? profile.hobbies.map(safeText).filter(Boolean) : [],
-  };
-}
-
-// --- Pour que l’IA écrive une VRAIE lettre (expériences, résultats, outils) ---
-function buildCandidateHighlights(profile: CvProfile) {
-  const topXp = (profile.experiences || []).slice(0, 3).map((xp, i) => {
-    const bullets = (xp.bullets || []).slice(0, 4).map((b) => `- ${b}`).join("\n");
-    return `EXP${i + 1}: ${xp.role} @ ${xp.company} (${xp.dates}${xp.location ? `, ${xp.location}` : ""})
-${bullets}`;
-  });
-
-  const skillLines = (profile.skills?.sections || [])
-    .slice(0, 4)
-    .map((s) => `${s.title}: ${(s.items || []).slice(0, 10).join(", ")}`);
-
-  const tools = (profile.skills?.tools || []).slice(0, 18);
-
-  return `
-CANDIDATE_NAME: ${profile.fullName}
-SUMMARY: ${profile.profileSummary}
-
-TOP_EXPERIENCES:
-${topXp.join("\n\n")}
-
-KEY_SKILLS:
-${skillLines.join("\n")}
-
-TOOLS:
-${tools.join(", ")}
-
-CERTS: ${profile.certs}
-LANGS: ${profile.langLine}
-`.trim();
-}
-
-function buildJobDescWithInstructions(args: {
-  jobDescription: string;
-  lang: Lang;
-  jobTitle: string;
-  companyName: string;
-  jobLink: string;
-  profile: CvProfile;
-}) {
-  const base = (args.jobDescription || "").trim();
-
-  const instrFR = `
----
-INSTRUCTIONS IMPORTANTES (à respecter):
-- Rédige une lettre de motivation PERSONNALISÉE et crédible.
-- Utilise explicitement 2 à 3 expériences ci-dessous (réalisations / responsabilités).
-- Mets en avant compétences + outils pertinents pour le poste.
-- Adapte le discours à l'entreprise "${args.companyName}" et au poste "${args.jobTitle}".
-- Ton: professionnel, concret, pas de blabla.
-- Longueur: 220 à 320 mots (≈ 1 page A4).
-- Structure: 3 à 4 paragraphes.
-- Termine par une phrase d’appel à entretien.
-- IMPORTANT: Retourne UNIQUEMENT le CORPS de la lettre (pas d’en-tête, pas d’adresse, pas de signature).
-
-OFFRE_URL: ${args.jobLink || "(non fournie)"}
-
-PROFIL (à utiliser):
-${buildCandidateHighlights(args.profile)}
-`.trim();
-
-  const instrEN = `
----
-IMPORTANT INSTRUCTIONS:
-- Write a REAL, tailored cover letter (credible, specific).
-- Explicitly use 2–3 experiences below (achievements/responsibilities).
-- Highlight relevant skills + tools for the role.
-- Adapt to company "${args.companyName}" and role "${args.jobTitle}".
-- Tone: professional, concrete, no fluff.
-- Length: 220–320 words (~1 A4 page).
-- Structure: 3–4 paragraphs.
-- End with a clear interview call-to-action.
-- IMPORTANT: Return ONLY the BODY (no header, no address, no signature).
-
-JOB_URL: ${args.jobLink || "(not provided)"}
-
-PROFILE (use it):
-${buildCandidateHighlights(args.profile)}
-`.trim();
-
-  const injected = args.lang === "fr" ? instrFR : instrEN;
-  if (!base) return injected;
-  return `${base}\n\n${injected}`;
-}
-
-function extractBodyFromLetterText(letterText: string, lang: Lang, fullName: string) {
-  const raw = safeText(letterText);
-  if (!raw) return "";
-
-  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  if (!lines.length) return raw;
-
-  const first = lines[0].toLowerCase();
-  const isGreeting =
-    (lang === "fr" && (first.startsWith("madame") || first.startsWith("bonjour"))) ||
-    (lang === "en" && (first.startsWith("dear") || first.startsWith("hello")));
-
-  if (isGreeting) lines.shift();
-
-  while (lines.length) {
-    const last = lines[lines.length - 1].toLowerCase();
-    if (
-      last.includes("cordialement") ||
-      last.includes("bien cordialement") ||
-      last.includes("salutations") ||
-      last.includes("sincerely") ||
-      last.includes("best regards") ||
-      last.includes("kind regards")
-    ) {
-      lines.pop();
-      continue;
-    }
-    if (fullName && last.includes(fullName.toLowerCase())) {
-      lines.pop();
-      continue;
-    }
-    break;
-  }
-
-  const body = lines.join("\n\n").trim();
-  return body || raw;
-}
-
-function buildLmModel(profile: CvProfile, lang: Lang, companyName: string, jobTitle: string, letterText: string): LmModel {
-  const name = safeText(profile.fullName) || "Candidat";
-  const contactLines: string[] = [];
-  if (profile.phone) contactLines.push(lang === "fr" ? `Téléphone : ${safeText(profile.phone)}` : `Phone: ${safeText(profile.phone)}`);
-  if (profile.email) contactLines.push(lang === "fr" ? `Email : ${safeText(profile.email)}` : `Email: ${safeText(profile.email)}`);
-  if (profile.linkedin) contactLines.push(lang === "fr" ? `LinkedIn : ${safeText(profile.linkedin)}` : `LinkedIn: ${safeText(profile.linkedin)}`);
-
-  const city = safeText(profile.city) || "Paris";
-  const dateStr =
-    lang === "fr"
-      ? new Date().toLocaleDateString("fr-FR")
-      : new Date().toLocaleDateString("en-GB");
-
-  const subject =
-    lang === "fr"
-      ? `Objet : Candidature – ${jobTitle || "poste"}`
-      : `Subject: Application – ${jobTitle || "role"}`;
-
-  const salutation = lang === "fr" ? "Madame, Monsieur," : "Dear Hiring Manager,";
-  const closing = lang === "fr" ? "Cordialement," : "Sincerely,";
-
-  const body = extractBodyFromLetterText(letterText, lang, name);
-
-  return {
-    lang,
-    name,
-    contactLines,
-    service: lang === "fr" ? "Service Recrutement" : "Recruitment Team",
-    companyName: safeText(companyName) || (lang === "fr" ? "Entreprise" : "Company"),
-    companyAddr: "",
-    city,
-    dateStr,
-    subject,
-    salutation,
-    body: body || safeText(letterText),
-    closing,
-    signature: name,
-  };
-}
-
-// =============================
-// PAGE
-// =============================
-
-export default function AssistanceCandidaturePage() {
-  // --- PROFIL CV IA ---
-  const [userId, setUserId] = useState<string | null>(null);
-  const [userEmail, setUserEmail] = useState<string | null>(null);
-  const [profile, setProfile] = useState<CvProfile | null>(null);
-  const [loadingProfile, setLoadingProfile] = useState(true);
-
-  // Bandeau global "IA en cours"
-  const [globalLoadingMessage, setGlobalLoadingMessage] = useState<string | null>(null);
-
-  useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (user) => {
-      if (!user) {
-        setUserId(null);
-        setUserEmail(null);
-        setProfile(null);
-        setLoadingProfile(false);
-        return;
-      }
-
-      setUserId(user.uid);
-      setUserEmail(user.email ?? null);
-
-      try {
-        const ref = doc(db, "profiles", user.uid);
-        const snap = await getDoc(ref);
-
-        if (snap.exists()) {
-          const data = snap.data() as any;
-
-          const loadedProfile: CvProfile = {
-            fullName: data.fullName || "",
-            email: data.email || "",
-            phone: data.phone || "",
-            linkedin: data.linkedin || "",
-            profileSummary: data.profileSummary || "",
-            city: data.city || "",
-            address: data.address || "",
-            contractType: data.contractType || data.contractTypeStandard || "",
-            contractTypeStandard: data.contractTypeStandard || "",
-            contractTypeFull: data.contractTypeFull || "",
-            primaryDomain: data.primaryDomain || "",
-            secondaryDomains: Array.isArray(data.secondaryDomains) ? data.secondaryDomains : [],
-            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
-            drivingLicense: data.drivingLicense || "",
-            vehicle: data.vehicle || "",
-            skills: {
-              sections: Array.isArray(data.skills?.sections) ? data.skills.sections : [],
-              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
-            },
-            experiences: Array.isArray(data.experiences) ? data.experiences : [],
-            education: Array.isArray(data.education) ? data.education : [],
-            educationShort: Array.isArray(data.educationShort) ? data.educationShort : [],
-            certs: data.certs || "",
-            langLine: data.langLine || "",
-            hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
-            updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : undefined,
-          };
-
-          setProfile(loadedProfile);
-        } else {
-          setProfile(null);
-        }
-      } catch (e) {
-        console.error("Erreur chargement profil Firestore (assistance):", e);
-      } finally {
-        setLoadingProfile(false);
-      }
-    });
-
-    return () => unsub();
-  }, []);
-
-  // --- ÉTATS CV IA ---
-  const [cvTargetJob, setCvTargetJob] = useState("");
-  const [cvTemplate, setCvTemplate] = useState("ats");
-  const [cvLang, setCvLang] = useState<Lang>("fr");
-  const [cvContract, setCvContract] = useState("CDI");
-  const [cvJobLink, setCvJobLink] = useState("");
-  const [cvJobDesc, setCvJobDesc] = useState("");
-  const [cvAutoCreate, setCvAutoCreate] = useState(true);
-
-  const [cvLoading, setCvLoading] = useState(false);
-  const [cvZipLoading, setCvZipLoading] = useState(false);
-  const [cvStatus, setCvStatus] = useState<string | null>(null);
-  const [cvError, setCvError] = useState<string | null>(null);
-
-  // ✅ Couleur PDF (rouge par défaut)
-  const [pdfBrand, setPdfBrand] = useState("#ef4444"); // 🔴 rouge
-
-  // --- ÉTATS LETTRE DE MOTIVATION ---
-  const [lmLang, setLmLang] = useState<Lang>("fr");
-  const [companyName, setCompanyName] = useState("");
-  const [jobTitle, setJobTitle] = useState("");
-  const [jobDescription, setJobDescription] = useState("");
-  const [jobLink, setJobLink] = useState("");
-  const [letterText, setLetterText] = useState("");
-  const [lmLoading, setLmLoading] = useState(false);
-  const [lmError, setLmError] = useState<string | null>(null);
-  const [letterCopied, setLetterCopied] = useState(false);
-  const [lmPdfLoading, setLmPdfLoading] = useState(false);
-  const [lmPdfError, setLmPdfError] = useState<string | null>(null);
-
-  // --- ÉTATS PITCH ---
-  const [pitchLang, setPitchLang] = useState<Lang>("fr");
-  const [pitchText, setPitchText] = useState("");
-  const [pitchLoading, setPitchLoading] = useState(false);
-  const [pitchError, setPitchError] = useState<string | null>(null);
-  const [pitchCopied, setPitchCopied] = useState(false);
-
-  // --- MAIL ---
-  const [recruiterName, setRecruiterName] = useState("");
-  const [emailPreview, setEmailPreview] = useState("");
-  const [subjectPreview, setSubjectPreview] = useState("");
-
-  // --- DERIVÉS ---
-  const visibilityLabel = userId ? "Associé à ton compte" : "Invité";
-
-  const miniHeadline =
-    profile?.profileSummary?.split(".")[0] ||
-    profile?.contractType ||
-    "Analyse ton CV PDF dans l’onglet « CV IA » pour activer l’assistant.";
-
-  const profileName = profile?.fullName || userEmail || "Profil non détecté";
-
-  const targetedJob = jobTitle || cvTargetJob || "Poste cible non renseigné";
-  const targetedCompany = companyName || "Entreprise non renseignée";
-
-  // --- Auto create /applications ---
-  type GenerationKind = "cv" | "cv_lm" | "lm" | "pitch";
-
-  const autoCreateApplication = async (kind: GenerationKind) => {
-    if (!cvAutoCreate) return;
-    if (!userId || !profile) return;
-
-    try {
-      const appsRef = collection(db, "applications");
-      await addDoc(appsRef, {
-        userId,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-        company: companyName || "",
-        jobTitle: jobTitle || cvTargetJob || "",
-        jobLink: jobLink || cvJobLink || "",
-        status: "draft",
-        source: "Assistant candidature IA",
-        hasCv: kind === "cv" || kind === "cv_lm",
-        hasLm: kind === "lm" || kind === "cv_lm",
-        hasPitch: kind === "pitch",
-        langCv: cvLang,
-        langLm: lmLang,
-        langPitch: pitchLang,
-      });
-    } catch (e) {
-      console.error("Erreur création entrée suivi de candidature :", e);
-    }
-  };
-
-  // =============================
-  // ✅ Génération IA (lettre / pitch) - MODIFIÉ POUR TOKEN
-  // =============================
-
-  const generateCoverLetterText = async (lang: Lang): Promise<string> => {
-    if (!profile) throw new Error("Profil manquant.");
-    if (!jobTitle && !jobDescription) {
-      throw new Error("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
-    }
-
-    // 1. Récupérer l'utilisateur pour le token
-    const user = auth.currentUser;
-    if (!user) throw new Error("Vous devez être connecté pour générer une lettre.");
-    
-    // 2. Récupérer le token Auth
-    const token = await user.getIdToken();
-
-    const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
-
-    // ✅ injection pour forcer une VRAIE lettre (expériences, outils, concret)
-    const enrichedJobDescription = buildJobDescWithInstructions({
-      jobDescription,
-      lang,
-      jobTitle,
-      companyName,
-      jobLink,
-      profile,
-    });
-
-    // 3. Appel vers l'API locale avec le TOKEN dans les headers
-    const resp = await fetch(LETTER_AND_PITCH_URL, {
-      method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}` // <--- CLÉ DE L'AUTHENTIFICATION
-      },
-      body: JSON.stringify({
-        profile,
-        jobTitle,
-        companyName,
-        jobDescription: enrichedJobDescription,
-        lang,
-        recaptchaToken,
-      }),
-    });
-
-    const json = await resp.json().catch(() => null);
-    if (!resp.ok) {
-      const msg = (json && json.error) || "Erreur pendant la génération de la lettre de motivation.";
-      throw new Error(msg);
-    }
-
-    const coverLetter = typeof json.coverLetter === "string" ? json.coverLetter.trim() : "";
-    if (!coverLetter) throw new Error("Lettre vide renvoyée par l'API.");
-    return coverLetter;
-  };
-
-  // =============================
-  // ✅ PDF locaux (CV + LM)
-  // =============================
-
-  const colors = useMemo(() => makePdfColors(pdfBrand), [pdfBrand]);
-
-  const handleGenerateCv = async () => {
-    if (!profile) {
-      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
-      return;
-    }
-
-    setCvError(null);
-    setCvStatus(null);
-    setCvLoading(true);
-    setGlobalLoadingMessage("Mise en page du CV (1 page)…");
-
-    try {
-      if (cvTemplate !== "ats") {
-        setCvStatus("Note : génération locale disponible en ATS (sobre) pour le moment.");
-      }
-
-      const cvModel: CvDocModel = profileToCvDocModel(profile, {
-        targetJob: cvTargetJob,
-        contract: cvContract,
-      });
-
-      const { blob, bestScale } = await fitOnePage((scale) =>
-        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
-      );
-
-      downloadBlob(blob, "cv-ia.pdf");
-      setCvStatus(`CV généré (1 page) ✅ (scale=${bestScale.toFixed(2)})`);
-
-      await autoCreateApplication("cv");
-
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_document",
-          docType: "cv",
-          eventType: "generate",
-          tool: "clientPdfMakeCv",
-        });
-      }
-    } catch (err: any) {
-      console.error("Erreur génération CV locale:", err);
-      setCvError(err?.message || "Impossible de générer le CV pour le moment.");
-    } finally {
-      setCvLoading(false);
-      setGlobalLoadingMessage(null);
-    }
-  };
-
-  const handleGenerateCvLmPdf = async () => {
-    if (!profile) {
-      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
-      return;
-    }
-
-    setCvError(null);
-    setCvStatus(null);
-    setCvZipLoading(true);
-    setGlobalLoadingMessage("Mise en page CV + lettre (1 page + 1 page)…");
-
-    try {
-      // 1) CV
-      const cvModel: CvDocModel = profileToCvDocModel(profile, {
-        targetJob: cvTargetJob,
-        contract: cvContract,
-      });
-
-      const cvFit = await fitOnePage((scale) =>
-        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
-      );
-
-      // 2) Lettre : si pas encore générée -> IA
-      let cover = letterText?.trim();
-      if (!cover) {
-        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
-        cover = await generateCoverLetterText(lmLang);
-        setLetterText(cover);
-      }
-
-      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
-
-      const lmFit = await fitOnePage(
-        (scale) => buildLmStyledPdf(lmModel, colors, scale),
-        { min: 0.85, max: 1.6, iterations: 7, initial: 1.0 }
-      );
-
-      // 3) Fusion -> 2 pages
-      const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
-      downloadBlob(merged, "cv-lm-ia.pdf");
-
-      setCvStatus("CV (1 page) + LM (1 page) générés ✅ (PDF 2 pages)");
-      await autoCreateApplication("cv_lm");
-
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_document",
-          docType: "cv",
-          eventType: "generate",
-          tool: "clientPdfMakeCvLm",
-        });
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_document",
-          docType: "lm",
-          eventType: "generate",
-          tool: "clientPdfMakeCvLm",
-          creditsDelta: 0,
-        });
-      }
-    } catch (err: any) {
-      console.error("Erreur génération CV+LM locale:", err);
-      setCvError(err?.message || "Impossible de générer CV + LM pour le moment.");
-    } finally {
-      setCvZipLoading(false);
-      setGlobalLoadingMessage(null);
-    }
-  };
-
-  // --- ACTIONS LETTRE ---
-  const handleGenerateLetter = async (e?: FormEvent) => {
-    if (e) e.preventDefault();
-    if (!profile) {
-      setLmError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
-      return;
-    }
-    if (!jobTitle && !jobDescription) {
-      setLmError("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
-      return;
-    }
-
-    setLmError(null);
-    setLmPdfError(null);
-    setPitchError(null);
-    setLmLoading(true);
-    setLetterCopied(false);
-    setGlobalLoadingMessage("L’IA rédige ta lettre de motivation…");
-
-    try {
-      const coverLetter = await generateCoverLetterText(lmLang);
-      setLetterText(coverLetter);
-
-      await autoCreateApplication("lm");
-
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_document",
-          docType: "lm",
-          eventType: "generate",
-          tool: "generateLetterAndPitch",
-        });
-      }
-    } catch (err: any) {
-      console.error("Erreur generateLetter:", err);
-      setLmError(err?.message || "Impossible de générer la lettre de motivation pour le moment.");
-    } finally {
-      setLmLoading(false);
-      setGlobalLoadingMessage(null);
-    }
-  };
-
-  // ✅ PDF LM local (auto-génère si texte vide)
-  const handleDownloadLetterPdf = async () => {
-    if (!profile) {
-      setLmPdfError("Profil manquant.");
-      return;
-    }
-    if (!jobTitle && !jobDescription && !letterText) {
-      setLmPdfError("Renseigne au moins le poste ou colle un extrait d’offre, puis génère/télécharge.");
-      return;
-    }
-
-    setLmPdfError(null);
-    setLmPdfLoading(true);
-    setGlobalLoadingMessage("Mise en forme PDF (lettre 1 page)…");
-
-    try {
-      let cover = letterText?.trim();
-      if (!cover) {
-        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
-        cover = await generateCoverLetterText(lmLang);
-        setLetterText(cover);
-      }
-
-      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
-
-      const { blob } = await fitOnePage(
-        (scale) => buildLmStyledPdf(lmModel, colors, scale),
-        { min: 0.85, max: 1.6, iterations: 7, initial: 1.0 }
-      );
-
-      downloadBlob(blob, "lettre-motivation.pdf");
-
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "download_pdf",
-          docType: "other",
-          eventType: "lm_pdf_download",
-          tool: "clientPdfMakeLm",
-        });
-      }
-    } catch (err: any) {
-      console.error("Erreur LM PDF (local):", err);
-      setLmPdfError(err?.message || "Impossible de générer le PDF pour le moment.");
-    } finally {
-      setLmPdfLoading(false);
-      setGlobalLoadingMessage(null);
-    }
-  };
-
-  const handleCopyLetter = async () => {
-    if (!letterText) return;
-    try {
-      await navigator.clipboard.writeText(letterText);
-      setLetterCopied(true);
-      setTimeout(() => setLetterCopied(false), 1500);
-    } catch (e) {
-      console.error("Erreur copie LM:", e);
-    }
-  };
-
-  // --- PITCH ---
-  const handleGeneratePitch = async () => {
-    if (!profile) {
-      setPitchError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
-      return;
-    }
-
-    const effectiveJobTitle = jobTitle || cvTargetJob || "Candidature cible";
-    const effectiveDesc = jobDescription || cvJobDesc || "";
-
-    setPitchError(null);
-    setPitchLoading(true);
-    setPitchCopied(false);
-    setGlobalLoadingMessage("L’IA prépare ton pitch d’ascenseur…");
-
-    try {
-      // 1. Récupérer User + Token
-      const user = auth.currentUser;
-      if (!user) throw new Error("Connecte-toi pour générer un pitch.");
-      const token = await user.getIdToken();
-
-      const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
-
-      // 2. Appel API Locale avec Token
-      const resp = await fetch(LETTER_AND_PITCH_URL, {
-        method: "POST",
-        headers: { 
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}` 
-        },
-        body: JSON.stringify({
-          profile,
-          jobTitle: effectiveJobTitle,
-          companyName,
-          jobDescription: effectiveDesc,
-          lang: pitchLang,
-          recaptchaToken,
-        }),
-      });
-
-      const json = await resp.json().catch(() => null);
-
-      if (!resp.ok) {
-        const msg = (json && json.error) || "Erreur pendant la génération du pitch.";
-        throw new Error(msg);
-      }
-
-      const pitch = typeof json.pitch === "string" ? json.pitch.trim() : "";
-      if (!pitch) throw new Error("Pitch vide renvoyé par l'API.");
-
-      setPitchText(pitch);
-      await autoCreateApplication("pitch");
-
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_pitch",
-          docType: "other",
-          eventType: "generate",
-          tool: "generateLetterAndPitch",
-        });
-      }
-    } catch (err: any) {
-      console.error("Erreur generatePitch:", err);
-      setPitchError(err?.message || "Impossible de générer le pitch pour le moment.");
-    } finally {
-      setPitchLoading(false);
-      setGlobalLoadingMessage(null);
-    }
-  };
-
-  const handleCopyPitch = async () => {
-    if (!pitchText) return;
-    try {
-      await navigator.clipboard.writeText(pitchText);
-      setPitchCopied(true);
-      setTimeout(() => setPitchCopied(false), 1500);
-    } catch (e) {
-      console.error("Erreur copie pitch:", e);
-    }
-  };
-
-  // --- MAIL ---
-  const buildEmailContent = () => {
-    const name = profile?.fullName || "Je";
-    const subject = `Candidature – ${jobTitle || "poste"} – ${name}`;
-    const recruiter = recruiterName.trim() || "Madame, Monsieur";
-
-    const body = `Bonjour ${recruiter},
-
-Je me permets de vous adresser ma candidature pour le poste de ${jobTitle || "..."} au sein de ${
-      companyName || "votre entreprise"
-    }.
-
-Vous trouverez ci-joint mon CV ainsi que ma lettre de motivation.
-Mon profil correspond particulièrement à vos attentes sur ce poste, et je serais ravi(e) d'échanger avec vous pour en discuter de vive voix.
-
-Je reste bien entendu disponible pour tout complément d'information.
-
-Cordialement,
-
-${name}
-`;
-
-    setSubjectPreview(subject);
-    setEmailPreview(body);
-  };
-
-  const handleGenerateEmail = (e: FormEvent) => {
-    e.preventDefault();
-    buildEmailContent();
-  };
-
-  // --- RENDER ---
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.25 }}
-      className="max-w-3xl mx-auto px-3 sm:px-4 py-5 sm:py-6 space-y-4"
-    >
-      {/* Bandeau global IA */}
-      {globalLoadingMessage && (
-        <div className="mb-2 rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-1.5 text-[11px] flex items-center gap-2 text-[var(--muted)]">
-          <span className="inline-flex w-3 h-3 rounded-full border-2 border-[var(--brand)] border-t-transparent animate-spin" />
-          <span>{globalLoadingMessage}</span>
-        </div>
-      )}
-
-      {/* HEADER */}
-      <section className="space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="badge-muted flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-            <span className="text-[11px] uppercase tracking-wider text-[var(--muted)]">
-              Assistant de candidature IA
-            </span>
-          </p>
-          <div className="flex flex-wrap gap-2 text-[11px]">
-            <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
-              Profil IA :{" "}
-              <span className="ml-1 font-medium">
-                {loadingProfile ? "Chargement…" : profile ? "Détecté ✅" : "Non détecté"}
-              </span>
-            </span>
-            <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
-              Visibilité : <span className="ml-1 font-medium">{visibilityLabel}</span>
-            </span>
-          </div>
-        </div>
-
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="space-y-1">
-            <h1 className="text-lg sm:text-xl font-semibold">Prépare ta candidature avec ton CV IA</h1>
-            <p className="text-[12px] text-[var(--muted)] max-w-xl">
-              Génère un <strong>CV 1 page</strong>, une <strong>lettre de motivation</strong> (1 page), un{" "}
-              <strong>pitch</strong> et un <strong>mail</strong>.
-            </p>
-          </div>
-
-          <div className="w-full sm:w-[220px] rounded-2xl border border-[var(--border)] bg-[var(--bg-soft)] px-3 py-2.5 text-[11px]">
-            <p className="text-[var(--muted)] mb-1">Résumé du profil</p>
-            <p className="font-semibold text-[var(--ink)] leading-tight">{profileName}</p>
-            <p className="mt-0.5 text-[var(--muted)] line-clamp-2">{miniHeadline}</p>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap gap-1.5 text-[11px]">
-          {[
-            "Cible le poste",
-            "Génère CV & LM",
-            "Prépare ton pitch",
-            "Génère ton mail",
-          ].map((t, i) => (
-            <span
-              key={i}
-              className="inline-flex items-center gap-1 rounded-full bg-[var(--bg-soft)] border border-[var(--border)] px-2 py-[3px]"
-            >
-              <span className="w-4 h-4 rounded-full bg-[var(--brand)]/10 flex items-center justify-center text-[10px] text-[var(--brand)]">
-                {i + 1}
-              </span>
-              <span>{t}</span>
-            </span>
-          ))}
-        </div>
-      </section>
-
-      {/* ÉTAPE 1 : CV */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-              Étape 1
-            </span>
-            <div>
-              <h2 className="text-base sm:text-lg font-semibold text-[var(--ink)]">CV IA – 1 page A4</h2>
-              <p className="text-[11px] text-[var(--muted)]">
-                Génération locale (PDF) – rendu identique aux templates HTML.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div className="space-y-3 text-[13px]">
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Titre / objectif du CV</label>
-            <input
-              id="cvTargetJob"
-              type="text"
-              className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-              placeholder="Ex : Ingénieur Cybersécurité"
-              value={cvTargetJob}
-              onChange={(e) => setCvTargetJob(e.target.value)}
-            />
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Modèle</label>
-              <select
-                id="cvTemplate"
-                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
-                value={cvTemplate}
-                onChange={(e) => setCvTemplate(e.target.value)}
-              >
-                <option value="ats">ATS (sobre) ✅</option>
-                <option value="design">Design (CLOUD)</option>
-                <option value="magazine">Magazine</option>
-                <option value="classic">Classique</option>
-                <option value="modern">Moderne</option>
-                <option value="minimalist">Minimaliste</option>
-                <option value="academic">Académique</option>
-              </select>
-              {cvTemplate !== "ats" && (
-                <p className="mt-1 text-[10px] text-[var(--muted)]">
-                  Génération locale disponible en <strong>ATS</strong> pour l’instant.
-                </p>
-              )}
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Langue</label>
-              <select
-                id="cvLang"
-                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
-                value={cvLang}
-                onChange={(e) => setCvLang(e.target.value as Lang)}
-              >
-                <option value="fr">Français</option>
-                <option value="en">English</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Contrat visé</label>
-              <select
-                id="cvContract"
-                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
-                value={cvContract}
-                onChange={(e) => setCvContract(e.target.value)}
-              >
-                <option value="CDI">CDI</option>
-                <option value="CDD">CDD</option>
-                <option value="Alternance">Alternance</option>
-                <option value="Stage">Stage</option>
-                <option value="Freelance">Freelance</option>
-              </select>
-            </div>
-
-            {/* ✅ COULEUR PDF */}
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Couleur PDF (CV + LM)
-              </label>
-              <div className="flex items-center gap-2">
-                <input
-                  type="color"
-                  value={pdfBrand}
-                  onChange={(e) => setPdfBrand(e.target.value)}
-                  className="h-9 w-12 rounded-lg border border-[var(--border)] bg-[var(--bg-soft)]"
-                  aria-label="Couleur du PDF"
-                />
-                <input
-                  type="text"
-                  value={pdfBrand}
-                  onChange={(e) => setPdfBrand(e.target.value)}
-                  className="input flex-1 text-[var(--ink)] bg-[var(--bg)]"
-                  placeholder="#ef4444"
-                />
-              </div>
-              <p className="mt-1 text-[10px] text-[var(--muted)]">
-                Par défaut : <strong>rouge</strong> (#ef4444).
-              </p>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Lien de l&apos;offre (optionnel)
-              </label>
-              <input
-                id="cvJobLink"
-                type="url"
-                className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                placeholder="https://"
-                value={cvJobLink}
-                onChange={(e) => setCvJobLink(e.target.value)}
-              />
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Extraits de l&apos;offre (optionnel)
-              </label>
-              <textarea
-                id="cvJD"
-                rows={3}
-                className="input textarea w-full text-[13px] text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                placeholder="Colle quelques missions / outils / mots-clés de l’offre."
-                value={cvJobDesc}
-                onChange={(e) => setCvJobDesc(e.target.value)}
-              />
-            </div>
-          </div>
-
-          <div className="pt-1">
-            <label className="flex items-center gap-2 cursor-pointer text-[12px]">
-              <input
-                id="autoCreateSwitch"
-                type="checkbox"
-                className="toggle-checkbox"
-                checked={cvAutoCreate}
-                onChange={(e) => setCvAutoCreate(e.target.checked)}
-              />
-              <span className="text-[var(--muted)]">
-                Créer automatiquement une entrée dans le <strong>Suivi 📌</strong> à chaque génération.
-              </span>
-            </label>
-          </div>
-        </div>
-
-        <div className="flex flex-col sm:flex-row gap-2 pt-2">
-          <button
-            id="generateCvBtn"
-            type="button"
-            onClick={handleGenerateCv}
-            disabled={cvLoading || !profile}
-            className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            <span>{cvLoading ? "Génération du CV..." : "Générer le CV (PDF) — 1 page"}</span>
-            <div id="cvBtnSpinner" className={`loader absolute inset-0 m-auto ${cvLoading ? "" : "hidden"}`} />
-          </button>
-
-          <button
-            id="generateCvLmPdfBtn"
-            type="button"
-            onClick={handleGenerateCvLmPdf}
-            disabled={cvZipLoading || !profile}
-            className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            <span>{cvZipLoading ? "Génération PDF..." : "CV + LM (PDF) — 2 pages"}</span>
-            <div id="cvLmZipBtnSpinner" className={`loader absolute inset-0 m-auto ${cvZipLoading ? "" : "hidden"}`} />
-          </button>
-        </div>
-
-        <div className="mt-2 p-2.5 rounded-md border border-dashed border-[var(--border)]/70 text-[11px] text-[var(--muted)]">
-          {cvStatus ? (
-            <p className="text-center text-emerald-400 text-[12px]">{cvStatus}</p>
-          ) : (
-            <p className="text-center">
-              Génération locale : téléchargement direct (CV 1 page, ou CV+LM 2 pages).
-            </p>
-          )}
-          {cvError && <p className="mt-1 text-center text-red-400 text-[12px]">{cvError}</p>}
-        </div>
-      </section>
-
-      {/* ÉTAPE 2 : LM */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
-          <span>
-            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
-          </span>
-          <span>
-            🏢 <span className="font-medium text-[var(--ink)]">{targetedCompany}</span>
-          </span>
-        </div>
-
-        <form onSubmit={handleGenerateLetter} className="space-y-3">
-          <div className="flex items-start justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-                Étape 2
-              </span>
-              <div>
-                <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Lettre de motivation IA</h3>
-                <p className="text-[11px] text-[var(--muted)]">
-                  La lettre est générée en s’appuyant sur <strong>tes expériences</strong> (et outils), puis exportée en PDF (1 page).
-                </p>
-              </div>
-            </div>
-            <select
-              id="lmLang"
-              className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
-              value={lmLang}
-              onChange={(e) => setLmLang(e.target.value as Lang)}
-            >
-              <option value="fr">FR</option>
-              <option value="en">EN</option>
-            </select>
-          </div>
-
-          <div className="space-y-3 text-[13px]">
-            <div className="grid sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
-                <input
-                  id="companyName"
-                  type="text"
-                  className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                  placeholder="Ex : IMOGATE"
-                  value={companyName}
-                  onChange={(e) => setCompanyName(e.target.value)}
-                />
-              </div>
-              <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
-                <input
-                  id="jobTitle"
-                  type="text"
-                  className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                  placeholder="Ex : Ingénieur Réseaux & Sécurité"
-                  value={jobTitle}
-                  onChange={(e) => setJobTitle(e.target.value)}
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Extraits de l&apos;offre (optionnel)</label>
-              <textarea
-                id="jobDescription"
-                rows={3}
-                className="input textarea w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                placeholder="Colle quelques missions / outils / contexte de l’offre."
-                value={jobDescription}
-                onChange={(e) => setJobDescription(e.target.value)}
-              />
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Lien de l&apos;offre (optionnel)</label>
-              <input
-                id="jobLink"
-                type="url"
-                className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                placeholder="https://"
-                value={jobLink}
-                onChange={(e) => setJobLink(e.target.value)}
-              />
-            </div>
-
-            {lmError && <p className="text-[11px] text-red-400">{lmError}</p>}
-
-            <div className="flex flex-col sm:flex-row gap-2 pt-1">
-              <button
-                id="generateCoverLetterBtn"
-                type="submit"
-                disabled={lmLoading || !profile}
-                className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                <span>{lmLoading ? "Génération de la LM..." : "Générer la lettre"}</span>
-                <div id="lmBtnSpinner" className={`loader absolute inset-0 m-auto ${lmLoading ? "" : "hidden"}`} />
-              </button>
-
-              <button
-                id="downloadLetterPdfBtn"
-                type="button"
-                onClick={handleDownloadLetterPdf}
-                disabled={lmPdfLoading || !profile}
-                className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                <span>{lmPdfLoading ? "Création du PDF..." : "Télécharger en PDF (1 page)"}</span>
-                <div className={`loader absolute inset-0 m-auto ${lmPdfLoading ? "" : "hidden"}`} />
-              </button>
-            </div>
-
-            <div className="flex flex-col sm:flex-row gap-2">
-              <button
-                id="copyLetterBtn"
-                type="button"
-                onClick={handleCopyLetter}
-                disabled={!letterText}
-                className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                <span>{letterCopied ? "Texte copié ✅" : "Copier le texte"}</span>
-              </button>
-            </div>
-
-            {lmPdfError && <p className="text-[11px] text-red-400">{lmPdfError}</p>}
-          </div>
-        </form>
-
-        <div className="mt-2 p-3 card-soft rounded-md border border-dashed border-[var(--brand)]/50">
-          <p className="text-[11px] text-[var(--muted)] mb-1 text-center">
-            Dernière lettre générée (tu peux l&apos;adapter avant envoi ou PDF).
-          </p>
-          <div className="letter-pre text-[13px] text-[var(--ink)] overflow-auto max-h-[220px] whitespace-pre-line">
-            {letterText ? (
-              <p>{letterText}</p>
-            ) : (
-              <p className="text-center text-[var(--muted)]">Lance une génération pour voir ici le texte de la LM IA.</p>
-            )}
-          </div>
-        </div>
-      </section>
-
-      {/* ÉTAPE 3 : PITCH */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3">
-        <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
-          <span>
-            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
-          </span>
-          <span>🧩 Utilise ce pitch pour mails, LinkedIn et entretiens.</span>
-        </div>
-
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-              Étape 3
-            </span>
-            <div>
-              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Pitch d&apos;ascenseur</h3>
-              <p className="text-[11px] text-[var(--muted)]">
-                Résumé percutant de 2–4 phrases pour te présenter en 30–40 secondes.
-              </p>
-            </div>
-          </div>
-          <select
-            id="pitchLang"
-            className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
-            value={pitchLang}
-            onChange={(e) => setPitchLang(e.target.value as Lang)}
-          >
-            <option value="fr">FR</option>
-            <option value="en">EN</option>
-          </select>
-        </div>
-
-        {pitchError && <p className="text-[11px] text-red-400">{pitchError}</p>}
-
-        <div className="flex flex-col sm:flex-row gap-2 pt-1">
-          <button
-            id="generatePitchBtn"
-            type="button"
-            onClick={handleGeneratePitch}
-            disabled={pitchLoading || !profile}
-            className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            <span>{pitchLoading ? "Génération du pitch..." : "Générer le pitch"}</span>
-            <div id="pitchBtnSpinner" className={`loader absolute inset-0 m-auto ${pitchLoading ? "" : "hidden"}`} />
-          </button>
-          <button
-            id="copyPitchBtn"
-            type="button"
-            onClick={handleCopyPitch}
-            disabled={!pitchText}
-            className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            <span>{pitchCopied ? "Pitch copié ✅" : "Copier le pitch"}</span>
-          </button>
-        </div>
-
-        <div className="mt-2 p-3 card-soft rounded-md text-[13px] text-[var(--ink)] whitespace-pre-line">
-          {pitchText ? (
-            <p>{pitchText}</p>
-          ) : (
-            <p className="text-center text-[11px] text-[var(--muted)]">
-              Après génération, ton pitch apparaîtra ici.
-            </p>
-          )}
-        </div>
-      </section>
-
-      {/* ÉTAPE 4 : MAIL */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-              Étape 4
-            </span>
-            <div>
-              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Mail de candidature</h3>
-              <p className="text-[11px] text-[var(--muted)] max-w-xl">
-                Génère un <strong>objet</strong> et un <strong>corps de mail</strong> à copier.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <form onSubmit={handleGenerateEmail} className="grid md:grid-cols-2 gap-4 text-sm mt-1">
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
-            <input
-              className="input w-full"
-              value={companyName}
-              onChange={(e) => setCompanyName(e.target.value)}
-              placeholder="Ex : IMOGATE"
-            />
-          </div>
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
-            <input
-              className="input w-full"
-              value={jobTitle}
-              onChange={(e) => setJobTitle(e.target.value)}
-              placeholder="Ex : Ingénieur Réseaux & Sécurité"
-            />
-          </div>
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom du recruteur (optionnel)</label>
-            <input
-              className="input w-full"
-              value={recruiterName}
-              onChange={(e) => setRecruiterName(e.target.value)}
-              placeholder="Ex : Mme Dupont"
-            />
-          </div>
-          <div className="md:col-span-2 flex justify-end">
-            <button type="submit" className="btn-primary min-w-[200px]">
-              Générer le mail
-            </button>
-          </div>
-        </form>
-
-        <div className="grid md:grid-cols-2 gap-4 mt-3 text-sm">
-          <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
-            <h4 className="font-semibold text-sm mb-2">Objet</h4>
-            <div className="text-xs text-[var(--muted)] whitespace-pre-line">
-              {subjectPreview || "L'objet généré apparaîtra ici."}
-            </div>
-          </div>
-          <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
-            <h4 className="font-semibold text-sm mb-2">Corps du mail</h4>
-            <div className="text-xs text-[var(--muted)] whitespace-pre-line max-h-64 overflow-auto">
-              {emailPreview || "Le texte du mail apparaîtra ici après génération."}
-            </div>
-          </div>
-        </div>
-
-        <p className="text-[10px] text-[var(--muted)] mt-3">
-          📌 Copie-colle l&apos;objet et le texte, puis joins le CV et la lettre PDF.
-        </p>
-      </section>
-    </motion.div>
   );
 }
 ````
@@ -22311,13 +20342,12 @@ export default function InterviewChat() {
 "use strict";
 
 /**
- * ✅ Version nettoyée (SANS doublons / SANS commandes terminal dans le JS)
- * ✅ Import v1 explicite (Cloud Functions Gen1)
- * ✅ Option bypass reCAPTCHA en dev/emulator (via env)
- *
- * IMPORTANT :
- * - Utilise Node 18+ (fetch natif)
- * - Ne colle JAMAIS "npm install ..." dans ce fichier
+ * Version avec :
+ * - reCAPTCHA conservé sur les autres endpoints
+ * - generateLetterAndPitch SANS reCAPTCHA NI auth obligatoire
+ * - ✅ PROMPTS (FR/EN) intégrés DIRECTEMENT dans CE FICHIER (plus de fichiers prompts séparés)
+ *   -> generateLetterAndPitch utilise buildLetterAndPitchPrompt()
+ *   -> generateCvLmZip utilise buildLmBodyPrompt()
  */
 
 const functions = require("firebase-functions/v1");
@@ -22325,10 +20355,9 @@ const admin = require("firebase-admin");
 const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
 const JSZip = require("jszip");
 const { Polar } = require("@polar-sh/sdk");
-// const { validateEvent, WebhookVerificationError } = require("@polar-sh/sdk/webhooks"); // (signature optionnelle)
 const { RecaptchaEnterpriseServiceClient } = require("@google-cloud/recaptcha-enterprise");
 
-// Initialisation Firebase Admin (pour Firestore + auth + callable)
+// Initialisation Firebase Admin
 if (!admin.apps.length) {
   admin.initializeApp();
 }
@@ -22345,21 +20374,167 @@ if (!fetchFn) {
 }
 
 // =============================
-//  reCAPTCHA Enterprise (config + helper)
+//  ✅ PROMPTS LM / Letter+Pitch (INLINE)
+// =============================
+const TEMPLATE_LETTER_PITCH_FR = `
+Tu es un coach carrières senior et recruteur.
+
+Retourne STRICTEMENT un JSON valide :
+{ "coverLetter": "string", "pitch": "string" }
+
+RÈGLES LETTRE :
+- "coverLetter" = UNIQUEMENT le CORPS (pas d’en-tête, pas d’objet, pas de formule d’appel, pas de signature).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Ne pas inventer (entreprises/outils/chiffres).
+- Utilise UNIQUEMENT le profil candidat + la fiche de poste.
+
+PROFIL CANDIDAT (source de vérité) :
+{{cvText}}
+
+FICHE DE POSTE :
+{{jobDescription}}
+
+INTITULÉ : {{jobTitle}}
+ENTREPRISE : {{companyName}}
+`.trim();
+
+const TEMPLATE_LETTER_PITCH_EN = `
+You are a senior career coach and recruiter.
+
+Return STRICTLY valid JSON:
+{ "coverLetter": "string", "pitch": "string" }
+
+COVER LETTER RULES:
+- "coverLetter" must be ONLY the BODY (no header, no subject, no greeting, no signature).
+- 3 to 5 short paragraphs separated by a blank line.
+- Do not invent facts, companies, tools, numbers.
+- Use ONLY the candidate profile and the job description.
+
+CANDIDATE PROFILE (source of truth):
+{{cvText}}
+
+JOB DESCRIPTION:
+{{jobDescription}}
+
+JOB TITLE: {{jobTitle}}
+COMPANY: {{companyName}}
+`.trim();
+
+const TEMPLATE_LM_BODY_FR = `
+Tu es un coach carrières senior et recruteur.
+
+MISSION :
+Rédige UNIQUEMENT le CORPS d’une lettre de motivation adaptée au poste, basée UNIQUEMENT sur les infos fournies (CV + fiche de poste).
+
+ENTRÉES :
+- Intitulé : "{{jobTitle}}"
+- Entreprise : "{{companyName}}"
+- Fiche de poste :
+{{jobDescription}}
+
+- Profil candidat :
+{{cvText}}
+
+RÈGLES :
+- Ne pas inventer (pas de chiffres/clients/technos non présents).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Pas d’en-tête, pas d’objet, pas de salutation, pas de signature.
+- Réponds STRICTEMENT en JSON :
+{ "body": "..." }
+`.trim();
+
+const TEMPLATE_LM_BODY_EN = `
+You are a senior career coach and recruiter.
+
+TASK:
+Write ONLY the BODY of a cover letter tailored to the job, using ONLY the provided information (CV + job description).
+
+INPUTS:
+- Job title: "{{jobTitle}}"
+- Company: "{{companyName}}"
+- Job description:
+{{jobDescription}}
+
+- Candidate profile (source of truth):
+{{cvText}}
+
+STRICT RULES:
+- Do NOT invent facts (no fake metrics, clients, tools, dates).
+- 3 to 5 paragraphs separated by ONE blank line.
+- No header, no subject line, no greeting, no signature.
+- Output MUST be STRICT JSON only:
+{ "body": "..." }
+`.trim();
+
+function normalizeLang(langRaw) {
+  const l = String(langRaw || "fr").toLowerCase();
+  return l.startsWith("en") ? "en" : "fr";
+}
+
+function fillTemplate(template, vars) {
+  return template.replace(/\{\{(\w+)\}\}/g, (_, k) =>
+    String(vars && Object.prototype.hasOwnProperty.call(vars, k) ? vars[k] : "")
+  );
+}
+
+/**
+ * Prompt pour endpoint generateLetterAndPitch
+ * -> attend JSON { coverLetter, pitch }
+ */
+function buildLetterAndPitchPrompt({
+  lang,
+  cvText,
+  jobDescription,
+  jobTitle,
+  companyName,
+}) {
+  const L = normalizeLang(lang);
+  const tpl = L === "en" ? TEMPLATE_LETTER_PITCH_EN : TEMPLATE_LETTER_PITCH_FR;
+
+  return fillTemplate(tpl, {
+    cvText: cvText || "",
+    jobDescription: jobDescription || "—",
+    jobTitle: jobTitle || (L === "en" ? "the role" : "le poste"),
+    companyName: companyName || (L === "en" ? "your company" : "votre entreprise"),
+  });
+}
+
+/**
+ * Prompt pour générer UNIQUEMENT le corps de LM
+ * -> attend JSON { body }
+ */
+function buildLmBodyPrompt({
+  lang,
+  cvText,
+  jobDescription,
+  jobTitle,
+  companyName,
+}) {
+  const L = normalizeLang(lang);
+  const tpl = L === "en" ? TEMPLATE_LM_BODY_EN : TEMPLATE_LM_BODY_FR;
+
+  return fillTemplate(tpl, {
+    cvText: cvText || "",
+    jobDescription: jobDescription || "—",
+    jobTitle: jobTitle || (L === "en" ? "the role" : "le poste"),
+    companyName: companyName || (L === "en" ? "your company" : "votre entreprise"),
+  });
+}
+
+// =============================
+//  reCAPTCHA Enterprise
 // =============================
 const recaptchaClient = new RecaptchaEnterpriseServiceClient();
 
 function getRecaptchaConfig() {
-  const cfg = (functions.config && functions.config() && functions.config().recaptcha) || {};
+  const cfg =
+    (functions.config && functions.config() && functions.config().recaptcha) || {};
 
   const projectId = cfg.project_id || process.env.RECAPTCHA_PROJECT_ID || "";
   const siteKey = cfg.site_key || process.env.RECAPTCHA_SITE_KEY || "";
   const thresholdRaw = cfg.threshold || process.env.RECAPTCHA_THRESHOLD || "0.5";
   const threshold = Number(thresholdRaw);
 
-  // ✅ Bypass optionnel (dev seulement recommandé)
-  // - RECAPTCHA_BYPASS=true
-  // - ou functions:config:set recaptcha.bypass=true
   const bypassRaw = cfg.bypass || process.env.RECAPTCHA_BYPASS || "false";
   const bypass = String(bypassRaw).toLowerCase() === "true";
 
@@ -22372,7 +20547,10 @@ function getRecaptchaConfig() {
 }
 
 function isEmulator() {
-  return process.env.FUNCTIONS_EMULATOR === "true" || !!process.env.FIREBASE_EMULATOR_HUB;
+  return (
+    process.env.FUNCTIONS_EMULATOR === "true" ||
+    !!process.env.FIREBASE_EMULATOR_HUB
+  );
 }
 
 function getClientIp(req) {
@@ -22388,24 +20566,17 @@ function getClientIp(req) {
   return typeof ip === "string" ? ip : "";
 }
 
-/**
- * Vérifie le token reCAPTCHA Enterprise.
- * expectedAction :
- * - si fourni -> vérifie que l'action du token correspond
- * - sinon -> pas de check d'action
- */
 async function verifyRecaptchaToken({ token, expectedAction, req }) {
   const { projectId, siteKey, threshold, bypass } = getRecaptchaConfig();
 
-  // ✅ Bypass explicite (utile en local/dev)
+  // bypass en dev si configuré
   if (bypass && (isEmulator() || process.env.NODE_ENV !== "production")) {
     return { ok: true, bypass: true, score: null, threshold };
   }
 
-  // Si pas configuré, on ne bloque pas (mais on log)
   if (!projectId || !siteKey) {
     console.warn(
-      "reCAPTCHA non configuré (recaptcha.project_id / recaptcha.site_key manquants) => vérification bypass."
+      "reCAPTCHA non configuré (project_id / site_key manquants) => bypass."
     );
     return { ok: true, bypass: true, score: null, threshold };
   }
@@ -22442,7 +20613,6 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
       };
     }
 
-    // Action check (si fourni)
     if (
       expectedAction &&
       tokenProps.action &&
@@ -22474,11 +20644,6 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
   }
 }
 
-/**
- * Important sécurité :
- * - expectedAction (passée par l'endpoint) a priorité.
- * - sinon on lit req.body.action (utile pour /recaptchaVerify).
- */
 async function enforceRecaptchaOrReturn(req, res, expectedAction) {
   const token =
     (req.body && (req.body.recaptchaToken || req.body.token)) ||
@@ -22504,14 +20669,12 @@ async function enforceRecaptchaOrReturn(req, res, expectedAction) {
   if (!result.ok) {
     return res.status(403).json({ error: "reCAPTCHA failed", details: result });
   }
-  return null; // ok
+  return null;
 }
 
 // =============================
 //  CORS
 // =============================
-
-// Exemple env: CORS_ALLOW_ORIGINS="https://assistant-ia-v4.web.app,https://assistant-ia-v4.firebaseapp.com,http://localhost:3000"
 function getAllowedOrigins() {
   const raw =
     process.env.CORS_ALLOW_ORIGINS ||
@@ -22526,7 +20689,6 @@ function getAllowedOrigins() {
     .filter(Boolean);
 }
 
-// Pas de credentials côté front -> pas besoin de Allow-Credentials
 function setCors(req, res) {
   const origin = req.headers.origin;
   const allowlist = getAllowedOrigins();
@@ -22548,7 +20710,7 @@ function setCors(req, res) {
 }
 
 // =============================
-//  ✅ AUTH + CREDITS (serveur) : débit crédits + logs
+//  AUTH + CREDITS (serveur)
 // =============================
 function getBearerToken(req) {
   const h = req.headers["authorization"] || req.headers["Authorization"] || "";
@@ -22619,9 +20781,9 @@ async function debitCreditsAndLog({
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    // documents
     if (docsGenerated && docsGenerated > 0) {
-      updates.totalDocumentsGenerated = admin.firestore.FieldValue.increment(docsGenerated);
+      updates.totalDocumentsGenerated =
+        admin.firestore.FieldValue.increment(docsGenerated);
     }
     if (cvGenerated && cvGenerated > 0) {
       updates.totalCvGenerated = admin.firestore.FieldValue.increment(cvGenerated);
@@ -22644,7 +20806,7 @@ async function debitCreditsAndLog({
         creditsDelta: -cost,
         meta: meta || null,
         path: path || null,
-        createdAt: now, // number (ms)
+        createdAt: now,
         createdAtServer: admin.firestore.FieldValue.serverTimestamp(),
         ip: ip || null,
         userAgent: userAgent || null,
@@ -22655,7 +20817,7 @@ async function debitCreditsAndLog({
 }
 
 // =============================
-//  HTTPS: recaptchaVerify
+//  recaptchaVerify
 // =============================
 exports.recaptchaVerify = functions
   .region("europe-west1")
@@ -22708,7 +20870,12 @@ function inferContractTypeStandard(raw) {
 
   if (norm.includes("alternance") || norm.includes("apprentissage")) return "Alternance";
   if (norm.includes("stage") || norm.includes("intern")) return "Stage";
-  if (norm.includes("freelance") || norm.includes("independant") || norm.includes("indépendant") || norm.includes("auto-entrepreneur"))
+  if (
+    norm.includes("freelance") ||
+    norm.includes("independant") ||
+    norm.includes("indépendant") ||
+    norm.includes("auto-entrepreneur")
+  )
     return "Freelance";
   if (norm.includes("cdd") || norm.includes("duree determinee") || norm.includes("durée determinée"))
     return "CDD";
@@ -22775,10 +20942,7 @@ exports.adminUpdateCredits = functions
     const userRef = db.collection("users").doc(userId);
 
     await userRef.set(
-      {
-        credits,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
+      { credits, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
       { merge: true }
     );
 
@@ -22801,7 +20965,10 @@ async function callGeminiText(prompt, apiKey, temperature = 0.7, maxOutputTokens
 
   const resp = await fetchFn(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
     body: JSON.stringify(body),
   });
 
@@ -22833,7 +21000,10 @@ async function callGeminiWithCv(base64Pdf, apiKey) {
         role: "user",
         parts: [
           {
-            inline_data: { mime_type: "application/pdf", data: base64Pdf },
+            inline_data: {
+              mime_type: "application/pdf",
+              data: base64Pdf,
+            },
           },
           {
             text: `Lis ce CV et renvoie STRICTEMENT un JSON valide avec exactement ce schéma :
@@ -22889,7 +21059,10 @@ RÈGLES IMPORTANTES :
 
   const resp = await fetchFn(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
     body: JSON.stringify(body),
   });
 
@@ -22913,12 +21086,10 @@ RÈGLES IMPORTANTES :
     parsed = data;
   }
 
-  // Post-traitement (skills/tools/softskills + contrat)
   let sectionsRaw = Array.isArray(parsed?.skills?.sections) ? parsed.skills.sections : [];
   let tools = Array.isArray(parsed?.skills?.tools) ? parsed.skills.tools : [];
   let softSkillsArr = Array.isArray(parsed?.softSkills) ? parsed.softSkills : [];
 
-  // Soft skills clean/dedup
   const softSeen = new Set();
   softSkillsArr = softSkillsArr
     .filter((s) => typeof s === "string")
@@ -22930,7 +21101,6 @@ RÈGLES IMPORTANTES :
       return true;
     });
 
-  // Inject soft skills into sections if needed
   if (softSkillsArr.length > 0) {
     let idx = sectionsRaw.findIndex(
       (sec) =>
@@ -22953,7 +21123,6 @@ RÈGLES IMPORTANTES :
     }
   }
 
-  // Clean sections
   const sections = sectionsRaw
     .map((sec) => {
       const seen = new Set();
@@ -22974,7 +21143,6 @@ RÈGLES IMPORTANTES :
     })
     .filter((sec) => sec.title || sec.items.length);
 
-  // Clean tools
   const cleanTools = [];
   const seenTools = new Set();
   for (const raw of tools) {
@@ -22987,12 +21155,10 @@ RÈGLES IMPORTANTES :
   }
   tools = cleanTools;
 
-  // Dedup tools vs section items
   const sectionItemSet = new Set();
   sections.forEach((sec) => sec.items.forEach((it) => sectionItemSet.add(String(it).toLowerCase())));
   tools = tools.filter((t) => !sectionItemSet.has(String(t).toLowerCase()));
 
-  // Contract
   const contractTypeFull = parsed?.contractTypeFull || parsed?.contractType || "";
   let contractTypeStandard = parsed?.contractTypeStandard || "";
   if (!contractTypeStandard) contractTypeStandard = inferContractTypeStandard(contractTypeFull);
@@ -23031,7 +21197,7 @@ RÈGLES IMPORTANTES :
 }
 
 // =============================
-//  HTTPS: extractProfile
+//  extractProfile
 // =============================
 exports.extractProfile = functions
   .region("europe-west1")
@@ -23043,14 +21209,13 @@ exports.extractProfile = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "extract_profile");
     if (deny) return;
 
     try {
       const base64Pdf = req.body?.base64Pdf;
       if (!base64Pdf) {
-        return res.status(400).json({ error: "Champ 'base64Pdf' manquant dans le corps JSON." });
+        return res.status(400).json({ error: "Champ 'base64Pdf' manquant." });
       }
 
       const GEMINI_API_KEY =
@@ -23181,7 +21346,6 @@ exports.interview = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "interview");
     if (deny) return;
 
@@ -23193,7 +21357,6 @@ exports.interview = functions
         return res.status(400).json({ error: "Champ 'action' manquant ('start' ou 'answer')." });
       }
 
-      // START
       if (action === "start") {
         const userId = body.userId || "";
         const jobTitle = body.jobTitle || "";
@@ -23233,8 +21396,7 @@ exports.interview = functions
 
         try {
           const GEMINI_API_KEY =
-            process.env.GEMINI_API_KEY ||
-            (functions.config().gemini && functions.config().gemini.key);
+            process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
 
           if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY manquante");
 
@@ -23284,7 +21446,6 @@ exports.interview = functions
         });
       }
 
-      // ANSWER
       if (action === "answer") {
         const userId = body.userId || "";
         const sessionId = body.sessionId || "";
@@ -23322,8 +21483,7 @@ exports.interview = functions
 
         try {
           const GEMINI_API_KEY =
-            process.env.GEMINI_API_KEY ||
-            (functions.config().gemini && functions.config().gemini.key);
+            process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
 
           if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY manquante");
 
@@ -23346,7 +21506,8 @@ exports.interview = functions
           console.error("Erreur Gemini (interview/answer):", err);
         }
 
-        const isLastStep = session.currentStep >= (session.totalQuestions || INTERVIEW_QUESTION_PLAN.complet);
+        const isLastStep =
+          session.currentStep >= (session.totalQuestions || INTERVIEW_QUESTION_PLAN.complet);
 
         if (!nextQuestion && !finalSummary) {
           if (isLastStep) {
@@ -23362,7 +21523,11 @@ exports.interview = functions
         }
 
         if (nextQuestion) {
-          session.history.push({ role: "interviewer", text: nextQuestion, createdAt: new Date().toISOString() });
+          session.history.push({
+            role: "interviewer",
+            text: nextQuestion,
+            createdAt: new Date().toISOString(),
+          });
         }
 
         if (finalSummary || isLastStep) session.finished = true;
@@ -23404,7 +21569,9 @@ function buildProfileContextForIA(profile) {
         if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
       });
     }
-    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
+    if (Array.isArray(p.skills.tools)) {
+      skillsArr = skillsArr.concat(p.skills.tools);
+    }
   } else {
     skillsArr = [];
   }
@@ -23415,7 +21582,9 @@ function buildProfileContextForIA(profile) {
     ? p.experiences
         .map(
           (e) =>
-            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
+            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(
+              e.bullets || []
+            ).join(" ")}`
         )
         .join("; \n")
     : "";
@@ -23461,7 +21630,13 @@ async function createSimpleCvPdf(profile, options) {
   function drawLine(text, size = 11, bold = false) {
     if (!text || y < 50) return;
     const f = bold ? fontBold : font;
-    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+    page.drawText(text, {
+      x: marginX,
+      y,
+      size,
+      font: f,
+      color: rgb(0.1, 0.12, 0.16),
+    });
     y -= size + 4;
   }
 
@@ -23480,7 +21655,13 @@ async function createSimpleCvPdf(profile, options) {
         const testWidth = f.widthOfTextAtSize(testLine, size);
         if (testWidth > maxWidth) {
           if (y < 50) return;
-          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+          page.drawText(line, {
+            x: marginX,
+            y,
+            size,
+            font: f,
+            color: rgb(0.1, 0.12, 0.16),
+          });
           y -= size + 3;
           line = w;
         } else {
@@ -23489,7 +21670,13 @@ async function createSimpleCvPdf(profile, options) {
       }
 
       if (line && y >= 50) {
-        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+        page.drawText(line, {
+          x: marginX,
+          y,
+          size,
+          font: f,
+          color: rgb(0.1, 0.12, 0.16),
+        });
         y -= size + 6;
       }
       y -= 2;
@@ -23498,7 +21685,13 @@ async function createSimpleCvPdf(profile, options) {
 
   function drawSectionTitle(title) {
     if (!title || y < 60) return;
-    page.drawText(title, { x: marginX, y, size: 11, font: fontBold, color: rgb(0.08, 0.15, 0.45) });
+    page.drawText(title, {
+      x: marginX,
+      y,
+      size: 11,
+      font: fontBold,
+      color: rgb(0.08, 0.15, 0.45),
+    });
     y -= 14;
   }
 
@@ -23677,7 +21870,7 @@ async function createLetterPdf(coverLetter, meta) {
 }
 
 // =============================
-//  HTTPS: generateLetterAndPitch  ✅ (débit crédits -1)
+//  Fallback lettre + pitch
 // =============================
 function buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang) {
   const p = profile || {};
@@ -23694,15 +21887,18 @@ function buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescript
     return {
       pitch:
         summary ||
-        `I am ${name || "a candidate"} with ${years ? years + " years of experience" : "solid experience"} in ${
-          primaryDomain || "my field"
-        }, motivated by the ${jobTitle || "role"} at ${companyName || "your company"}.`,
-      // fallback "full letter", ok if you use it as body too
+        `I am ${name || "a candidate"} with ${
+          years ? years + " years of experience" : "solid experience"
+        } in ${primaryDomain || "my field"}, motivated by the ${jobTitle || "role"} at ${
+          companyName || "your company"
+        }.`,
       coverLetter: `I am writing to express my interest in the position of ${jobTitle || "your advertised role"}. With ${
         years ? years + " years of experience" : "solid experience"
       } in ${primaryDomain || "my field"}, I have developed strong skills relevant to this opportunity.
 
-In my previous experience at ${company || "my last company"}, I contributed to projects with measurable impact and collaborated with different stakeholders.
+In my previous experience at ${company || "my last company"}${
+        city ? " in " + city : ""
+      }, I contributed to projects with measurable impact and collaborated with different stakeholders.
 
 I would be delighted to discuss how I can contribute to your team.`,
     };
@@ -23716,17 +21912,22 @@ I would be delighted to discuss how I can contribute to your team.`,
       } ${primaryDomain ? "dans " + primaryDomain : ""}, motivé(e) par le poste de ${
         jobTitle || "votre poste"
       } chez ${companyName || "votre entreprise"}.`,
-    // fallback "full letter", ok if you use it as body too
-    coverLetter: `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
-      companyName || "votre entreprise"
-    }. Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
-      primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
-    }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
+    coverLetter: `Je vous écris pour vous faire part de mon intérêt pour le poste de ${
+      jobTitle || "..."
+    } au sein de ${companyName || "votre entreprise"}. Avec ${
+      years ? years + " ans d’expérience" : "une expérience significative"
+    } ${primaryDomain ? "dans " + primaryDomain : "dans mon domaine"}, j’ai développé des compétences solides en ${
+      role || "gestion de projets, collaboration et suivi d’objectifs"
+    }.
 
 Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`,
   };
 }
 
+// =============================
+//  generateLetterAndPitch ✅
+//  (SANS reCAPTCHA, SANS auth obligatoire)
+// =============================
 exports.generateLetterAndPitch = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
@@ -23737,19 +21938,7 @@ exports.generateLetterAndPitch = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
-    const deny = await enforceRecaptchaOrReturn(req, res, "generate_letter_pitch");
-    if (deny) return;
-
-    // ✅ Auth obligatoire + débit crédits
-    let authUser = null;
-    try {
-      authUser = await requireFirebaseUser(req);
-    } catch (e) {
-      const code = e?.code || e?.message;
-      if (code === "MISSING_AUTH") return res.status(401).json({ error: "unauthenticated" });
-      return res.status(401).json({ error: "invalid_auth" });
-    }
+    // ⚠️ ICI : PAS DE reCAPTCHA, PAS DE requireFirebaseUser
 
     try {
       const body = req.body || {};
@@ -23758,35 +21947,13 @@ exports.generateLetterAndPitch = functions
       const jobTitle = body.jobTitle || "";
       const companyName = body.companyName || "";
       const langRaw = body.lang || "fr";
-      const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lang = normalizeLang(langRaw);
 
       if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
       if (!jobTitle && !jobDescription)
         return res.status(400).json({
           error: "Ajoute au moins l'intitulé du poste ou un extrait de la description.",
         });
-
-      // ✅ Débit -1 crédit (LM)
-      try {
-        await debitCreditsAndLog({
-          uid: authUser.uid,
-          email: authUser.email,
-          cost: 1,
-          tool: "generateLetterAndPitch",
-          docType: "lm",
-          docsGenerated: 1,
-          cvGenerated: 0,
-          lmGenerated: 1,
-          req,
-          meta: { jobTitle, companyName, lang },
-        });
-      } catch (e) {
-        if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
-          return res.status(402).json({ error: "NO_CREDITS" });
-        }
-        console.error("Débit crédits (LM) error:", e);
-        return res.status(500).json({ error: "credits_error" });
-      }
 
       const GEMINI_API_KEY =
         process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
@@ -23798,47 +21965,14 @@ exports.generateLetterAndPitch = functions
         return res.status(200).json({ coverLetter: fb.coverLetter, pitch: fb.pitch, lang });
       }
 
-      // ✅ IMPORTANT: coverLetter = CORPS uniquement (pas d'objet / salutation / signature)
-      const prompt =
-        lang === "en"
-          ? `You are a senior career coach and recruiter.
-
-Return STRICTLY valid JSON:
-{ "coverLetter": "string", "pitch": "string" }
-
-COVER LETTER RULES:
-- "coverLetter" must be ONLY the BODY (no header, no subject, no greeting, no signature).
-- 3 to 5 short paragraphs separated by a blank line.
-- Do not invent facts, companies, tools, numbers.
-- Use ONLY the candidate profile and the job description.
-
-CANDIDATE PROFILE (source of truth):
-${cvText}
-
-JOB DESCRIPTION:
-${jobDescription || "—"}
-
-JOB TITLE: ${jobTitle || "the role"}
-COMPANY: ${companyName || "your company"}`
-          : `Tu es un coach carrières senior et recruteur.
-
-Retourne STRICTEMENT un JSON valide :
-{ "coverLetter": "string", "pitch": "string" }
-
-RÈGLES LETTRE :
-- "coverLetter" = UNIQUEMENT le CORPS (pas d’en-tête, pas d’objet, pas de formule d’appel, pas de signature).
-- 3 à 5 paragraphes séparés par une ligne vide.
-- Ne pas inventer (entreprises/outils/chiffres).
-- Utilise UNIQUEMENT le profil candidat + la fiche de poste.
-
-PROFIL CANDIDAT (source de vérité) :
-${cvText}
-
-FICHE DE POSTE :
-${jobDescription || "—"}
-
-INTITULÉ : ${jobTitle || "le poste"}
-ENTREPRISE : ${companyName || "votre entreprise"}`;
+      // ✅ MODIF : prompt INLINE via builder
+      const prompt = buildLetterAndPitchPrompt({
+        lang,
+        cvText,
+        jobDescription: jobDescription || "—",
+        jobTitle,
+        companyName,
+      });
 
       let coverLetter = "";
       let pitch = "";
@@ -23846,12 +21980,14 @@ ENTREPRISE : ${companyName || "votre entreprise"}`;
       try {
         const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.7, 2200);
         const cleaned = String(raw).replace(/```json|```/gi, "").trim();
+
         let parsed = null;
         try {
           parsed = JSON.parse(cleaned);
         } catch {
           parsed = { coverLetter: cleaned, pitch: "" };
         }
+
         coverLetter = typeof parsed.coverLetter === "string" ? parsed.coverLetter.trim() : "";
         pitch = typeof parsed.pitch === "string" ? parsed.pitch.trim() : "";
       } catch (err) {
@@ -23872,12 +22008,10 @@ ENTREPRISE : ${companyName || "votre entreprise"}`;
   });
 
 // =============================
-//  HTTPS: generateInterviewQA
+//  generateInterviewQA
 // =============================
 function buildFallbackQuestions(lang, role, company, city, dates, bullets) {
-  const missions = (Array.isArray(bullets) ? bullets : [])
-    .filter((b) => typeof b === "string")
-    .slice(0, 3);
+  const missions = (Array.isArray(bullets) ? bullets : []).filter((b) => typeof b === "string").slice(0, 3);
 
   if (lang === "en") {
     return [
@@ -23934,7 +22068,6 @@ exports.generateInterviewQA = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_interview_qa");
     if (deny) return;
 
@@ -23943,7 +22076,7 @@ exports.generateInterviewQA = functions
       const profile = body.profile;
       const experienceIndex = body.experienceIndex;
       const langRaw = body.lang || "fr";
-      const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lang = normalizeLang(langRaw);
 
       if (!profile || !Array.isArray(profile.experiences)) {
         return res.status(400).json({
@@ -24041,7 +22174,7 @@ ${cvText}`;
   });
 
 // =============================
-//  HTTPS: generateCvPdf ✅ (débit crédits -1)
+//  generateCvPdf (avec reCAPTCHA + crédits)
 // =============================
 exports.generateCvPdf = functions
   .region("europe-west1")
@@ -24053,11 +22186,9 @@ exports.generateCvPdf = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_cv_pdf");
     if (deny) return;
 
-    // ✅ Auth obligatoire + débit crédits
     let authUser = null;
     try {
       authUser = await requireFirebaseUser(req);
@@ -24075,11 +22206,10 @@ exports.generateCvPdf = functions
       const contract = body.contract || "";
       const jobLink = body.jobLink || "";
       const jobDescription = body.jobDescription || "";
-      const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lang = normalizeLang(langRaw);
 
       if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
 
-      // ✅ Débit -1 crédit (CV)
       try {
         await debitCreditsAndLog({
           uid: authUser.uid,
@@ -24119,7 +22249,7 @@ exports.generateCvPdf = functions
   });
 
 // =============================
-//  HTTPS: generateCvLmZip ✅ (débit crédits -2)
+//  generateCvLmZip
 // =============================
 exports.generateCvLmZip = functions
   .region("europe-west1")
@@ -24130,11 +22260,9 @@ exports.generateCvLmZip = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_cv_lm_zip");
     if (deny) return;
 
-    // ✅ Auth obligatoire + débit crédits
     let authUser = null;
     try {
       authUser = await requireFirebaseUser(req);
@@ -24154,11 +22282,10 @@ exports.generateCvLmZip = functions
       const jobDescription = body.jobDescription || "";
       const lm = body.lm || {};
 
-      const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lang = normalizeLang(langRaw);
 
       if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
 
-      // ✅ Débit -2 crédits (ZIP = CV + LM)
       try {
         await debitCreditsAndLog({
           uid: authUser.uid,
@@ -24193,7 +22320,8 @@ exports.generateCvLmZip = functions
 
       if (!GEMINI_API_KEY) {
         return res.status(500).json({
-          error: "Clé Gemini manquante côté serveur. Configure GEMINI_API_KEY ou functions.config().gemini.key.",
+          error:
+            "Clé Gemini manquante côté serveur. Configure GEMINI_API_KEY ou functions.config().gemini.key.",
         });
       }
 
@@ -24201,73 +22329,31 @@ exports.generateCvLmZip = functions
       const jobTitle = lm.jobTitle || targetJob || "";
       const lmJobDescription = lm.jobDescription || jobDescription || "";
       const lmLangRaw = lm.lang || lang;
-      const lmLang = String(lmLangRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lmLang = normalizeLang(lmLangRaw);
 
       const cvText = buildProfileContextForIA(profile);
 
-      // ✅ NOUVEAU PROMPT (CORPS “vrai” + JSON + anti-hallucination)
-      const promptLm =
-        lmLang === "en"
-          ? `
-You are a senior career coach and recruiter.
-
-TASK:
-Write ONLY the BODY of a cover letter tailored to the job, using ONLY the provided information (CV + job description).
-
-INPUTS:
-- Job title: "${jobTitle || "the role"}"
-- Company: "${companyName || "your company"}"
-- Job description:
-${lmJobDescription || jobDescription || "—"}
-
-- Candidate profile (source of truth):
-${cvText}
-
-STRICT RULES:
-- Do NOT invent facts (no fake metrics, clients, tools, dates).
-- 3 to 5 paragraphs separated by ONE blank line.
-- No header, no subject line, no greeting, no signature.
-- Output MUST be STRICT JSON only:
-{ "body": "..." }
-`.trim()
-          : `
-Tu es un coach carrières senior et recruteur.
-
-MISSION :
-Rédige UNIQUEMENT le CORPS d’une lettre de motivation adaptée au poste, basée UNIQUEMENT sur les infos fournies (CV + fiche de poste).
-
-ENTRÉES :
-- Intitulé : "${jobTitle || targetJob || "le poste"}"
-- Entreprise : "${companyName || "votre entreprise"}"
-- Fiche de poste :
-${lmJobDescription || jobDescription || "—"}
-
-- Profil candidat :
-${cvText}
-
-RÈGLES :
-- Ne pas inventer (pas de chiffres/clients/technos non présents).
-- 3 à 5 paragraphes séparés par une ligne vide.
-- Pas d’en-tête, pas d’objet, pas de salutation, pas de signature.
-- Réponds STRICTEMENT en JSON :
-{ "body": "..." }
-`.trim();
+      // ✅ MODIF : prompt LM INLINE via builder
+      const promptLm = buildLmBodyPrompt({
+        lang: lmLang,
+        cvText,
+        jobDescription: lmJobDescription || jobDescription || "—",
+        jobTitle: jobTitle || targetJob || "",
+        companyName: companyName || "",
+      });
 
       const rawLm = await callGeminiText(promptLm, GEMINI_API_KEY, 0.65, 1400);
 
-      // Parsing JSON strict
       let coverLetterText = "";
       try {
         const cleaned = String(rawLm).replace(/```json|```/gi, "").trim();
         const parsed = JSON.parse(cleaned);
         coverLetterText = typeof parsed.body === "string" ? parsed.body.trim() : "";
       } catch {
-        // fallback: si l'IA foire, on prend brut
         coverLetterText = String(rawLm || "").trim();
       }
 
       if (!coverLetterText) {
-        // fallback de sécurité
         const fb = buildFallbackLetterAndPitch(profile, jobTitle, companyName, lmJobDescription, lmLang);
         coverLetterText = fb.coverLetter || "";
       }
@@ -24295,8 +22381,7 @@ RÈGLES :
   });
 
 // =============================
-//  HTTPS: generateLetterPdf
-//  (pas de débit ici : sinon double facturation avec generateLetterAndPitch)
+//  generateLetterPdf
 // =============================
 exports.generateLetterPdf = functions
   .region("europe-west1")
@@ -24307,7 +22392,6 @@ exports.generateLetterPdf = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_letter_pdf");
     if (deny) return;
 
@@ -24318,7 +22402,7 @@ exports.generateLetterPdf = functions
       const companyName = (body.companyName || "").toString().trim();
       const candidateName = (body.candidateName || "").toString().trim();
       const langRaw = body.lang || "fr";
-      const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lang = normalizeLang(langRaw);
 
       if (!coverLetter) {
         return res.status(400).json({ error: "Champ 'coverLetter' manquant ou vide." });
@@ -24337,7 +22421,9 @@ exports.generateLetterPdf = functions
         .replace(/^-+|-+$/g, "");
 
       const filename =
-        (lang === "en" ? "cover-letter" : "lettre-motivation") + (safeJob ? `-${safeJob}` : "") + ".pdf";
+        (lang === "en" ? "cover-letter" : "lettre-motivation") +
+        (safeJob ? `-${safeJob}` : "") +
+        ".pdf";
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
@@ -24349,7 +22435,7 @@ exports.generateLetterPdf = functions
   });
 
 // =============================
-//  HTTPS: jobs (Adzuna)
+//  jobs (Adzuna)
 // =============================
 exports.jobs = functions
   .region("europe-west1")
@@ -24360,7 +22446,6 @@ exports.jobs = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "jobs_search");
     if (deny) return;
 
@@ -24420,8 +22505,10 @@ exports.jobs = functions
         return {
           id: job.id || `job-${index}`,
           title: job.title || "Offre sans titre",
-          company: job.company && job.company.display_name ? job.company.display_name : "Entreprise non renseignée",
-          location: job.location && job.location.display_name ? job.location.display_name : "Lieu non précisé",
+          company:
+            job.company && job.company.display_name ? job.company.display_name : "Entreprise non renseignée",
+          location:
+            job.location && job.location.display_name ? job.location.display_name : "Lieu non précisé",
           url: job.redirect_url || "",
           description: job.description || "",
           created: job.created || "",
@@ -24432,7 +22519,9 @@ exports.jobs = functions
       return res.status(200).json({ jobs });
     } catch (err) {
       console.error("Erreur /jobs:", err);
-      return res.status(500).json({ error: "Erreur interne lors de la recherche d'offres (Adzuna /jobs)." });
+      return res.status(500).json({
+        error: "Erreur interne lors de la recherche d'offres (Adzuna /jobs).",
+      });
     }
   });
 
@@ -24454,7 +22543,6 @@ exports.polarCheckout = functions
     if (req.method === "OPTIONS") return res.status(204).send("");
     if (req.method !== "POST") return res.status(405).json({ error: "Méthode non autorisée" });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "polar_checkout");
     if (deny) return;
 
@@ -24517,11 +22605,7 @@ exports.polarCheckout = functions
         require_billing_address: false,
         allow_trial: true,
         is_business_customer: false,
-        metadata: {
-          firebase_uid: String(userId),
-          pack_id: String(packId),
-          app: "assistant-ia-v4",
-        },
+        metadata: { firebase_uid: String(userId), pack_id: String(packId), app: "assistant-ia-v4" },
       };
 
       const checkout = await polar.checkouts.create(payload);
@@ -24530,7 +22614,6 @@ exports.polarCheckout = functions
         return res.status(500).json({ ok: false, error: "Checkout Polar créé mais URL manquante." });
       }
 
-      // mapping checkoutId -> userId
       try {
         const checkoutId = checkout.id ? String(checkout.id) : null;
         const customerId = checkout.customer_id ? String(checkout.customer_id) : null;
@@ -24577,7 +22660,10 @@ exports.polarCheckout = functions
       return res.status(200).json({ ok: true, url: checkout.url });
     } catch (err) {
       console.error("Erreur polarCheckout:", err);
-      return res.status(500).json({ ok: false, error: "Erreur interne lors de la création du checkout Polar." });
+      return res.status(500).json({
+        ok: false,
+        error: "Erreur interne lors de la création du checkout Polar.",
+      });
     }
   });
 
@@ -24639,7 +22725,6 @@ exports.polarWebhook = functions
     }
 
     try {
-      // ⚠️ Validation signature désactivée (tu peux réactiver plus tard avec validateEvent)
       const event = req.body || {};
       console.log("Webhook Polar reçu :", JSON.stringify(event, null, 2));
 
@@ -24757,7 +22842,7 @@ exports.polarWebhook = functions
       await db.runTransaction(async (tx) => {
         if (ledgerRef) {
           const ledgerSnap = await tx.get(ledgerRef);
-          if (ledgerSnap.exists) return; // pas de double crédit
+          if (ledgerSnap.exists) return;
         }
 
         const userRef = db.collection("users").doc(userId);
@@ -24785,13 +22870,8 @@ exports.polarWebhook = functions
           });
         }
 
-        // ✅ NOUVEAU : Historique des recharges
         const rechargeId = orderId ? String(orderId) : `${event.type}_${Date.now()}`;
-        const rechargeRef = db
-          .collection("users")
-          .doc(userId)
-          .collection("rechargeHistory")
-          .doc(rechargeId);
+        const rechargeRef = db.collection("users").doc(userId).collection("rechargeHistory").doc(rechargeId);
 
         tx.set(
           rechargeRef,
@@ -24887,6 +22967,1964 @@ export const functions = getFunctions(app, "europe-west1");
 // Provider Google (pour popup)
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
+````
+
+## File: lib/recaptcha.ts
+````typescript
+// lib/recaptcha.ts
+"use client";
+
+/**
+ * ✅ Single source of truth reCAPTCHA (v3 standard ou Enterprise)
+ * - Loader robuste (si script pas encore chargé)
+ * - tryGetRecaptchaToken(): non bloquant => retourne null si adblock/timeout…
+ * - getRecaptchaToken(): strict => throw si impossible
+ * - verifyRecaptcha(): optionnel via ton endpoint CF /recaptchaVerify (Enterprise)
+ */
+
+declare global {
+  interface Window {
+    grecaptcha?: GrecaptchaRoot;
+  }
+}
+
+type GrecaptchaClient = {
+  ready?: (cb: () => void) => void;
+  execute: (siteKey: string, opts: { action: string }) => Promise<string>;
+};
+
+type GrecaptchaRoot = GrecaptchaClient & {
+  enterprise?: GrecaptchaClient;
+};
+
+export type VerifyResult =
+  | { ok: true; score?: number }
+  | { ok: false; reason: string; score?: number };
+
+const DEFAULT_API_BASE =
+  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+
+export const API_BASE = (
+  process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE
+).replace(/\/+$/, "");
+
+const SITE_KEY =
+  process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY ||
+  process.env.NEXT_PUBLIC_RECAPTCHA_KEY ||
+  "";
+
+const USE_ENTERPRISE =
+  (process.env.NEXT_PUBLIC_RECAPTCHA_ENTERPRISE || "")
+    .toLowerCase()
+    .trim() === "true";
+
+let recaptchaLoadPromise: Promise<void> | null = null;
+
+function isBrowser() {
+  return typeof window !== "undefined" && typeof document !== "undefined";
+}
+
+function normalizeAction(action: string) {
+  return (action || "").trim().toLowerCase();
+}
+
+function describeRecaptchaLoadFailure() {
+  return [
+    "Sécurité: impossible de valider reCAPTCHA.",
+    "Le script reCAPTCHA n’a pas pu être chargé ou est bloqué.",
+    "Causes fréquentes: bloqueur de pubs, DNS filtrant, proxy/corporate, CSP trop stricte, ou réseau qui bloque google.com.",
+  ].join(" ");
+}
+
+function hasUsableRecaptcha(): boolean {
+  const g = window.grecaptcha;
+  if (!g) return false;
+
+  if (USE_ENTERPRISE) {
+    return Boolean(g.enterprise && typeof g.enterprise.execute === "function");
+  }
+
+  return typeof g.execute === "function";
+}
+
+function pickRecaptchaClient(): GrecaptchaClient | null {
+  const g = window.grecaptcha;
+  if (!g) return null;
+
+  if (USE_ENTERPRISE) {
+    if (g.enterprise && typeof g.enterprise.execute === "function") return g.enterprise;
+    return null;
+  }
+
+  if (typeof g.execute === "function") return g;
+  return null;
+}
+
+/**
+ * ✅ Loader robuste:
+ * - attend que grecaptcha soit réellement dispo (poll)
+ * - retentable (reset promise en cas d’échec)
+ */
+async function ensureRecaptchaLoaded(): Promise<void> {
+  if (!isBrowser()) {
+    throw new Error("reCAPTCHA: appelé côté serveur (SSR).");
+  }
+  if (!SITE_KEY) {
+    throw new Error("reCAPTCHA: NEXT_PUBLIC_RECAPTCHA_SITE_KEY manquant.");
+  }
+  if (hasUsableRecaptcha()) return;
+  if (recaptchaLoadPromise) return recaptchaLoadPromise;
+
+  recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
+    const selector = USE_ENTERPRISE
+      ? 'script[data-recaptcha="enterprise"]'
+      : 'script[data-recaptcha="v3"]';
+
+    const existing = document.querySelector<HTMLScriptElement>(selector);
+
+    const pollUntilReady = (ms: number) => {
+      const t0 = Date.now();
+      const tick = () => {
+        if (hasUsableRecaptcha()) return resolve();
+        if (Date.now() - t0 > ms) return reject(new Error(describeRecaptchaLoadFailure()));
+        requestAnimationFrame(tick);
+      };
+      tick();
+    };
+
+    // Script déjà présent => on attend juste l'exposition de grecaptcha
+    if (existing) {
+      pollUntilReady(10_000);
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.async = true;
+    script.defer = true;
+    script.setAttribute("data-recaptcha", USE_ENTERPRISE ? "enterprise" : "v3");
+
+    const base = USE_ENTERPRISE
+      ? "https://www.google.com/recaptcha/enterprise.js"
+      : "https://www.google.com/recaptcha/api.js";
+
+    script.src = `${base}?render=${encodeURIComponent(SITE_KEY)}`;
+
+    const timeout = window.setTimeout(() => {
+      reject(new Error(describeRecaptchaLoadFailure()));
+    }, 12_000);
+
+    script.onload = () => {
+      window.clearTimeout(timeout);
+      pollUntilReady(8_000);
+    };
+
+    script.onerror = () => {
+      window.clearTimeout(timeout);
+      reject(new Error(describeRecaptchaLoadFailure()));
+    };
+
+    document.head.appendChild(script);
+  }).catch((e) => {
+    recaptchaLoadPromise = null; // ✅ retentable
+    throw e;
+  });
+
+  return recaptchaLoadPromise;
+}
+
+/**
+ * ✅ Non bloquant :
+ * - retourne un token si possible
+ * - sinon null (adblock, script bloqué, timeout…)
+ */
+export async function tryGetRecaptchaToken(action: string): Promise<string | null> {
+  if (!isBrowser()) return null;
+  if (!SITE_KEY) return null;
+
+  const normalizedAction = normalizeAction(action);
+  if (!normalizedAction) return null;
+
+  try {
+    await ensureRecaptchaLoaded();
+    const client = pickRecaptchaClient();
+    if (!client) return null;
+
+    const token = await new Promise<string>((resolve, reject) => {
+      const runExecute = () => {
+        client
+          .execute(SITE_KEY, { action: normalizedAction })
+          .then((t) => resolve(t))
+          .catch(reject);
+      };
+
+      try {
+        if (typeof client.ready === "function") client.ready(runExecute);
+        else runExecute();
+      } catch (e) {
+        reject(e);
+      }
+    });
+
+    return typeof token === "string" && token ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Version stricte */
+export async function getRecaptchaToken(action: string): Promise<string> {
+  const token = await tryGetRecaptchaToken(action);
+  if (!token) {
+    throw new Error(describeRecaptchaLoadFailure());
+  }
+  return token;
+}
+
+export async function warmupRecaptcha(): Promise<void> {
+  await ensureRecaptchaLoaded();
+}
+
+/** Vérif optionnelle via endpoint /recaptchaVerify */
+export async function verifyRecaptcha(token: string, action: string): Promise<VerifyResult> {
+  const normalizedAction = normalizeAction(action);
+
+  if (!token) return { ok: false, reason: "missing_token" };
+  if (!normalizedAction) return { ok: false, reason: "missing_action" };
+
+  try {
+    const res = await fetch(`${API_BASE}/recaptchaVerify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, action: normalizedAction }),
+      cache: "no-store",
+    });
+
+    const data: any = await res.json().catch(() => ({}));
+
+    if (!res.ok || !data?.ok) {
+      return {
+        ok: false,
+        reason: String(data?.reason || data?.details?.reason || "recaptcha_failed"),
+        score: typeof data?.score === "number"
+          ? data.score
+          : typeof data?.details?.score === "number"
+            ? data.details.score
+            : undefined,
+      };
+    }
+
+    return { ok: true, score: typeof data?.score === "number" ? data.score : undefined };
+  } catch {
+    return { ok: false, reason: "network_error" };
+  }
+}
+````
+
+## File: firebase.json
+````json
+{
+  "hosting": {
+    "site": "assistant-ia-v4",
+    "public": "out",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      { "source": "/api/recaptchaVerify", "function": "recaptchaVerify" },
+
+      { "source": "/api/interview", "function": "interview" },
+      { "source": "/api/extractProfile", "function": "extractProfile" },
+
+      { "source": "/api/generateLetterAndPitch", "function": "generateLetterAndPitch" },
+      { "source": "/api/generateInterviewQA", "function": "generateInterviewQA" },
+      { "source": "/api/generateCvPdf", "function": "generateCvPdf" },
+      { "source": "/api/generateCvLmZip", "function": "generateCvLmZip" },
+      { "source": "/api/generateLetterPdf", "function": "generateLetterPdf" },
+
+      { "source": "/api/jobs", "function": "jobs" },
+
+      { "source": "/api/polar/checkout", "function": "polarCheckout" },
+      { "source": "/api/polar/webhook", "function": "polarWebhook" },
+
+      { "source": "**", "destination": "/index.html" }
+    ],
+    "cleanUrls": true,
+    "trailingSlash": false
+  },
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "functions": {
+    "source": "functions"
+  }
+}
+````
+
+## File: next.config.mjs
+````javascript
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // ❌ IMPORTANT : on ne met PAS "output: 'export'"
+  // car ton projet utilise des routes API (/api/...)
+  // qui nécessitent un runtime Node.js.
+
+  reactStrictMode: true,
+
+  // Tu peux garder cette option si tu veux éviter l’optimisation d'images
+  // (utile par ex. pour un déploiement static sur certains hébergeurs)
+  images: {
+    unoptimized: true,
+  },
+
+  // (Optionnel) : si tu veux être explicite sur le runtime Node :
+  experimental: {
+    serverRuntime: "nodejs",
+  },
+};
+
+export default nextConfig;
+````
+
+## File: app/api/generateLetterAndPitch/route.ts
+````typescript
+// app/api/generateLetterAndPitch/route.ts
+
+import { NextResponse } from "next/server";
+
+const CF_LETTER_AND_PITCH_URL =
+  process.env.FUNCTIONS_BASE_URL
+    ? `${process.env.FUNCTIONS_BASE_URL}/generateLetterAndPitch`
+    : "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
+
+export async function POST(req: Request) {
+  // 1) Récupération du body JSON
+  let body: any = null;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json(
+      { error: "Corps JSON invalide." },
+      { status: 400 }
+    );
+  }
+
+  try {
+    // 2) Préparation des headers pour la Cloud Function
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    // On propage l'Authorization si le front en envoie une (idToken Firebase éventuel)
+    const authHeader = req.headers.get("authorization");
+    if (authHeader) {
+      headers["Authorization"] = authHeader;
+    }
+
+    // On propage aussi le token reCAPTCHA en header si présent
+    const recaptchaHeader =
+      req.headers.get("x-recaptcha-token") ||
+      req.headers.get("X-Recaptcha-Token");
+    if (recaptchaHeader) {
+      headers["X-Recaptcha-Token"] = recaptchaHeader;
+    }
+
+    // 3) Appel de la Cloud Function réelle
+    const cfRes = await fetch(CF_LETTER_AND_PITCH_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    const status = cfRes.status;
+    const contentType = cfRes.headers.get("content-type") || "";
+
+    // 4) Si ce n’est pas du JSON, on renvoie un message explicite
+    if (!contentType.includes("application/json")) {
+      const text = await cfRes.text().catch(() => "");
+      return NextResponse.json(
+        {
+          error:
+            "La Cloud Function generateLetterAndPitch ne renvoie pas de JSON.",
+          status,
+          rawBody: text.slice(0, 500),
+        },
+        { status: status || 500 }
+      );
+    }
+
+    const json = await cfRes.json().catch(() => null);
+
+    // 5) Propager proprement l’erreur backend
+    if (!cfRes.ok) {
+      return NextResponse.json(
+        json || { error: "Erreur backend generateLetterAndPitch" },
+        { status }
+      );
+    }
+
+    // 6) Succès → renvoyer le JSON directement au front
+    return NextResponse.json(json, { status });
+  } catch (e: any) {
+    console.error("Erreur proxy /api/generateLetterAndPitch :", e);
+    return NextResponse.json(
+      {
+        error:
+          "Erreur interne dans la route Next /api/generateLetterAndPitch (proxy).",
+        details: e?.message ?? String(e),
+      },
+      { status: 500 }
+    );
+  }
+}
+````
+
+## File: app/app/lm/page.tsx
+````typescript
+"use client";
+
+import { logUsage } from "@/lib/logUsage";
+import { useEffect, useMemo, useState, FormEvent } from "react";
+import { motion } from "framer-motion";
+import { auth, db } from "@/lib/firebase";
+import { onAuthStateChanged } from "firebase/auth";
+import { doc, getDoc, collection, addDoc, serverTimestamp } from "firebase/firestore";
+
+// ✅ PDF (génération locale, rendu identique à tes HTML pdfmake)
+import { makePdfColors } from "@/lib/pdf/colors";
+import { fitOnePage } from "@/lib/pdf/fitOnePage";
+import { mergePdfBlobs } from "@/lib/pdf/mergePdfs";
+import { downloadBlob } from "@/lib/pdf/pdfmakeClient";
+import { buildCvAtsPdf, type CvDocModel } from "@/lib/pdf/templates/cvAts";
+import { buildLmStyledPdf, type LmModel } from "@/lib/pdf/templates/letter";
+
+// --- TYPES ---
+
+type CvSkillsSection = { title: string; items: string[] };
+type CvSkills = { sections: CvSkillsSection[]; tools: string[] };
+
+type CvExperience = {
+  company: string;
+  role: string;
+  dates: string;
+  bullets: string[];
+  location?: string;
+};
+
+type CvEducation = {
+  school: string;
+  degree: string;
+  dates: string;
+  location?: string;
+};
+
+type CvProfile = {
+  fullName: string;
+  email: string;
+  phone: string;
+  linkedin: string;
+  profileSummary: string;
+
+  city?: string;
+  address?: string;
+
+  contractType: string;
+  contractTypeStandard?: string;
+  contractTypeFull?: string;
+
+  primaryDomain?: string;
+  secondaryDomains?: string[];
+  softSkills?: string[];
+
+  drivingLicense?: string;
+  vehicle?: string;
+
+  skills: CvSkills;
+  experiences: CvExperience[];
+  education: CvEducation[];
+  educationShort: string[];
+  certs: string;
+  langLine: string;
+  hobbies: string[];
+  updatedAt?: number;
+};
+
+type Lang = "fr" | "en";
+
+// 🔗 ENDPOINT LOCAL (Proxy Next.js)
+// On pointe vers notre API locale pour gérer l'auth proprement
+const LETTER_AND_PITCH_URL = "/api/generateLetterAndPitch";
+
+// =============================
+// ✅ reCAPTCHA Enterprise (client)
+// =============================
+
+const RECAPTCHA_SITE_KEY = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY || "";
+let recaptchaLoadPromise: Promise<void> | null = null;
+
+function loadRecaptchaEnterprise(siteKey: string): Promise<void> {
+  if (typeof window === "undefined") {
+    return Promise.reject(new Error("reCAPTCHA: window indisponible (SSR)."));
+  }
+  if ((window as any).grecaptcha?.enterprise) return Promise.resolve();
+  if (recaptchaLoadPromise) return recaptchaLoadPromise;
+
+  recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
+    const existing = document.querySelector(
+      'script[data-recaptcha-enterprise="true"]'
+    ) as HTMLScriptElement | null;
+
+    if (existing) {
+      const t = window.setInterval(() => {
+        if ((window as any).grecaptcha?.enterprise) {
+          window.clearInterval(t);
+          resolve();
+        }
+      }, 50);
+
+      window.setTimeout(() => {
+        window.clearInterval(t);
+        if (!(window as any).grecaptcha?.enterprise) {
+          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
+        }
+      }, 6000);
+      return;
+    }
+
+    const s = document.createElement("script");
+    s.src = `https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(
+      siteKey
+    )}`;
+    s.async = true;
+    s.defer = true;
+    s.setAttribute("data-recaptcha-enterprise", "true");
+
+    s.onload = () => {
+      const t = window.setInterval(() => {
+        if ((window as any).grecaptcha?.enterprise) {
+          window.clearInterval(t);
+          resolve();
+        }
+      }, 50);
+
+      window.setTimeout(() => {
+        window.clearInterval(t);
+        if (!(window as any).grecaptcha?.enterprise) {
+          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
+        }
+      }, 6000);
+    };
+
+    s.onerror = () =>
+      reject(new Error("Impossible de charger reCAPTCHA Enterprise."));
+    document.head.appendChild(s);
+  });
+
+  return recaptchaLoadPromise;
+}
+
+async function getRecaptchaToken(action: string): Promise<string> {
+  if (!RECAPTCHA_SITE_KEY) {
+    throw new Error("reCAPTCHA: NEXT_PUBLIC_RECAPTCHA_SITE_KEY manquante.");
+  }
+
+  await loadRecaptchaEnterprise(RECAPTCHA_SITE_KEY);
+
+  const g = (window as any).grecaptcha;
+  if (!g?.enterprise?.ready || !g?.enterprise?.execute) {
+    throw new Error(
+      "reCAPTCHA Enterprise indisponible (grecaptcha.enterprise manquant)."
+    );
+  }
+
+  await new Promise<void>((resolve) => g.enterprise.ready(() => resolve()));
+  const token = await g.enterprise.execute(RECAPTCHA_SITE_KEY, { action });
+
+  if (!token || typeof token !== "string") {
+    throw new Error("reCAPTCHA: token vide.");
+  }
+  return token;
+}
+
+// =============================
+// ✅ Helpers (texte & PDF locaux)
+// =============================
+
+function safeText(v: any) {
+  return String(v ?? "").trim();
+}
+
+function buildContactLine(p: CvProfile) {
+  const parts: string[] = [];
+  if (p.city) parts.push(safeText(p.city));
+  if (p.phone) parts.push(safeText(p.phone));
+  if (p.email) parts.push(safeText(p.email));
+  if (p.linkedin) parts.push(safeText(p.linkedin));
+  return parts.filter(Boolean).join(" | ");
+}
+
+function categorizeSkills(profile: CvProfile) {
+  const cloud: string[] = [];
+  const sec: string[] = [];
+  const sys: string[] = [];
+  const auto: string[] = [];
+  const tools: string[] = [];
+  const soft: string[] = Array.isArray(profile.softSkills) ? profile.softSkills : [];
+
+  const sections = profile.skills?.sections || [];
+  for (const s of sections) {
+    const title = (s?.title || "").toLowerCase();
+    const items = (s?.items || []).filter(Boolean);
+
+    const pushAll = (arr: string[], vals: string[]) => vals.forEach((x) => arr.push(x));
+
+    if (title.includes("cloud") || title.includes("azure") || title.includes("aws") || title.includes("gcp")) {
+      pushAll(cloud, items);
+    } else if (title.includes("sécu") || title.includes("secu") || title.includes("security") || title.includes("cyber")) {
+      pushAll(sec, items);
+    } else if (
+      title.includes("réseau") ||
+      title.includes("reseau") ||
+      title.includes("system") ||
+      title.includes("système") ||
+      title.includes("sys")
+    ) {
+      pushAll(sys, items);
+    } else if (title.includes("autom") || title.includes("devops") || title.includes("ia") || title.includes("api")) {
+      pushAll(auto, items);
+    } else {
+      pushAll(tools, items);
+    }
+  }
+
+  const extraTools = Array.isArray(profile.skills?.tools) ? profile.skills.tools : [];
+  extraTools.forEach((t) => tools.push(t));
+
+  const uniq = (arr: string[]) => Array.from(new Set(arr.map((x) => safeText(x)).filter(Boolean)));
+
+  return {
+    cloud: uniq(cloud),
+    sec: uniq(sec),
+    sys: uniq(sys),
+    auto: uniq(auto),
+    tools: uniq(tools),
+    soft: uniq(soft),
+  };
+}
+
+function profileToCvDocModel(profile: CvProfile, params: { targetJob: string; contract: string }): CvDocModel {
+  const titleParts: string[] = [];
+  if (params.targetJob?.trim()) titleParts.push(params.targetJob.trim());
+  if (params.contract?.trim()) titleParts.push(params.contract.trim());
+  const title = titleParts.length ? titleParts.join(" — ") : (profile.contractType || "Candidature");
+
+  const skills = categorizeSkills(profile);
+
+  const xp = (profile.experiences || []).map((x) => ({
+    company: safeText(x.company),
+    city: safeText(x.location || ""),
+    role: safeText(x.role),
+    dates: safeText(x.dates),
+    bullets: Array.isArray(x.bullets) ? x.bullets.map(safeText).filter(Boolean) : [],
+  }));
+
+  const educationLines =
+    Array.isArray(profile.educationShort) && profile.educationShort.length
+      ? profile.educationShort.map(safeText).filter(Boolean)
+      : (profile.education || []).map((e) => {
+          const a = safeText(e.degree);
+          const b = safeText(e.school);
+          const c = safeText(e.dates);
+          const d = safeText(e.location || "");
+          return [a, b, c, d].filter(Boolean).join(" — ");
+        });
+
+  return {
+    name: safeText(profile.fullName) || safeText(profile.email) || "Candidat",
+    title,
+    contactLine: buildContactLine(profile),
+    profile: safeText(profile.profileSummary),
+    skills,
+    xp,
+    education: educationLines,
+    certs: safeText(profile.certs),
+    langLine: safeText(profile.langLine),
+    hobbies: Array.isArray(profile.hobbies) ? profile.hobbies.map(safeText).filter(Boolean) : [],
+  };
+}
+
+// --- Pour que l’IA écrive une VRAIE lettre (expériences, résultats, outils) ---
+function buildCandidateHighlights(profile: CvProfile) {
+  const topXp = (profile.experiences || []).slice(0, 3).map((xp, i) => {
+    const bullets = (xp.bullets || []).slice(0, 4).map((b) => `- ${b}`).join("\n");
+    return `EXP${i + 1}: ${xp.role} @ ${xp.company} (${xp.dates}${xp.location ? `, ${xp.location}` : ""})
+${bullets}`;
+  });
+
+  const skillLines = (profile.skills?.sections || [])
+    .slice(0, 4)
+    .map((s) => `${s.title}: ${(s.items || []).slice(0, 10).join(", ")}`);
+
+  const tools = (profile.skills?.tools || []).slice(0, 18);
+
+  return `
+CANDIDATE_NAME: ${profile.fullName}
+SUMMARY: ${profile.profileSummary}
+
+TOP_EXPERIENCES:
+${topXp.join("\n\n")}
+
+KEY_SKILLS:
+${skillLines.join("\n")}
+
+TOOLS:
+${tools.join(", ")}
+
+CERTS: ${profile.certs}
+LANGS: ${profile.langLine}
+`.trim();
+}
+
+function buildJobDescWithInstructions(args: {
+  jobDescription: string;
+  lang: Lang;
+  jobTitle: string;
+  companyName: string;
+  jobLink: string;
+  profile: CvProfile;
+}) {
+  const base = (args.jobDescription || "").trim();
+
+  const instrFR = `
+---
+INSTRUCTIONS IMPORTANTES (à respecter):
+- Rédige une lettre de motivation PERSONNALISÉE et crédible.
+- Utilise explicitement 2 à 3 expériences ci-dessous (réalisations / responsabilités).
+- Mets en avant compétences + outils pertinents pour le poste.
+- Adapte le discours à l'entreprise "${args.companyName}" et au poste "${args.jobTitle}".
+- Ton: professionnel, concret, pas de blabla.
+- Longueur: 220 à 320 mots (≈ 1 page A4).
+- Structure: 3 à 4 paragraphes.
+- Termine par une phrase d’appel à entretien.
+- IMPORTANT: Retourne UNIQUEMENT le CORPS de la lettre (pas d’en-tête, pas d’adresse, pas de signature).
+
+OFFRE_URL: ${args.jobLink || "(non fournie)"}
+
+PROFIL (à utiliser):
+${buildCandidateHighlights(args.profile)}
+`.trim();
+
+  const instrEN = `
+---
+IMPORTANT INSTRUCTIONS:
+- Write a REAL, tailored cover letter (credible, specific).
+- Explicitly use 2–3 experiences below (achievements/responsibilities).
+- Highlight relevant skills + tools for the role.
+- Adapt to company "${args.companyName}" and role "${args.jobTitle}".
+- Tone: professional, concrete, no fluff.
+- Length: 220–320 words (~1 A4 page).
+- Structure: 3–4 paragraphs.
+- End with a clear interview call-to-action.
+- IMPORTANT: Return ONLY the BODY (no header, no address, no signature).
+
+JOB_URL: ${args.jobLink || "(not provided)"}
+
+PROFILE (use it):
+${buildCandidateHighlights(args.profile)}
+`.trim();
+
+  const injected = args.lang === "fr" ? instrFR : instrEN;
+  if (!base) return injected;
+  return `${base}\n\n${injected}`;
+}
+
+function extractBodyFromLetterText(letterText: string, lang: Lang, fullName: string) {
+  const raw = safeText(letterText);
+  if (!raw) return "";
+
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return raw;
+
+  const first = lines[0].toLowerCase();
+  const isGreeting =
+    (lang === "fr" && (first.startsWith("madame") || first.startsWith("bonjour"))) ||
+    (lang === "en" && (first.startsWith("dear") || first.startsWith("hello")));
+
+  if (isGreeting) lines.shift();
+
+  while (lines.length) {
+    const last = lines[lines.length - 1].toLowerCase();
+    if (
+      last.includes("cordialement") ||
+      last.includes("bien cordialement") ||
+      last.includes("salutations") ||
+      last.includes("sincerely") ||
+      last.includes("best regards") ||
+      last.includes("kind regards")
+    ) {
+      lines.pop();
+      continue;
+    }
+    if (fullName && last.includes(fullName.toLowerCase())) {
+      lines.pop();
+      continue;
+    }
+    break;
+  }
+
+  const body = lines.join("\n\n").trim();
+  return body || raw;
+}
+
+function buildLmModel(profile: CvProfile, lang: Lang, companyName: string, jobTitle: string, letterText: string): LmModel {
+  const name = safeText(profile.fullName) || "Candidat";
+  const contactLines: string[] = [];
+  if (profile.phone) contactLines.push(lang === "fr" ? `Téléphone : ${safeText(profile.phone)}` : `Phone: ${safeText(profile.phone)}`);
+  if (profile.email) contactLines.push(lang === "fr" ? `Email : ${safeText(profile.email)}` : `Email: ${safeText(profile.email)}`);
+  if (profile.linkedin) contactLines.push(lang === "fr" ? `LinkedIn : ${safeText(profile.linkedin)}` : `LinkedIn: ${safeText(profile.linkedin)}`);
+
+  const city = safeText(profile.city) || "Paris";
+  const dateStr =
+    lang === "fr"
+      ? new Date().toLocaleDateString("fr-FR")
+      : new Date().toLocaleDateString("en-GB");
+
+  const subject =
+    lang === "fr"
+      ? `Objet : Candidature – ${jobTitle || "poste"}`
+      : `Subject: Application – ${jobTitle || "role"}`;
+
+  const salutation = lang === "fr" ? "Madame, Monsieur," : "Dear Hiring Manager,";
+  const closing = lang === "fr" ? "Cordialement," : "Sincerely,";
+
+  const body = extractBodyFromLetterText(letterText, lang, name);
+
+  return {
+    lang,
+    name,
+    contactLines,
+    service: lang === "fr" ? "Service Recrutement" : "Recruitment Team",
+    companyName: safeText(companyName) || (lang === "fr" ? "Entreprise" : "Company"),
+    companyAddr: "",
+    city,
+    dateStr,
+    subject,
+    salutation,
+    body: body || safeText(letterText),
+    closing,
+    signature: name,
+  };
+}
+
+// =============================
+// PAGE
+// =============================
+
+export default function AssistanceCandidaturePage() {
+  // --- PROFIL CV IA ---
+  const [userId, setUserId] = useState<string | null>(null);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [profile, setProfile] = useState<CvProfile | null>(null);
+  const [loadingProfile, setLoadingProfile] = useState(true);
+
+  // Bandeau global "IA en cours"
+  const [globalLoadingMessage, setGlobalLoadingMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        setUserId(null);
+        setUserEmail(null);
+        setProfile(null);
+        setLoadingProfile(false);
+        return;
+      }
+
+      setUserId(user.uid);
+      setUserEmail(user.email ?? null);
+
+      try {
+        const ref = doc(db, "profiles", user.uid);
+        const snap = await getDoc(ref);
+
+        if (snap.exists()) {
+          const data = snap.data() as any;
+
+          const loadedProfile: CvProfile = {
+            fullName: data.fullName || "",
+            email: data.email || "",
+            phone: data.phone || "",
+            linkedin: data.linkedin || "",
+            profileSummary: data.profileSummary || "",
+            city: data.city || "",
+            address: data.address || "",
+            contractType: data.contractType || data.contractTypeStandard || "",
+            contractTypeStandard: data.contractTypeStandard || "",
+            contractTypeFull: data.contractTypeFull || "",
+            primaryDomain: data.primaryDomain || "",
+            secondaryDomains: Array.isArray(data.secondaryDomains) ? data.secondaryDomains : [],
+            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
+            drivingLicense: data.drivingLicense || "",
+            vehicle: data.vehicle || "",
+            skills: {
+              sections: Array.isArray(data.skills?.sections) ? data.skills.sections : [],
+              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
+            },
+            experiences: Array.isArray(data.experiences) ? data.experiences : [],
+            education: Array.isArray(data.education) ? data.education : [],
+            educationShort: Array.isArray(data.educationShort) ? data.educationShort : [],
+            certs: data.certs || "",
+            langLine: data.langLine || "",
+            hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
+            updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : undefined,
+          };
+
+          setProfile(loadedProfile);
+        } else {
+          setProfile(null);
+        }
+      } catch (e) {
+        console.error("Erreur chargement profil Firestore (assistance):", e);
+      } finally {
+        setLoadingProfile(false);
+      }
+    });
+
+    return () => unsub();
+  }, []);
+
+  // --- ÉTATS CV IA ---
+  const [cvTargetJob, setCvTargetJob] = useState("");
+  const [cvTemplate, setCvTemplate] = useState("ats");
+  const [cvLang, setCvLang] = useState<Lang>("fr");
+  const [cvContract, setCvContract] = useState("CDI");
+  const [cvJobLink, setCvJobLink] = useState("");
+  const [cvJobDesc, setCvJobDesc] = useState("");
+  const [cvAutoCreate, setCvAutoCreate] = useState(true);
+
+  const [cvLoading, setCvLoading] = useState(false);
+  const [cvZipLoading, setCvZipLoading] = useState(false);
+  const [cvStatus, setCvStatus] = useState<string | null>(null);
+  const [cvError, setCvError] = useState<string | null>(null);
+
+  // ✅ Couleur PDF (rouge par défaut)
+  const [pdfBrand, setPdfBrand] = useState("#ef4444"); // 🔴 rouge
+
+  // --- ÉTATS LETTRE DE MOTIVATION ---
+  const [lmLang, setLmLang] = useState<Lang>("fr");
+  const [companyName, setCompanyName] = useState("");
+  const [jobTitle, setJobTitle] = useState("");
+  const [jobDescription, setJobDescription] = useState("");
+  const [jobLink, setJobLink] = useState("");
+  const [letterText, setLetterText] = useState("");
+  const [lmLoading, setLmLoading] = useState(false);
+  const [lmError, setLmError] = useState<string | null>(null);
+  const [letterCopied, setLetterCopied] = useState(false);
+  const [lmPdfLoading, setLmPdfLoading] = useState(false);
+  const [lmPdfError, setLmPdfError] = useState<string | null>(null);
+
+  // --- ÉTATS PITCH ---
+  const [pitchLang, setPitchLang] = useState<Lang>("fr");
+  const [pitchText, setPitchText] = useState("");
+  const [pitchLoading, setPitchLoading] = useState(false);
+  const [pitchError, setPitchError] = useState<string | null>(null);
+  const [pitchCopied, setPitchCopied] = useState(false);
+
+  // --- MAIL ---
+  const [recruiterName, setRecruiterName] = useState("");
+  const [emailPreview, setEmailPreview] = useState("");
+  const [subjectPreview, setSubjectPreview] = useState("");
+
+  // --- DERIVÉS ---
+  const visibilityLabel = userId ? "Associé à ton compte" : "Invité";
+
+  const miniHeadline =
+    profile?.profileSummary?.split(".")[0] ||
+    profile?.contractType ||
+    "Analyse ton CV PDF dans l’onglet « CV IA » pour activer l’assistant.";
+
+  const profileName = profile?.fullName || userEmail || "Profil non détecté";
+
+  const targetedJob = jobTitle || cvTargetJob || "Poste cible non renseigné";
+  const targetedCompany = companyName || "Entreprise non renseignée";
+
+  // --- Auto create /applications ---
+  type GenerationKind = "cv" | "cv_lm" | "lm" | "pitch";
+
+  const autoCreateApplication = async (kind: GenerationKind) => {
+    if (!cvAutoCreate) return;
+    if (!userId || !profile) return;
+
+    try {
+      const appsRef = collection(db, "applications");
+      await addDoc(appsRef, {
+        userId,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        company: companyName || "",
+        jobTitle: jobTitle || cvTargetJob || "",
+        jobLink: jobLink || cvJobLink || "",
+        status: "draft",
+        source: "Assistant candidature IA",
+        hasCv: kind === "cv" || kind === "cv_lm",
+        hasLm: kind === "lm" || kind === "cv_lm",
+        hasPitch: kind === "pitch",
+        langCv: cvLang,
+        langLm: lmLang,
+        langPitch: pitchLang,
+      });
+    } catch (e) {
+      console.error("Erreur création entrée suivi de candidature :", e);
+    }
+  };
+
+  // =============================
+  // ✅ Génération IA (lettre / pitch) - MODIFIÉ POUR TOKEN
+  // =============================
+
+  const generateCoverLetterText = async (lang: Lang): Promise<string> => {
+    if (!profile) throw new Error("Profil manquant.");
+    if (!jobTitle && !jobDescription) {
+      throw new Error("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
+    }
+
+    // 1. Récupérer l'utilisateur pour le token
+    const user = auth.currentUser;
+    if (!user) throw new Error("Vous devez être connecté pour générer une lettre.");
+    
+    // 2. Récupérer le token Auth
+    const token = await user.getIdToken();
+
+    const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
+
+    // ✅ injection pour forcer une VRAIE lettre (expériences, outils, concret)
+    const enrichedJobDescription = buildJobDescWithInstructions({
+      jobDescription,
+      lang,
+      jobTitle,
+      companyName,
+      jobLink,
+      profile,
+    });
+
+    // 3. Appel vers l'API locale avec le TOKEN dans les headers
+    const resp = await fetch(LETTER_AND_PITCH_URL, {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}` // <--- CLÉ DE L'AUTHENTIFICATION
+      },
+      body: JSON.stringify({
+        profile,
+        jobTitle,
+        companyName,
+        jobDescription: enrichedJobDescription,
+        lang,
+        recaptchaToken,
+      }),
+    });
+
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const msg = (json && json.error) || "Erreur pendant la génération de la lettre de motivation.";
+      throw new Error(msg);
+    }
+
+    const coverLetter = typeof json.coverLetter === "string" ? json.coverLetter.trim() : "";
+    if (!coverLetter) throw new Error("Lettre vide renvoyée par l'API.");
+    return coverLetter;
+  };
+
+  // =============================
+  // ✅ PDF locaux (CV + LM)
+  // =============================
+
+  const colors = useMemo(() => makePdfColors(pdfBrand), [pdfBrand]);
+
+  const handleGenerateCv = async () => {
+    if (!profile) {
+      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      return;
+    }
+
+    setCvError(null);
+    setCvStatus(null);
+    setCvLoading(true);
+    setGlobalLoadingMessage("Mise en page du CV (1 page)…");
+
+    try {
+      if (cvTemplate !== "ats") {
+        setCvStatus("Note : génération locale disponible en ATS (sobre) pour le moment.");
+      }
+
+      const cvModel: CvDocModel = profileToCvDocModel(profile, {
+        targetJob: cvTargetJob,
+        contract: cvContract,
+      });
+
+      const { blob, bestScale } = await fitOnePage((scale) =>
+        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
+      );
+
+      downloadBlob(blob, "cv-ia.pdf");
+      setCvStatus(`CV généré (1 page) ✅ (scale=${bestScale.toFixed(2)})`);
+
+      await autoCreateApplication("cv");
+
+      if (auth.currentUser) {
+        await logUsage({
+          user: auth.currentUser,
+          action: "generate_document",
+          docType: "cv",
+          eventType: "generate",
+          tool: "clientPdfMakeCv",
+        });
+      }
+    } catch (err: any) {
+      console.error("Erreur génération CV locale:", err);
+      setCvError(err?.message || "Impossible de générer le CV pour le moment.");
+    } finally {
+      setCvLoading(false);
+      setGlobalLoadingMessage(null);
+    }
+  };
+
+  const handleGenerateCvLmPdf = async () => {
+    if (!profile) {
+      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      return;
+    }
+
+    setCvError(null);
+    setCvStatus(null);
+    setCvZipLoading(true);
+    setGlobalLoadingMessage("Mise en page CV + lettre (1 page + 1 page)…");
+
+    try {
+      // 1) CV
+      const cvModel: CvDocModel = profileToCvDocModel(profile, {
+        targetJob: cvTargetJob,
+        contract: cvContract,
+      });
+
+      const cvFit = await fitOnePage((scale) =>
+        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
+      );
+
+      // 2) Lettre : si pas encore générée -> IA
+      let cover = letterText?.trim();
+      if (!cover) {
+        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
+        cover = await generateCoverLetterText(lmLang);
+        setLetterText(cover);
+      }
+
+      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
+
+      const lmFit = await fitOnePage(
+        (scale) => buildLmStyledPdf(lmModel, colors, scale),
+        { min: 0.85, max: 1.6, iterations: 7, initial: 1.0 }
+      );
+
+      // 3) Fusion -> 2 pages
+      const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
+      downloadBlob(merged, "cv-lm-ia.pdf");
+
+      setCvStatus("CV (1 page) + LM (1 page) générés ✅ (PDF 2 pages)");
+      await autoCreateApplication("cv_lm");
+
+      if (auth.currentUser) {
+        await logUsage({
+          user: auth.currentUser,
+          action: "generate_document",
+          docType: "cv",
+          eventType: "generate",
+          tool: "clientPdfMakeCvLm",
+        });
+        await logUsage({
+          user: auth.currentUser,
+          action: "generate_document",
+          docType: "lm",
+          eventType: "generate",
+          tool: "clientPdfMakeCvLm",
+          creditsDelta: 0,
+        });
+      }
+    } catch (err: any) {
+      console.error("Erreur génération CV+LM locale:", err);
+      setCvError(err?.message || "Impossible de générer CV + LM pour le moment.");
+    } finally {
+      setCvZipLoading(false);
+      setGlobalLoadingMessage(null);
+    }
+  };
+
+  // --- ACTIONS LETTRE ---
+  const handleGenerateLetter = async (e?: FormEvent) => {
+    if (e) e.preventDefault();
+    if (!profile) {
+      setLmError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      return;
+    }
+    if (!jobTitle && !jobDescription) {
+      setLmError("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
+      return;
+    }
+
+    setLmError(null);
+    setLmPdfError(null);
+    setPitchError(null);
+    setLmLoading(true);
+    setLetterCopied(false);
+    setGlobalLoadingMessage("L’IA rédige ta lettre de motivation…");
+
+    try {
+      const coverLetter = await generateCoverLetterText(lmLang);
+      setLetterText(coverLetter);
+
+      await autoCreateApplication("lm");
+
+      if (auth.currentUser) {
+        await logUsage({
+          user: auth.currentUser,
+          action: "generate_document",
+          docType: "lm",
+          eventType: "generate",
+          tool: "generateLetterAndPitch",
+        });
+      }
+    } catch (err: any) {
+      console.error("Erreur generateLetter:", err);
+      setLmError(err?.message || "Impossible de générer la lettre de motivation pour le moment.");
+    } finally {
+      setLmLoading(false);
+      setGlobalLoadingMessage(null);
+    }
+  };
+
+  // ✅ PDF LM local (auto-génère si texte vide)
+  const handleDownloadLetterPdf = async () => {
+    if (!profile) {
+      setLmPdfError("Profil manquant.");
+      return;
+    }
+    if (!jobTitle && !jobDescription && !letterText) {
+      setLmPdfError("Renseigne au moins le poste ou colle un extrait d’offre, puis génère/télécharge.");
+      return;
+    }
+
+    setLmPdfError(null);
+    setLmPdfLoading(true);
+    setGlobalLoadingMessage("Mise en forme PDF (lettre 1 page)…");
+
+    try {
+      let cover = letterText?.trim();
+      if (!cover) {
+        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
+        cover = await generateCoverLetterText(lmLang);
+        setLetterText(cover);
+      }
+
+      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
+
+      const { blob } = await fitOnePage(
+        (scale) => buildLmStyledPdf(lmModel, colors, scale),
+        { min: 0.85, max: 1.6, iterations: 7, initial: 1.0 }
+      );
+
+      downloadBlob(blob, "lettre-motivation.pdf");
+
+      if (auth.currentUser) {
+        await logUsage({
+          user: auth.currentUser,
+          action: "download_pdf",
+          docType: "other",
+          eventType: "lm_pdf_download",
+          tool: "clientPdfMakeLm",
+        });
+      }
+    } catch (err: any) {
+      console.error("Erreur LM PDF (local):", err);
+      setLmPdfError(err?.message || "Impossible de générer le PDF pour le moment.");
+    } finally {
+      setLmPdfLoading(false);
+      setGlobalLoadingMessage(null);
+    }
+  };
+
+  const handleCopyLetter = async () => {
+    if (!letterText) return;
+    try {
+      await navigator.clipboard.writeText(letterText);
+      setLetterCopied(true);
+      setTimeout(() => setLetterCopied(false), 1500);
+    } catch (e) {
+      console.error("Erreur copie LM:", e);
+    }
+  };
+
+  // --- PITCH ---
+  const handleGeneratePitch = async () => {
+    if (!profile) {
+      setPitchError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      return;
+    }
+
+    const effectiveJobTitle = jobTitle || cvTargetJob || "Candidature cible";
+    const effectiveDesc = jobDescription || cvJobDesc || "";
+
+    setPitchError(null);
+    setPitchLoading(true);
+    setPitchCopied(false);
+    setGlobalLoadingMessage("L’IA prépare ton pitch d’ascenseur…");
+
+    try {
+      // 1. Récupérer User + Token
+      const user = auth.currentUser;
+      if (!user) throw new Error("Connecte-toi pour générer un pitch.");
+      const token = await user.getIdToken();
+
+      const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
+
+      // 2. Appel API Locale avec Token
+      const resp = await fetch(LETTER_AND_PITCH_URL, {
+        method: "POST",
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}` 
+        },
+        body: JSON.stringify({
+          profile,
+          jobTitle: effectiveJobTitle,
+          companyName,
+          jobDescription: effectiveDesc,
+          lang: pitchLang,
+          recaptchaToken,
+        }),
+      });
+
+      const json = await resp.json().catch(() => null);
+
+      if (!resp.ok) {
+        const msg = (json && json.error) || "Erreur pendant la génération du pitch.";
+        throw new Error(msg);
+      }
+
+      const pitch = typeof json.pitch === "string" ? json.pitch.trim() : "";
+      if (!pitch) throw new Error("Pitch vide renvoyé par l'API.");
+
+      setPitchText(pitch);
+      await autoCreateApplication("pitch");
+
+      if (auth.currentUser) {
+        await logUsage({
+          user: auth.currentUser,
+          action: "generate_pitch",
+          docType: "other",
+          eventType: "generate",
+          tool: "generateLetterAndPitch",
+        });
+      }
+    } catch (err: any) {
+      console.error("Erreur generatePitch:", err);
+      setPitchError(err?.message || "Impossible de générer le pitch pour le moment.");
+    } finally {
+      setPitchLoading(false);
+      setGlobalLoadingMessage(null);
+    }
+  };
+
+  const handleCopyPitch = async () => {
+    if (!pitchText) return;
+    try {
+      await navigator.clipboard.writeText(pitchText);
+      setPitchCopied(true);
+      setTimeout(() => setPitchCopied(false), 1500);
+    } catch (e) {
+      console.error("Erreur copie pitch:", e);
+    }
+  };
+
+  // --- MAIL ---
+  const buildEmailContent = () => {
+    const name = profile?.fullName || "Je";
+    const subject = `Candidature – ${jobTitle || "poste"} – ${name}`;
+    const recruiter = recruiterName.trim() || "Madame, Monsieur";
+
+    const body = `Bonjour ${recruiter},
+
+Je me permets de vous adresser ma candidature pour le poste de ${jobTitle || "..."} au sein de ${
+      companyName || "votre entreprise"
+    }.
+
+Vous trouverez ci-joint mon CV ainsi que ma lettre de motivation.
+Mon profil correspond particulièrement à vos attentes sur ce poste, et je serais ravi(e) d'échanger avec vous pour en discuter de vive voix.
+
+Je reste bien entendu disponible pour tout complément d'information.
+
+Cordialement,
+
+${name}
+`;
+
+    setSubjectPreview(subject);
+    setEmailPreview(body);
+  };
+
+  const handleGenerateEmail = (e: FormEvent) => {
+    e.preventDefault();
+    buildEmailContent();
+  };
+
+  // --- RENDER ---
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.25 }}
+      className="max-w-3xl mx-auto px-3 sm:px-4 py-5 sm:py-6 space-y-4"
+    >
+      {/* Bandeau global IA */}
+      {globalLoadingMessage && (
+        <div className="mb-2 rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-1.5 text-[11px] flex items-center gap-2 text-[var(--muted)]">
+          <span className="inline-flex w-3 h-3 rounded-full border-2 border-[var(--brand)] border-t-transparent animate-spin" />
+          <span>{globalLoadingMessage}</span>
+        </div>
+      )}
+
+      {/* HEADER */}
+      <section className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="badge-muted flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+            <span className="text-[11px] uppercase tracking-wider text-[var(--muted)]">
+              Assistant de candidature IA
+            </span>
+          </p>
+          <div className="flex flex-wrap gap-2 text-[11px]">
+            <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
+              Profil IA :{" "}
+              <span className="ml-1 font-medium">
+                {loadingProfile ? "Chargement…" : profile ? "Détecté ✅" : "Non détecté"}
+              </span>
+            </span>
+            <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
+              Visibilité : <span className="ml-1 font-medium">{visibilityLabel}</span>
+            </span>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="space-y-1">
+            <h1 className="text-lg sm:text-xl font-semibold">Prépare ta candidature avec ton CV IA</h1>
+            <p className="text-[12px] text-[var(--muted)] max-w-xl">
+              Génère un <strong>CV 1 page</strong>, une <strong>lettre de motivation</strong> (1 page), un{" "}
+              <strong>pitch</strong> et un <strong>mail</strong>.
+            </p>
+          </div>
+
+          <div className="w-full sm:w-[220px] rounded-2xl border border-[var(--border)] bg-[var(--bg-soft)] px-3 py-2.5 text-[11px]">
+            <p className="text-[var(--muted)] mb-1">Résumé du profil</p>
+            <p className="font-semibold text-[var(--ink)] leading-tight">{profileName}</p>
+            <p className="mt-0.5 text-[var(--muted)] line-clamp-2">{miniHeadline}</p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-1.5 text-[11px]">
+          {[
+            "Cible le poste",
+            "Génère CV & LM",
+            "Prépare ton pitch",
+            "Génère ton mail",
+          ].map((t, i) => (
+            <span
+              key={i}
+              className="inline-flex items-center gap-1 rounded-full bg-[var(--bg-soft)] border border-[var(--border)] px-2 py-[3px]"
+            >
+              <span className="w-4 h-4 rounded-full bg-[var(--brand)]/10 flex items-center justify-center text-[10px] text-[var(--brand)]">
+                {i + 1}
+              </span>
+              <span>{t}</span>
+            </span>
+          ))}
+        </div>
+      </section>
+
+      {/* ÉTAPE 1 : CV */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
+              Étape 1
+            </span>
+            <div>
+              <h2 className="text-base sm:text-lg font-semibold text-[var(--ink)]">CV IA – 1 page A4</h2>
+              <p className="text-[11px] text-[var(--muted)]">
+                Génération locale (PDF) – rendu identique aux templates HTML.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-3 text-[13px]">
+          <div>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Titre / objectif du CV</label>
+            <input
+              id="cvTargetJob"
+              type="text"
+              className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+              placeholder="Ex : Ingénieur Cybersécurité"
+              value={cvTargetJob}
+              onChange={(e) => setCvTargetJob(e.target.value)}
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Modèle</label>
+              <select
+                id="cvTemplate"
+                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
+                value={cvTemplate}
+                onChange={(e) => setCvTemplate(e.target.value)}
+              >
+                <option value="ats">ATS (sobre) ✅</option>
+                <option value="design">Design (CLOUD)</option>
+                <option value="magazine">Magazine</option>
+                <option value="classic">Classique</option>
+                <option value="modern">Moderne</option>
+                <option value="minimalist">Minimaliste</option>
+                <option value="academic">Académique</option>
+              </select>
+              {cvTemplate !== "ats" && (
+                <p className="mt-1 text-[10px] text-[var(--muted)]">
+                  Génération locale disponible en <strong>ATS</strong> pour l’instant.
+                </p>
+              )}
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Langue</label>
+              <select
+                id="cvLang"
+                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
+                value={cvLang}
+                onChange={(e) => setCvLang(e.target.value as Lang)}
+              >
+                <option value="fr">Français</option>
+                <option value="en">English</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Contrat visé</label>
+              <select
+                id="cvContract"
+                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
+                value={cvContract}
+                onChange={(e) => setCvContract(e.target.value)}
+              >
+                <option value="CDI">CDI</option>
+                <option value="CDD">CDD</option>
+                <option value="Alternance">Alternance</option>
+                <option value="Stage">Stage</option>
+                <option value="Freelance">Freelance</option>
+              </select>
+            </div>
+
+            {/* ✅ COULEUR PDF */}
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Couleur PDF (CV + LM)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="color"
+                  value={pdfBrand}
+                  onChange={(e) => setPdfBrand(e.target.value)}
+                  className="h-9 w-12 rounded-lg border border-[var(--border)] bg-[var(--bg-soft)]"
+                  aria-label="Couleur du PDF"
+                />
+                <input
+                  type="text"
+                  value={pdfBrand}
+                  onChange={(e) => setPdfBrand(e.target.value)}
+                  className="input flex-1 text-[var(--ink)] bg-[var(--bg)]"
+                  placeholder="#ef4444"
+                />
+              </div>
+              <p className="mt-1 text-[10px] text-[var(--muted)]">
+                Par défaut : <strong>rouge</strong> (#ef4444).
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Lien de l&apos;offre (optionnel)
+              </label>
+              <input
+                id="cvJobLink"
+                type="url"
+                className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                placeholder="https://"
+                value={cvJobLink}
+                onChange={(e) => setCvJobLink(e.target.value)}
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Extraits de l&apos;offre (optionnel)
+              </label>
+              <textarea
+                id="cvJD"
+                rows={3}
+                className="input textarea w-full text-[13px] text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                placeholder="Colle quelques missions / outils / mots-clés de l’offre."
+                value={cvJobDesc}
+                onChange={(e) => setCvJobDesc(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="pt-1">
+            <label className="flex items-center gap-2 cursor-pointer text-[12px]">
+              <input
+                id="autoCreateSwitch"
+                type="checkbox"
+                className="toggle-checkbox"
+                checked={cvAutoCreate}
+                onChange={(e) => setCvAutoCreate(e.target.checked)}
+              />
+              <span className="text-[var(--muted)]">
+                Créer automatiquement une entrée dans le <strong>Suivi 📌</strong> à chaque génération.
+              </span>
+            </label>
+          </div>
+        </div>
+
+        <div className="flex flex-col sm:flex-row gap-2 pt-2">
+          <button
+            id="generateCvBtn"
+            type="button"
+            onClick={handleGenerateCv}
+            disabled={cvLoading || !profile}
+            className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <span>{cvLoading ? "Génération du CV..." : "Générer le CV (PDF) — 1 page"}</span>
+            <div id="cvBtnSpinner" className={`loader absolute inset-0 m-auto ${cvLoading ? "" : "hidden"}`} />
+          </button>
+
+          <button
+            id="generateCvLmPdfBtn"
+            type="button"
+            onClick={handleGenerateCvLmPdf}
+            disabled={cvZipLoading || !profile}
+            className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <span>{cvZipLoading ? "Génération PDF..." : "CV + LM (PDF) — 2 pages"}</span>
+            <div id="cvLmZipBtnSpinner" className={`loader absolute inset-0 m-auto ${cvZipLoading ? "" : "hidden"}`} />
+          </button>
+        </div>
+
+        <div className="mt-2 p-2.5 rounded-md border border-dashed border-[var(--border)]/70 text-[11px] text-[var(--muted)]">
+          {cvStatus ? (
+            <p className="text-center text-emerald-400 text-[12px]">{cvStatus}</p>
+          ) : (
+            <p className="text-center">
+              Génération locale : téléchargement direct (CV 1 page, ou CV+LM 2 pages).
+            </p>
+          )}
+          {cvError && <p className="mt-1 text-center text-red-400 text-[12px]">{cvError}</p>}
+        </div>
+      </section>
+
+      {/* ÉTAPE 2 : LM */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
+        <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
+          <span>
+            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
+          </span>
+          <span>
+            🏢 <span className="font-medium text-[var(--ink)]">{targetedCompany}</span>
+          </span>
+        </div>
+
+        <form onSubmit={handleGenerateLetter} className="space-y-3">
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
+                Étape 2
+              </span>
+              <div>
+                <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Lettre de motivation IA</h3>
+                <p className="text-[11px] text-[var(--muted)]">
+                  La lettre est générée en s’appuyant sur <strong>tes expériences</strong> (et outils), puis exportée en PDF (1 page).
+                </p>
+              </div>
+            </div>
+            <select
+              id="lmLang"
+              className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
+              value={lmLang}
+              onChange={(e) => setLmLang(e.target.value as Lang)}
+            >
+              <option value="fr">FR</option>
+              <option value="en">EN</option>
+            </select>
+          </div>
+
+          <div className="space-y-3 text-[13px]">
+            <div className="grid sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
+                <input
+                  id="companyName"
+                  type="text"
+                  className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                  placeholder="Ex : IMOGATE"
+                  value={companyName}
+                  onChange={(e) => setCompanyName(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
+                <input
+                  id="jobTitle"
+                  type="text"
+                  className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                  placeholder="Ex : Ingénieur Réseaux & Sécurité"
+                  value={jobTitle}
+                  onChange={(e) => setJobTitle(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Extraits de l&apos;offre (optionnel)</label>
+              <textarea
+                id="jobDescription"
+                rows={3}
+                className="input textarea w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                placeholder="Colle quelques missions / outils / contexte de l’offre."
+                value={jobDescription}
+                onChange={(e) => setJobDescription(e.target.value)}
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Lien de l&apos;offre (optionnel)</label>
+              <input
+                id="jobLink"
+                type="url"
+                className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                placeholder="https://"
+                value={jobLink}
+                onChange={(e) => setJobLink(e.target.value)}
+              />
+            </div>
+
+            {lmError && <p className="text-[11px] text-red-400">{lmError}</p>}
+
+            <div className="flex flex-col sm:flex-row gap-2 pt-1">
+              <button
+                id="generateCoverLetterBtn"
+                type="submit"
+                disabled={lmLoading || !profile}
+                className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <span>{lmLoading ? "Génération de la LM..." : "Générer la lettre"}</span>
+                <div id="lmBtnSpinner" className={`loader absolute inset-0 m-auto ${lmLoading ? "" : "hidden"}`} />
+              </button>
+
+              <button
+                id="downloadLetterPdfBtn"
+                type="button"
+                onClick={handleDownloadLetterPdf}
+                disabled={lmPdfLoading || !profile}
+                className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <span>{lmPdfLoading ? "Création du PDF..." : "Télécharger en PDF (1 page)"}</span>
+                <div className={`loader absolute inset-0 m-auto ${lmPdfLoading ? "" : "hidden"}`} />
+              </button>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2">
+              <button
+                id="copyLetterBtn"
+                type="button"
+                onClick={handleCopyLetter}
+                disabled={!letterText}
+                className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <span>{letterCopied ? "Texte copié ✅" : "Copier le texte"}</span>
+              </button>
+            </div>
+
+            {lmPdfError && <p className="text-[11px] text-red-400">{lmPdfError}</p>}
+          </div>
+        </form>
+
+        <div className="mt-2 p-3 card-soft rounded-md border border-dashed border-[var(--brand)]/50">
+          <p className="text-[11px] text-[var(--muted)] mb-1 text-center">
+            Dernière lettre générée (tu peux l&apos;adapter avant envoi ou PDF).
+          </p>
+          <div className="letter-pre text-[13px] text-[var(--ink)] overflow-auto max-h-[220px] whitespace-pre-line">
+            {letterText ? (
+              <p>{letterText}</p>
+            ) : (
+              <p className="text-center text-[var(--muted)]">Lance une génération pour voir ici le texte de la LM IA.</p>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* ÉTAPE 3 : PITCH */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3">
+        <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
+          <span>
+            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
+          </span>
+          <span>🧩 Utilise ce pitch pour mails, LinkedIn et entretiens.</span>
+        </div>
+
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
+              Étape 3
+            </span>
+            <div>
+              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Pitch d&apos;ascenseur</h3>
+              <p className="text-[11px] text-[var(--muted)]">
+                Résumé percutant de 2–4 phrases pour te présenter en 30–40 secondes.
+              </p>
+            </div>
+          </div>
+          <select
+            id="pitchLang"
+            className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
+            value={pitchLang}
+            onChange={(e) => setPitchLang(e.target.value as Lang)}
+          >
+            <option value="fr">FR</option>
+            <option value="en">EN</option>
+          </select>
+        </div>
+
+        {pitchError && <p className="text-[11px] text-red-400">{pitchError}</p>}
+
+        <div className="flex flex-col sm:flex-row gap-2 pt-1">
+          <button
+            id="generatePitchBtn"
+            type="button"
+            onClick={handleGeneratePitch}
+            disabled={pitchLoading || !profile}
+            className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <span>{pitchLoading ? "Génération du pitch..." : "Générer le pitch"}</span>
+            <div id="pitchBtnSpinner" className={`loader absolute inset-0 m-auto ${pitchLoading ? "" : "hidden"}`} />
+          </button>
+          <button
+            id="copyPitchBtn"
+            type="button"
+            onClick={handleCopyPitch}
+            disabled={!pitchText}
+            className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <span>{pitchCopied ? "Pitch copié ✅" : "Copier le pitch"}</span>
+          </button>
+        </div>
+
+        <div className="mt-2 p-3 card-soft rounded-md text-[13px] text-[var(--ink)] whitespace-pre-line">
+          {pitchText ? (
+            <p>{pitchText}</p>
+          ) : (
+            <p className="text-center text-[11px] text-[var(--muted)]">
+              Après génération, ton pitch apparaîtra ici.
+            </p>
+          )}
+        </div>
+      </section>
+
+      {/* ÉTAPE 4 : MAIL */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
+              Étape 4
+            </span>
+            <div>
+              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Mail de candidature</h3>
+              <p className="text-[11px] text-[var(--muted)] max-w-xl">
+                Génère un <strong>objet</strong> et un <strong>corps de mail</strong> à copier.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <form onSubmit={handleGenerateEmail} className="grid md:grid-cols-2 gap-4 text-sm mt-1">
+          <div>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
+            <input
+              className="input w-full"
+              value={companyName}
+              onChange={(e) => setCompanyName(e.target.value)}
+              placeholder="Ex : IMOGATE"
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
+            <input
+              className="input w-full"
+              value={jobTitle}
+              onChange={(e) => setJobTitle(e.target.value)}
+              placeholder="Ex : Ingénieur Réseaux & Sécurité"
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom du recruteur (optionnel)</label>
+            <input
+              className="input w-full"
+              value={recruiterName}
+              onChange={(e) => setRecruiterName(e.target.value)}
+              placeholder="Ex : Mme Dupont"
+            />
+          </div>
+          <div className="md:col-span-2 flex justify-end">
+            <button type="submit" className="btn-primary min-w-[200px]">
+              Générer le mail
+            </button>
+          </div>
+        </form>
+
+        <div className="grid md:grid-cols-2 gap-4 mt-3 text-sm">
+          <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
+            <h4 className="font-semibold text-sm mb-2">Objet</h4>
+            <div className="text-xs text-[var(--muted)] whitespace-pre-line">
+              {subjectPreview || "L'objet généré apparaîtra ici."}
+            </div>
+          </div>
+          <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
+            <h4 className="font-semibold text-sm mb-2">Corps du mail</h4>
+            <div className="text-xs text-[var(--muted)] whitespace-pre-line max-h-64 overflow-auto">
+              {emailPreview || "Le texte du mail apparaîtra ici après génération."}
+            </div>
+          </div>
+        </div>
+
+        <p className="text-[10px] text-[var(--muted)] mt-3">
+          📌 Copie-colle l&apos;objet et le texte, puis joins le CV et la lettre PDF.
+        </p>
+      </section>
+    </motion.div>
+  );
+}
 ````
 
 ## File: lib/gemini.ts
@@ -25253,257 +25291,6 @@ export async function callGenerateLetterPdf(params: {
     { letterText, candidateName, jobTitle, companyName, lang, recaptchaToken },
     { timeoutMs: 120_000 }
   );
-}
-````
-
-## File: lib/recaptcha.ts
-````typescript
-// lib/recaptcha.ts
-"use client";
-
-/**
- * ✅ Single source of truth reCAPTCHA (v3 standard ou Enterprise)
- * - Loader robuste (si script pas encore chargé)
- * - tryGetRecaptchaToken(): non bloquant => retourne null si adblock/timeout…
- * - getRecaptchaToken(): strict => throw si impossible
- * - verifyRecaptcha(): optionnel via ton endpoint CF /recaptchaVerify (Enterprise)
- */
-
-declare global {
-  interface Window {
-    grecaptcha?: GrecaptchaRoot;
-  }
-}
-
-type GrecaptchaClient = {
-  ready?: (cb: () => void) => void;
-  execute: (siteKey: string, opts: { action: string }) => Promise<string>;
-};
-
-type GrecaptchaRoot = GrecaptchaClient & {
-  enterprise?: GrecaptchaClient;
-};
-
-export type VerifyResult =
-  | { ok: true; score?: number }
-  | { ok: false; reason: string; score?: number };
-
-const DEFAULT_API_BASE =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
-
-export const API_BASE = (
-  process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE
-).replace(/\/+$/, "");
-
-const SITE_KEY =
-  process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY ||
-  process.env.NEXT_PUBLIC_RECAPTCHA_KEY ||
-  "";
-
-const USE_ENTERPRISE =
-  (process.env.NEXT_PUBLIC_RECAPTCHA_ENTERPRISE || "")
-    .toLowerCase()
-    .trim() === "true";
-
-let recaptchaLoadPromise: Promise<void> | null = null;
-
-function isBrowser() {
-  return typeof window !== "undefined" && typeof document !== "undefined";
-}
-
-function normalizeAction(action: string) {
-  return (action || "").trim().toLowerCase();
-}
-
-function describeRecaptchaLoadFailure() {
-  return [
-    "Sécurité: impossible de valider reCAPTCHA.",
-    "Le script reCAPTCHA n’a pas pu être chargé ou est bloqué.",
-    "Causes fréquentes: bloqueur de pubs, DNS filtrant, proxy/corporate, CSP trop stricte, ou réseau qui bloque google.com.",
-  ].join(" ");
-}
-
-function hasUsableRecaptcha(): boolean {
-  const g = window.grecaptcha;
-  if (!g) return false;
-
-  if (USE_ENTERPRISE) {
-    return Boolean(g.enterprise && typeof g.enterprise.execute === "function");
-  }
-
-  return typeof g.execute === "function";
-}
-
-function pickRecaptchaClient(): GrecaptchaClient | null {
-  const g = window.grecaptcha;
-  if (!g) return null;
-
-  if (USE_ENTERPRISE) {
-    if (g.enterprise && typeof g.enterprise.execute === "function") return g.enterprise;
-    return null;
-  }
-
-  if (typeof g.execute === "function") return g;
-  return null;
-}
-
-/**
- * ✅ Loader robuste:
- * - attend que grecaptcha soit réellement dispo (poll)
- * - retentable (reset promise en cas d’échec)
- */
-async function ensureRecaptchaLoaded(): Promise<void> {
-  if (!isBrowser()) {
-    throw new Error("reCAPTCHA: appelé côté serveur (SSR).");
-  }
-  if (!SITE_KEY) {
-    throw new Error("reCAPTCHA: NEXT_PUBLIC_RECAPTCHA_SITE_KEY manquant.");
-  }
-  if (hasUsableRecaptcha()) return;
-  if (recaptchaLoadPromise) return recaptchaLoadPromise;
-
-  recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
-    const selector = USE_ENTERPRISE
-      ? 'script[data-recaptcha="enterprise"]'
-      : 'script[data-recaptcha="v3"]';
-
-    const existing = document.querySelector<HTMLScriptElement>(selector);
-
-    const pollUntilReady = (ms: number) => {
-      const t0 = Date.now();
-      const tick = () => {
-        if (hasUsableRecaptcha()) return resolve();
-        if (Date.now() - t0 > ms) return reject(new Error(describeRecaptchaLoadFailure()));
-        requestAnimationFrame(tick);
-      };
-      tick();
-    };
-
-    // Script déjà présent => on attend juste l'exposition de grecaptcha
-    if (existing) {
-      pollUntilReady(10_000);
-      return;
-    }
-
-    const script = document.createElement("script");
-    script.async = true;
-    script.defer = true;
-    script.setAttribute("data-recaptcha", USE_ENTERPRISE ? "enterprise" : "v3");
-
-    const base = USE_ENTERPRISE
-      ? "https://www.google.com/recaptcha/enterprise.js"
-      : "https://www.google.com/recaptcha/api.js";
-
-    script.src = `${base}?render=${encodeURIComponent(SITE_KEY)}`;
-
-    const timeout = window.setTimeout(() => {
-      reject(new Error(describeRecaptchaLoadFailure()));
-    }, 12_000);
-
-    script.onload = () => {
-      window.clearTimeout(timeout);
-      pollUntilReady(8_000);
-    };
-
-    script.onerror = () => {
-      window.clearTimeout(timeout);
-      reject(new Error(describeRecaptchaLoadFailure()));
-    };
-
-    document.head.appendChild(script);
-  }).catch((e) => {
-    recaptchaLoadPromise = null; // ✅ retentable
-    throw e;
-  });
-
-  return recaptchaLoadPromise;
-}
-
-/**
- * ✅ Non bloquant :
- * - retourne un token si possible
- * - sinon null (adblock, script bloqué, timeout…)
- */
-export async function tryGetRecaptchaToken(action: string): Promise<string | null> {
-  if (!isBrowser()) return null;
-  if (!SITE_KEY) return null;
-
-  const normalizedAction = normalizeAction(action);
-  if (!normalizedAction) return null;
-
-  try {
-    await ensureRecaptchaLoaded();
-    const client = pickRecaptchaClient();
-    if (!client) return null;
-
-    const token = await new Promise<string>((resolve, reject) => {
-      const runExecute = () => {
-        client
-          .execute(SITE_KEY, { action: normalizedAction })
-          .then((t) => resolve(t))
-          .catch(reject);
-      };
-
-      try {
-        if (typeof client.ready === "function") client.ready(runExecute);
-        else runExecute();
-      } catch (e) {
-        reject(e);
-      }
-    });
-
-    return typeof token === "string" && token ? token : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Version stricte */
-export async function getRecaptchaToken(action: string): Promise<string> {
-  const token = await tryGetRecaptchaToken(action);
-  if (!token) {
-    throw new Error(describeRecaptchaLoadFailure());
-  }
-  return token;
-}
-
-export async function warmupRecaptcha(): Promise<void> {
-  await ensureRecaptchaLoaded();
-}
-
-/** Vérif optionnelle via endpoint /recaptchaVerify */
-export async function verifyRecaptcha(token: string, action: string): Promise<VerifyResult> {
-  const normalizedAction = normalizeAction(action);
-
-  if (!token) return { ok: false, reason: "missing_token" };
-  if (!normalizedAction) return { ok: false, reason: "missing_action" };
-
-  try {
-    const res = await fetch(`${API_BASE}/recaptchaVerify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token, action: normalizedAction }),
-      cache: "no-store",
-    });
-
-    const data: any = await res.json().catch(() => ({}));
-
-    if (!res.ok || !data?.ok) {
-      return {
-        ok: false,
-        reason: String(data?.reason || data?.details?.reason || "recaptcha_failed"),
-        score: typeof data?.score === "number"
-          ? data.score
-          : typeof data?.details?.score === "number"
-            ? data.details.score
-            : undefined,
-      };
-    }
-
-    return { ok: true, score: typeof data?.score === "number" ? data.score : undefined };
-  } catch {
-    return { ok: false, reason: "network_error" };
-  }
 }
 ````
 

@@ -2,13 +2,12 @@
 "use strict";
 
 /**
- * ✅ Version nettoyée (SANS doublons / SANS commandes terminal dans le JS)
- * ✅ Import v1 explicite (Cloud Functions Gen1)
- * ✅ Option bypass reCAPTCHA en dev/emulator (via env)
- *
- * IMPORTANT :
- * - Utilise Node 18+ (fetch natif)
- * - Ne colle JAMAIS "npm install ..." dans ce fichier
+ * Version avec :
+ * - reCAPTCHA conservé sur les autres endpoints
+ * - generateLetterAndPitch SANS reCAPTCHA NI auth obligatoire
+ * - ✅ PROMPTS (FR/EN) intégrés DIRECTEMENT dans CE FICHIER (plus de fichiers prompts séparés)
+ *   -> generateLetterAndPitch utilise buildLetterAndPitchPrompt()
+ *   -> generateCvLmZip utilise buildLmBodyPrompt()
  */
 
 const functions = require("firebase-functions/v1");
@@ -16,10 +15,9 @@ const admin = require("firebase-admin");
 const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
 const JSZip = require("jszip");
 const { Polar } = require("@polar-sh/sdk");
-// const { validateEvent, WebhookVerificationError } = require("@polar-sh/sdk/webhooks"); // (signature optionnelle)
 const { RecaptchaEnterpriseServiceClient } = require("@google-cloud/recaptcha-enterprise");
 
-// Initialisation Firebase Admin (pour Firestore + auth + callable)
+// Initialisation Firebase Admin
 if (!admin.apps.length) {
   admin.initializeApp();
 }
@@ -36,21 +34,167 @@ if (!fetchFn) {
 }
 
 // =============================
-//  reCAPTCHA Enterprise (config + helper)
+//  ✅ PROMPTS LM / Letter+Pitch (INLINE)
+// =============================
+const TEMPLATE_LETTER_PITCH_FR = `
+Tu es un coach carrières senior et recruteur.
+
+Retourne STRICTEMENT un JSON valide :
+{ "coverLetter": "string", "pitch": "string" }
+
+RÈGLES LETTRE :
+- "coverLetter" = UNIQUEMENT le CORPS (pas d’en-tête, pas d’objet, pas de formule d’appel, pas de signature).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Ne pas inventer (entreprises/outils/chiffres).
+- Utilise UNIQUEMENT le profil candidat + la fiche de poste.
+
+PROFIL CANDIDAT (source de vérité) :
+{{cvText}}
+
+FICHE DE POSTE :
+{{jobDescription}}
+
+INTITULÉ : {{jobTitle}}
+ENTREPRISE : {{companyName}}
+`.trim();
+
+const TEMPLATE_LETTER_PITCH_EN = `
+You are a senior career coach and recruiter.
+
+Return STRICTLY valid JSON:
+{ "coverLetter": "string", "pitch": "string" }
+
+COVER LETTER RULES:
+- "coverLetter" must be ONLY the BODY (no header, no subject, no greeting, no signature).
+- 3 to 5 short paragraphs separated by a blank line.
+- Do not invent facts, companies, tools, numbers.
+- Use ONLY the candidate profile and the job description.
+
+CANDIDATE PROFILE (source of truth):
+{{cvText}}
+
+JOB DESCRIPTION:
+{{jobDescription}}
+
+JOB TITLE: {{jobTitle}}
+COMPANY: {{companyName}}
+`.trim();
+
+const TEMPLATE_LM_BODY_FR = `
+Tu es un coach carrières senior et recruteur.
+
+MISSION :
+Rédige UNIQUEMENT le CORPS d’une lettre de motivation adaptée au poste, basée UNIQUEMENT sur les infos fournies (CV + fiche de poste).
+
+ENTRÉES :
+- Intitulé : "{{jobTitle}}"
+- Entreprise : "{{companyName}}"
+- Fiche de poste :
+{{jobDescription}}
+
+- Profil candidat :
+{{cvText}}
+
+RÈGLES :
+- Ne pas inventer (pas de chiffres/clients/technos non présents).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Pas d’en-tête, pas d’objet, pas de salutation, pas de signature.
+- Réponds STRICTEMENT en JSON :
+{ "body": "..." }
+`.trim();
+
+const TEMPLATE_LM_BODY_EN = `
+You are a senior career coach and recruiter.
+
+TASK:
+Write ONLY the BODY of a cover letter tailored to the job, using ONLY the provided information (CV + job description).
+
+INPUTS:
+- Job title: "{{jobTitle}}"
+- Company: "{{companyName}}"
+- Job description:
+{{jobDescription}}
+
+- Candidate profile (source of truth):
+{{cvText}}
+
+STRICT RULES:
+- Do NOT invent facts (no fake metrics, clients, tools, dates).
+- 3 to 5 paragraphs separated by ONE blank line.
+- No header, no subject line, no greeting, no signature.
+- Output MUST be STRICT JSON only:
+{ "body": "..." }
+`.trim();
+
+function normalizeLang(langRaw) {
+  const l = String(langRaw || "fr").toLowerCase();
+  return l.startsWith("en") ? "en" : "fr";
+}
+
+function fillTemplate(template, vars) {
+  return template.replace(/\{\{(\w+)\}\}/g, (_, k) =>
+    String(vars && Object.prototype.hasOwnProperty.call(vars, k) ? vars[k] : "")
+  );
+}
+
+/**
+ * Prompt pour endpoint generateLetterAndPitch
+ * -> attend JSON { coverLetter, pitch }
+ */
+function buildLetterAndPitchPrompt({
+  lang,
+  cvText,
+  jobDescription,
+  jobTitle,
+  companyName,
+}) {
+  const L = normalizeLang(lang);
+  const tpl = L === "en" ? TEMPLATE_LETTER_PITCH_EN : TEMPLATE_LETTER_PITCH_FR;
+
+  return fillTemplate(tpl, {
+    cvText: cvText || "",
+    jobDescription: jobDescription || "—",
+    jobTitle: jobTitle || (L === "en" ? "the role" : "le poste"),
+    companyName: companyName || (L === "en" ? "your company" : "votre entreprise"),
+  });
+}
+
+/**
+ * Prompt pour générer UNIQUEMENT le corps de LM
+ * -> attend JSON { body }
+ */
+function buildLmBodyPrompt({
+  lang,
+  cvText,
+  jobDescription,
+  jobTitle,
+  companyName,
+}) {
+  const L = normalizeLang(lang);
+  const tpl = L === "en" ? TEMPLATE_LM_BODY_EN : TEMPLATE_LM_BODY_FR;
+
+  return fillTemplate(tpl, {
+    cvText: cvText || "",
+    jobDescription: jobDescription || "—",
+    jobTitle: jobTitle || (L === "en" ? "the role" : "le poste"),
+    companyName: companyName || (L === "en" ? "your company" : "votre entreprise"),
+  });
+}
+
+// =============================
+//  reCAPTCHA Enterprise
 // =============================
 const recaptchaClient = new RecaptchaEnterpriseServiceClient();
 
 function getRecaptchaConfig() {
-  const cfg = (functions.config && functions.config() && functions.config().recaptcha) || {};
+  const cfg =
+    (functions.config && functions.config() && functions.config().recaptcha) || {};
 
   const projectId = cfg.project_id || process.env.RECAPTCHA_PROJECT_ID || "";
   const siteKey = cfg.site_key || process.env.RECAPTCHA_SITE_KEY || "";
   const thresholdRaw = cfg.threshold || process.env.RECAPTCHA_THRESHOLD || "0.5";
   const threshold = Number(thresholdRaw);
 
-  // ✅ Bypass optionnel (dev seulement recommandé)
-  // - RECAPTCHA_BYPASS=true
-  // - ou functions:config:set recaptcha.bypass=true
   const bypassRaw = cfg.bypass || process.env.RECAPTCHA_BYPASS || "false";
   const bypass = String(bypassRaw).toLowerCase() === "true";
 
@@ -63,7 +207,10 @@ function getRecaptchaConfig() {
 }
 
 function isEmulator() {
-  return process.env.FUNCTIONS_EMULATOR === "true" || !!process.env.FIREBASE_EMULATOR_HUB;
+  return (
+    process.env.FUNCTIONS_EMULATOR === "true" ||
+    !!process.env.FIREBASE_EMULATOR_HUB
+  );
 }
 
 function getClientIp(req) {
@@ -79,24 +226,17 @@ function getClientIp(req) {
   return typeof ip === "string" ? ip : "";
 }
 
-/**
- * Vérifie le token reCAPTCHA Enterprise.
- * expectedAction :
- * - si fourni -> vérifie que l'action du token correspond
- * - sinon -> pas de check d'action
- */
 async function verifyRecaptchaToken({ token, expectedAction, req }) {
   const { projectId, siteKey, threshold, bypass } = getRecaptchaConfig();
 
-  // ✅ Bypass explicite (utile en local/dev)
+  // bypass en dev si configuré
   if (bypass && (isEmulator() || process.env.NODE_ENV !== "production")) {
     return { ok: true, bypass: true, score: null, threshold };
   }
 
-  // Si pas configuré, on ne bloque pas (mais on log)
   if (!projectId || !siteKey) {
     console.warn(
-      "reCAPTCHA non configuré (recaptcha.project_id / recaptcha.site_key manquants) => vérification bypass."
+      "reCAPTCHA non configuré (project_id / site_key manquants) => bypass."
     );
     return { ok: true, bypass: true, score: null, threshold };
   }
@@ -133,7 +273,6 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
       };
     }
 
-    // Action check (si fourni)
     if (
       expectedAction &&
       tokenProps.action &&
@@ -165,11 +304,6 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
   }
 }
 
-/**
- * Important sécurité :
- * - expectedAction (passée par l'endpoint) a priorité.
- * - sinon on lit req.body.action (utile pour /recaptchaVerify).
- */
 async function enforceRecaptchaOrReturn(req, res, expectedAction) {
   const token =
     (req.body && (req.body.recaptchaToken || req.body.token)) ||
@@ -195,14 +329,12 @@ async function enforceRecaptchaOrReturn(req, res, expectedAction) {
   if (!result.ok) {
     return res.status(403).json({ error: "reCAPTCHA failed", details: result });
   }
-  return null; // ok
+  return null;
 }
 
 // =============================
 //  CORS
 // =============================
-
-// Exemple env: CORS_ALLOW_ORIGINS="https://assistant-ia-v4.web.app,https://assistant-ia-v4.firebaseapp.com,http://localhost:3000"
 function getAllowedOrigins() {
   const raw =
     process.env.CORS_ALLOW_ORIGINS ||
@@ -217,7 +349,6 @@ function getAllowedOrigins() {
     .filter(Boolean);
 }
 
-// Pas de credentials côté front -> pas besoin de Allow-Credentials
 function setCors(req, res) {
   const origin = req.headers.origin;
   const allowlist = getAllowedOrigins();
@@ -239,7 +370,7 @@ function setCors(req, res) {
 }
 
 // =============================
-//  ✅ AUTH + CREDITS (serveur) : débit crédits + logs
+//  AUTH + CREDITS (serveur)
 // =============================
 function getBearerToken(req) {
   const h = req.headers["authorization"] || req.headers["Authorization"] || "";
@@ -310,9 +441,9 @@ async function debitCreditsAndLog({
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    // documents
     if (docsGenerated && docsGenerated > 0) {
-      updates.totalDocumentsGenerated = admin.firestore.FieldValue.increment(docsGenerated);
+      updates.totalDocumentsGenerated =
+        admin.firestore.FieldValue.increment(docsGenerated);
     }
     if (cvGenerated && cvGenerated > 0) {
       updates.totalCvGenerated = admin.firestore.FieldValue.increment(cvGenerated);
@@ -335,7 +466,7 @@ async function debitCreditsAndLog({
         creditsDelta: -cost,
         meta: meta || null,
         path: path || null,
-        createdAt: now, // number (ms)
+        createdAt: now,
         createdAtServer: admin.firestore.FieldValue.serverTimestamp(),
         ip: ip || null,
         userAgent: userAgent || null,
@@ -346,7 +477,7 @@ async function debitCreditsAndLog({
 }
 
 // =============================
-//  HTTPS: recaptchaVerify
+//  recaptchaVerify
 // =============================
 exports.recaptchaVerify = functions
   .region("europe-west1")
@@ -399,7 +530,12 @@ function inferContractTypeStandard(raw) {
 
   if (norm.includes("alternance") || norm.includes("apprentissage")) return "Alternance";
   if (norm.includes("stage") || norm.includes("intern")) return "Stage";
-  if (norm.includes("freelance") || norm.includes("independant") || norm.includes("indépendant") || norm.includes("auto-entrepreneur"))
+  if (
+    norm.includes("freelance") ||
+    norm.includes("independant") ||
+    norm.includes("indépendant") ||
+    norm.includes("auto-entrepreneur")
+  )
     return "Freelance";
   if (norm.includes("cdd") || norm.includes("duree determinee") || norm.includes("durée determinée"))
     return "CDD";
@@ -466,10 +602,7 @@ exports.adminUpdateCredits = functions
     const userRef = db.collection("users").doc(userId);
 
     await userRef.set(
-      {
-        credits,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
+      { credits, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
       { merge: true }
     );
 
@@ -492,7 +625,10 @@ async function callGeminiText(prompt, apiKey, temperature = 0.7, maxOutputTokens
 
   const resp = await fetchFn(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
     body: JSON.stringify(body),
   });
 
@@ -524,7 +660,10 @@ async function callGeminiWithCv(base64Pdf, apiKey) {
         role: "user",
         parts: [
           {
-            inline_data: { mime_type: "application/pdf", data: base64Pdf },
+            inline_data: {
+              mime_type: "application/pdf",
+              data: base64Pdf,
+            },
           },
           {
             text: `Lis ce CV et renvoie STRICTEMENT un JSON valide avec exactement ce schéma :
@@ -580,7 +719,10 @@ RÈGLES IMPORTANTES :
 
   const resp = await fetchFn(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
     body: JSON.stringify(body),
   });
 
@@ -604,12 +746,10 @@ RÈGLES IMPORTANTES :
     parsed = data;
   }
 
-  // Post-traitement (skills/tools/softskills + contrat)
   let sectionsRaw = Array.isArray(parsed?.skills?.sections) ? parsed.skills.sections : [];
   let tools = Array.isArray(parsed?.skills?.tools) ? parsed.skills.tools : [];
   let softSkillsArr = Array.isArray(parsed?.softSkills) ? parsed.softSkills : [];
 
-  // Soft skills clean/dedup
   const softSeen = new Set();
   softSkillsArr = softSkillsArr
     .filter((s) => typeof s === "string")
@@ -621,7 +761,6 @@ RÈGLES IMPORTANTES :
       return true;
     });
 
-  // Inject soft skills into sections if needed
   if (softSkillsArr.length > 0) {
     let idx = sectionsRaw.findIndex(
       (sec) =>
@@ -644,7 +783,6 @@ RÈGLES IMPORTANTES :
     }
   }
 
-  // Clean sections
   const sections = sectionsRaw
     .map((sec) => {
       const seen = new Set();
@@ -665,7 +803,6 @@ RÈGLES IMPORTANTES :
     })
     .filter((sec) => sec.title || sec.items.length);
 
-  // Clean tools
   const cleanTools = [];
   const seenTools = new Set();
   for (const raw of tools) {
@@ -678,12 +815,10 @@ RÈGLES IMPORTANTES :
   }
   tools = cleanTools;
 
-  // Dedup tools vs section items
   const sectionItemSet = new Set();
   sections.forEach((sec) => sec.items.forEach((it) => sectionItemSet.add(String(it).toLowerCase())));
   tools = tools.filter((t) => !sectionItemSet.has(String(t).toLowerCase()));
 
-  // Contract
   const contractTypeFull = parsed?.contractTypeFull || parsed?.contractType || "";
   let contractTypeStandard = parsed?.contractTypeStandard || "";
   if (!contractTypeStandard) contractTypeStandard = inferContractTypeStandard(contractTypeFull);
@@ -722,7 +857,7 @@ RÈGLES IMPORTANTES :
 }
 
 // =============================
-//  HTTPS: extractProfile
+//  extractProfile
 // =============================
 exports.extractProfile = functions
   .region("europe-west1")
@@ -734,14 +869,13 @@ exports.extractProfile = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "extract_profile");
     if (deny) return;
 
     try {
       const base64Pdf = req.body?.base64Pdf;
       if (!base64Pdf) {
-        return res.status(400).json({ error: "Champ 'base64Pdf' manquant dans le corps JSON." });
+        return res.status(400).json({ error: "Champ 'base64Pdf' manquant." });
       }
 
       const GEMINI_API_KEY =
@@ -872,7 +1006,6 @@ exports.interview = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "interview");
     if (deny) return;
 
@@ -884,7 +1017,6 @@ exports.interview = functions
         return res.status(400).json({ error: "Champ 'action' manquant ('start' ou 'answer')." });
       }
 
-      // START
       if (action === "start") {
         const userId = body.userId || "";
         const jobTitle = body.jobTitle || "";
@@ -924,8 +1056,7 @@ exports.interview = functions
 
         try {
           const GEMINI_API_KEY =
-            process.env.GEMINI_API_KEY ||
-            (functions.config().gemini && functions.config().gemini.key);
+            process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
 
           if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY manquante");
 
@@ -975,7 +1106,6 @@ exports.interview = functions
         });
       }
 
-      // ANSWER
       if (action === "answer") {
         const userId = body.userId || "";
         const sessionId = body.sessionId || "";
@@ -1013,8 +1143,7 @@ exports.interview = functions
 
         try {
           const GEMINI_API_KEY =
-            process.env.GEMINI_API_KEY ||
-            (functions.config().gemini && functions.config().gemini.key);
+            process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
 
           if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY manquante");
 
@@ -1037,7 +1166,8 @@ exports.interview = functions
           console.error("Erreur Gemini (interview/answer):", err);
         }
 
-        const isLastStep = session.currentStep >= (session.totalQuestions || INTERVIEW_QUESTION_PLAN.complet);
+        const isLastStep =
+          session.currentStep >= (session.totalQuestions || INTERVIEW_QUESTION_PLAN.complet);
 
         if (!nextQuestion && !finalSummary) {
           if (isLastStep) {
@@ -1053,7 +1183,11 @@ exports.interview = functions
         }
 
         if (nextQuestion) {
-          session.history.push({ role: "interviewer", text: nextQuestion, createdAt: new Date().toISOString() });
+          session.history.push({
+            role: "interviewer",
+            text: nextQuestion,
+            createdAt: new Date().toISOString(),
+          });
         }
 
         if (finalSummary || isLastStep) session.finished = true;
@@ -1095,7 +1229,9 @@ function buildProfileContextForIA(profile) {
         if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
       });
     }
-    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
+    if (Array.isArray(p.skills.tools)) {
+      skillsArr = skillsArr.concat(p.skills.tools);
+    }
   } else {
     skillsArr = [];
   }
@@ -1106,7 +1242,9 @@ function buildProfileContextForIA(profile) {
     ? p.experiences
         .map(
           (e) =>
-            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
+            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(
+              e.bullets || []
+            ).join(" ")}`
         )
         .join("; \n")
     : "";
@@ -1152,7 +1290,13 @@ async function createSimpleCvPdf(profile, options) {
   function drawLine(text, size = 11, bold = false) {
     if (!text || y < 50) return;
     const f = bold ? fontBold : font;
-    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+    page.drawText(text, {
+      x: marginX,
+      y,
+      size,
+      font: f,
+      color: rgb(0.1, 0.12, 0.16),
+    });
     y -= size + 4;
   }
 
@@ -1171,7 +1315,13 @@ async function createSimpleCvPdf(profile, options) {
         const testWidth = f.widthOfTextAtSize(testLine, size);
         if (testWidth > maxWidth) {
           if (y < 50) return;
-          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+          page.drawText(line, {
+            x: marginX,
+            y,
+            size,
+            font: f,
+            color: rgb(0.1, 0.12, 0.16),
+          });
           y -= size + 3;
           line = w;
         } else {
@@ -1180,7 +1330,13 @@ async function createSimpleCvPdf(profile, options) {
       }
 
       if (line && y >= 50) {
-        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+        page.drawText(line, {
+          x: marginX,
+          y,
+          size,
+          font: f,
+          color: rgb(0.1, 0.12, 0.16),
+        });
         y -= size + 6;
       }
       y -= 2;
@@ -1189,7 +1345,13 @@ async function createSimpleCvPdf(profile, options) {
 
   function drawSectionTitle(title) {
     if (!title || y < 60) return;
-    page.drawText(title, { x: marginX, y, size: 11, font: fontBold, color: rgb(0.08, 0.15, 0.45) });
+    page.drawText(title, {
+      x: marginX,
+      y,
+      size: 11,
+      font: fontBold,
+      color: rgb(0.08, 0.15, 0.45),
+    });
     y -= 14;
   }
 
@@ -1368,7 +1530,7 @@ async function createLetterPdf(coverLetter, meta) {
 }
 
 // =============================
-//  HTTPS: generateLetterAndPitch  ✅ (débit crédits -1)
+//  Fallback lettre + pitch
 // =============================
 function buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang) {
   const p = profile || {};
@@ -1385,15 +1547,18 @@ function buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescript
     return {
       pitch:
         summary ||
-        `I am ${name || "a candidate"} with ${years ? years + " years of experience" : "solid experience"} in ${
-          primaryDomain || "my field"
-        }, motivated by the ${jobTitle || "role"} at ${companyName || "your company"}.`,
-      // fallback "full letter", ok if you use it as body too
+        `I am ${name || "a candidate"} with ${
+          years ? years + " years of experience" : "solid experience"
+        } in ${primaryDomain || "my field"}, motivated by the ${jobTitle || "role"} at ${
+          companyName || "your company"
+        }.`,
       coverLetter: `I am writing to express my interest in the position of ${jobTitle || "your advertised role"}. With ${
         years ? years + " years of experience" : "solid experience"
       } in ${primaryDomain || "my field"}, I have developed strong skills relevant to this opportunity.
 
-In my previous experience at ${company || "my last company"}, I contributed to projects with measurable impact and collaborated with different stakeholders.
+In my previous experience at ${company || "my last company"}${
+        city ? " in " + city : ""
+      }, I contributed to projects with measurable impact and collaborated with different stakeholders.
 
 I would be delighted to discuss how I can contribute to your team.`,
     };
@@ -1407,17 +1572,22 @@ I would be delighted to discuss how I can contribute to your team.`,
       } ${primaryDomain ? "dans " + primaryDomain : ""}, motivé(e) par le poste de ${
         jobTitle || "votre poste"
       } chez ${companyName || "votre entreprise"}.`,
-    // fallback "full letter", ok if you use it as body too
-    coverLetter: `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
-      companyName || "votre entreprise"
-    }. Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
-      primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
-    }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
+    coverLetter: `Je vous écris pour vous faire part de mon intérêt pour le poste de ${
+      jobTitle || "..."
+    } au sein de ${companyName || "votre entreprise"}. Avec ${
+      years ? years + " ans d’expérience" : "une expérience significative"
+    } ${primaryDomain ? "dans " + primaryDomain : "dans mon domaine"}, j’ai développé des compétences solides en ${
+      role || "gestion de projets, collaboration et suivi d’objectifs"
+    }.
 
 Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`,
   };
 }
 
+// =============================
+//  generateLetterAndPitch ✅
+//  (SANS reCAPTCHA, SANS auth obligatoire)
+// =============================
 exports.generateLetterAndPitch = functions
   .region("europe-west1")
   .https.onRequest(async (req, res) => {
@@ -1428,19 +1598,7 @@ exports.generateLetterAndPitch = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
-    const deny = await enforceRecaptchaOrReturn(req, res, "generate_letter_pitch");
-    if (deny) return;
-
-    // ✅ Auth obligatoire + débit crédits
-    let authUser = null;
-    try {
-      authUser = await requireFirebaseUser(req);
-    } catch (e) {
-      const code = e?.code || e?.message;
-      if (code === "MISSING_AUTH") return res.status(401).json({ error: "unauthenticated" });
-      return res.status(401).json({ error: "invalid_auth" });
-    }
+    // ⚠️ ICI : PAS DE reCAPTCHA, PAS DE requireFirebaseUser
 
     try {
       const body = req.body || {};
@@ -1449,35 +1607,13 @@ exports.generateLetterAndPitch = functions
       const jobTitle = body.jobTitle || "";
       const companyName = body.companyName || "";
       const langRaw = body.lang || "fr";
-      const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lang = normalizeLang(langRaw);
 
       if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
       if (!jobTitle && !jobDescription)
         return res.status(400).json({
           error: "Ajoute au moins l'intitulé du poste ou un extrait de la description.",
         });
-
-      // ✅ Débit -1 crédit (LM)
-      try {
-        await debitCreditsAndLog({
-          uid: authUser.uid,
-          email: authUser.email,
-          cost: 1,
-          tool: "generateLetterAndPitch",
-          docType: "lm",
-          docsGenerated: 1,
-          cvGenerated: 0,
-          lmGenerated: 1,
-          req,
-          meta: { jobTitle, companyName, lang },
-        });
-      } catch (e) {
-        if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
-          return res.status(402).json({ error: "NO_CREDITS" });
-        }
-        console.error("Débit crédits (LM) error:", e);
-        return res.status(500).json({ error: "credits_error" });
-      }
 
       const GEMINI_API_KEY =
         process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
@@ -1489,47 +1625,14 @@ exports.generateLetterAndPitch = functions
         return res.status(200).json({ coverLetter: fb.coverLetter, pitch: fb.pitch, lang });
       }
 
-      // ✅ IMPORTANT: coverLetter = CORPS uniquement (pas d'objet / salutation / signature)
-      const prompt =
-        lang === "en"
-          ? `You are a senior career coach and recruiter.
-
-Return STRICTLY valid JSON:
-{ "coverLetter": "string", "pitch": "string" }
-
-COVER LETTER RULES:
-- "coverLetter" must be ONLY the BODY (no header, no subject, no greeting, no signature).
-- 3 to 5 short paragraphs separated by a blank line.
-- Do not invent facts, companies, tools, numbers.
-- Use ONLY the candidate profile and the job description.
-
-CANDIDATE PROFILE (source of truth):
-${cvText}
-
-JOB DESCRIPTION:
-${jobDescription || "—"}
-
-JOB TITLE: ${jobTitle || "the role"}
-COMPANY: ${companyName || "your company"}`
-          : `Tu es un coach carrières senior et recruteur.
-
-Retourne STRICTEMENT un JSON valide :
-{ "coverLetter": "string", "pitch": "string" }
-
-RÈGLES LETTRE :
-- "coverLetter" = UNIQUEMENT le CORPS (pas d’en-tête, pas d’objet, pas de formule d’appel, pas de signature).
-- 3 à 5 paragraphes séparés par une ligne vide.
-- Ne pas inventer (entreprises/outils/chiffres).
-- Utilise UNIQUEMENT le profil candidat + la fiche de poste.
-
-PROFIL CANDIDAT (source de vérité) :
-${cvText}
-
-FICHE DE POSTE :
-${jobDescription || "—"}
-
-INTITULÉ : ${jobTitle || "le poste"}
-ENTREPRISE : ${companyName || "votre entreprise"}`;
+      // ✅ MODIF : prompt INLINE via builder
+      const prompt = buildLetterAndPitchPrompt({
+        lang,
+        cvText,
+        jobDescription: jobDescription || "—",
+        jobTitle,
+        companyName,
+      });
 
       let coverLetter = "";
       let pitch = "";
@@ -1537,12 +1640,14 @@ ENTREPRISE : ${companyName || "votre entreprise"}`;
       try {
         const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.7, 2200);
         const cleaned = String(raw).replace(/```json|```/gi, "").trim();
+
         let parsed = null;
         try {
           parsed = JSON.parse(cleaned);
         } catch {
           parsed = { coverLetter: cleaned, pitch: "" };
         }
+
         coverLetter = typeof parsed.coverLetter === "string" ? parsed.coverLetter.trim() : "";
         pitch = typeof parsed.pitch === "string" ? parsed.pitch.trim() : "";
       } catch (err) {
@@ -1563,12 +1668,10 @@ ENTREPRISE : ${companyName || "votre entreprise"}`;
   });
 
 // =============================
-//  HTTPS: generateInterviewQA
+//  generateInterviewQA
 // =============================
 function buildFallbackQuestions(lang, role, company, city, dates, bullets) {
-  const missions = (Array.isArray(bullets) ? bullets : [])
-    .filter((b) => typeof b === "string")
-    .slice(0, 3);
+  const missions = (Array.isArray(bullets) ? bullets : []).filter((b) => typeof b === "string").slice(0, 3);
 
   if (lang === "en") {
     return [
@@ -1625,7 +1728,6 @@ exports.generateInterviewQA = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_interview_qa");
     if (deny) return;
 
@@ -1634,7 +1736,7 @@ exports.generateInterviewQA = functions
       const profile = body.profile;
       const experienceIndex = body.experienceIndex;
       const langRaw = body.lang || "fr";
-      const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lang = normalizeLang(langRaw);
 
       if (!profile || !Array.isArray(profile.experiences)) {
         return res.status(400).json({
@@ -1732,7 +1834,7 @@ ${cvText}`;
   });
 
 // =============================
-//  HTTPS: generateCvPdf ✅ (débit crédits -1)
+//  generateCvPdf (avec reCAPTCHA + crédits)
 // =============================
 exports.generateCvPdf = functions
   .region("europe-west1")
@@ -1744,11 +1846,9 @@ exports.generateCvPdf = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_cv_pdf");
     if (deny) return;
 
-    // ✅ Auth obligatoire + débit crédits
     let authUser = null;
     try {
       authUser = await requireFirebaseUser(req);
@@ -1766,11 +1866,10 @@ exports.generateCvPdf = functions
       const contract = body.contract || "";
       const jobLink = body.jobLink || "";
       const jobDescription = body.jobDescription || "";
-      const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lang = normalizeLang(langRaw);
 
       if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
 
-      // ✅ Débit -1 crédit (CV)
       try {
         await debitCreditsAndLog({
           uid: authUser.uid,
@@ -1810,7 +1909,7 @@ exports.generateCvPdf = functions
   });
 
 // =============================
-//  HTTPS: generateCvLmZip ✅ (débit crédits -2)
+//  generateCvLmZip
 // =============================
 exports.generateCvLmZip = functions
   .region("europe-west1")
@@ -1821,11 +1920,9 @@ exports.generateCvLmZip = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_cv_lm_zip");
     if (deny) return;
 
-    // ✅ Auth obligatoire + débit crédits
     let authUser = null;
     try {
       authUser = await requireFirebaseUser(req);
@@ -1845,11 +1942,10 @@ exports.generateCvLmZip = functions
       const jobDescription = body.jobDescription || "";
       const lm = body.lm || {};
 
-      const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lang = normalizeLang(langRaw);
 
       if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
 
-      // ✅ Débit -2 crédits (ZIP = CV + LM)
       try {
         await debitCreditsAndLog({
           uid: authUser.uid,
@@ -1884,7 +1980,8 @@ exports.generateCvLmZip = functions
 
       if (!GEMINI_API_KEY) {
         return res.status(500).json({
-          error: "Clé Gemini manquante côté serveur. Configure GEMINI_API_KEY ou functions.config().gemini.key.",
+          error:
+            "Clé Gemini manquante côté serveur. Configure GEMINI_API_KEY ou functions.config().gemini.key.",
         });
       }
 
@@ -1892,73 +1989,31 @@ exports.generateCvLmZip = functions
       const jobTitle = lm.jobTitle || targetJob || "";
       const lmJobDescription = lm.jobDescription || jobDescription || "";
       const lmLangRaw = lm.lang || lang;
-      const lmLang = String(lmLangRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lmLang = normalizeLang(lmLangRaw);
 
       const cvText = buildProfileContextForIA(profile);
 
-      // ✅ NOUVEAU PROMPT (CORPS “vrai” + JSON + anti-hallucination)
-      const promptLm =
-        lmLang === "en"
-          ? `
-You are a senior career coach and recruiter.
-
-TASK:
-Write ONLY the BODY of a cover letter tailored to the job, using ONLY the provided information (CV + job description).
-
-INPUTS:
-- Job title: "${jobTitle || "the role"}"
-- Company: "${companyName || "your company"}"
-- Job description:
-${lmJobDescription || jobDescription || "—"}
-
-- Candidate profile (source of truth):
-${cvText}
-
-STRICT RULES:
-- Do NOT invent facts (no fake metrics, clients, tools, dates).
-- 3 to 5 paragraphs separated by ONE blank line.
-- No header, no subject line, no greeting, no signature.
-- Output MUST be STRICT JSON only:
-{ "body": "..." }
-`.trim()
-          : `
-Tu es un coach carrières senior et recruteur.
-
-MISSION :
-Rédige UNIQUEMENT le CORPS d’une lettre de motivation adaptée au poste, basée UNIQUEMENT sur les infos fournies (CV + fiche de poste).
-
-ENTRÉES :
-- Intitulé : "${jobTitle || targetJob || "le poste"}"
-- Entreprise : "${companyName || "votre entreprise"}"
-- Fiche de poste :
-${lmJobDescription || jobDescription || "—"}
-
-- Profil candidat :
-${cvText}
-
-RÈGLES :
-- Ne pas inventer (pas de chiffres/clients/technos non présents).
-- 3 à 5 paragraphes séparés par une ligne vide.
-- Pas d’en-tête, pas d’objet, pas de salutation, pas de signature.
-- Réponds STRICTEMENT en JSON :
-{ "body": "..." }
-`.trim();
+      // ✅ MODIF : prompt LM INLINE via builder
+      const promptLm = buildLmBodyPrompt({
+        lang: lmLang,
+        cvText,
+        jobDescription: lmJobDescription || jobDescription || "—",
+        jobTitle: jobTitle || targetJob || "",
+        companyName: companyName || "",
+      });
 
       const rawLm = await callGeminiText(promptLm, GEMINI_API_KEY, 0.65, 1400);
 
-      // Parsing JSON strict
       let coverLetterText = "";
       try {
         const cleaned = String(rawLm).replace(/```json|```/gi, "").trim();
         const parsed = JSON.parse(cleaned);
         coverLetterText = typeof parsed.body === "string" ? parsed.body.trim() : "";
       } catch {
-        // fallback: si l'IA foire, on prend brut
         coverLetterText = String(rawLm || "").trim();
       }
 
       if (!coverLetterText) {
-        // fallback de sécurité
         const fb = buildFallbackLetterAndPitch(profile, jobTitle, companyName, lmJobDescription, lmLang);
         coverLetterText = fb.coverLetter || "";
       }
@@ -1986,8 +2041,7 @@ RÈGLES :
   });
 
 // =============================
-//  HTTPS: generateLetterPdf
-//  (pas de débit ici : sinon double facturation avec generateLetterAndPitch)
+//  generateLetterPdf
 // =============================
 exports.generateLetterPdf = functions
   .region("europe-west1")
@@ -1998,7 +2052,6 @@ exports.generateLetterPdf = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_letter_pdf");
     if (deny) return;
 
@@ -2009,7 +2062,7 @@ exports.generateLetterPdf = functions
       const companyName = (body.companyName || "").toString().trim();
       const candidateName = (body.candidateName || "").toString().trim();
       const langRaw = body.lang || "fr";
-      const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+      const lang = normalizeLang(langRaw);
 
       if (!coverLetter) {
         return res.status(400).json({ error: "Champ 'coverLetter' manquant ou vide." });
@@ -2028,7 +2081,9 @@ exports.generateLetterPdf = functions
         .replace(/^-+|-+$/g, "");
 
       const filename =
-        (lang === "en" ? "cover-letter" : "lettre-motivation") + (safeJob ? `-${safeJob}` : "") + ".pdf";
+        (lang === "en" ? "cover-letter" : "lettre-motivation") +
+        (safeJob ? `-${safeJob}` : "") +
+        ".pdf";
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
@@ -2040,7 +2095,7 @@ exports.generateLetterPdf = functions
   });
 
 // =============================
-//  HTTPS: jobs (Adzuna)
+//  jobs (Adzuna)
 // =============================
 exports.jobs = functions
   .region("europe-west1")
@@ -2051,7 +2106,6 @@ exports.jobs = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "jobs_search");
     if (deny) return;
 
@@ -2111,8 +2165,10 @@ exports.jobs = functions
         return {
           id: job.id || `job-${index}`,
           title: job.title || "Offre sans titre",
-          company: job.company && job.company.display_name ? job.company.display_name : "Entreprise non renseignée",
-          location: job.location && job.location.display_name ? job.location.display_name : "Lieu non précisé",
+          company:
+            job.company && job.company.display_name ? job.company.display_name : "Entreprise non renseignée",
+          location:
+            job.location && job.location.display_name ? job.location.display_name : "Lieu non précisé",
           url: job.redirect_url || "",
           description: job.description || "",
           created: job.created || "",
@@ -2123,7 +2179,9 @@ exports.jobs = functions
       return res.status(200).json({ jobs });
     } catch (err) {
       console.error("Erreur /jobs:", err);
-      return res.status(500).json({ error: "Erreur interne lors de la recherche d'offres (Adzuna /jobs)." });
+      return res.status(500).json({
+        error: "Erreur interne lors de la recherche d'offres (Adzuna /jobs).",
+      });
     }
   });
 
@@ -2145,7 +2203,6 @@ exports.polarCheckout = functions
     if (req.method === "OPTIONS") return res.status(204).send("");
     if (req.method !== "POST") return res.status(405).json({ error: "Méthode non autorisée" });
 
-    // ✅ reCAPTCHA
     const deny = await enforceRecaptchaOrReturn(req, res, "polar_checkout");
     if (deny) return;
 
@@ -2208,11 +2265,7 @@ exports.polarCheckout = functions
         require_billing_address: false,
         allow_trial: true,
         is_business_customer: false,
-        metadata: {
-          firebase_uid: String(userId),
-          pack_id: String(packId),
-          app: "assistant-ia-v4",
-        },
+        metadata: { firebase_uid: String(userId), pack_id: String(packId), app: "assistant-ia-v4" },
       };
 
       const checkout = await polar.checkouts.create(payload);
@@ -2221,7 +2274,6 @@ exports.polarCheckout = functions
         return res.status(500).json({ ok: false, error: "Checkout Polar créé mais URL manquante." });
       }
 
-      // mapping checkoutId -> userId
       try {
         const checkoutId = checkout.id ? String(checkout.id) : null;
         const customerId = checkout.customer_id ? String(checkout.customer_id) : null;
@@ -2268,7 +2320,10 @@ exports.polarCheckout = functions
       return res.status(200).json({ ok: true, url: checkout.url });
     } catch (err) {
       console.error("Erreur polarCheckout:", err);
-      return res.status(500).json({ ok: false, error: "Erreur interne lors de la création du checkout Polar." });
+      return res.status(500).json({
+        ok: false,
+        error: "Erreur interne lors de la création du checkout Polar.",
+      });
     }
   });
 
@@ -2330,7 +2385,6 @@ exports.polarWebhook = functions
     }
 
     try {
-      // ⚠️ Validation signature désactivée (tu peux réactiver plus tard avec validateEvent)
       const event = req.body || {};
       console.log("Webhook Polar reçu :", JSON.stringify(event, null, 2));
 
@@ -2448,7 +2502,7 @@ exports.polarWebhook = functions
       await db.runTransaction(async (tx) => {
         if (ledgerRef) {
           const ledgerSnap = await tx.get(ledgerRef);
-          if (ledgerSnap.exists) return; // pas de double crédit
+          if (ledgerSnap.exists) return;
         }
 
         const userRef = db.collection("users").doc(userId);
@@ -2476,13 +2530,8 @@ exports.polarWebhook = functions
           });
         }
 
-        // ✅ NOUVEAU : Historique des recharges
         const rechargeId = orderId ? String(orderId) : `${event.type}_${Date.now()}`;
-        const rechargeRef = db
-          .collection("users")
-          .doc(userId)
-          .collection("rechargeHistory")
-          .doc(rechargeId);
+        const rechargeRef = db.collection("users").doc(userId).collection("rechargeHistory").doc(rechargeId);
 
         tx.set(
           rechargeRef,
