@@ -1,4 +1,3 @@
-// app/app/lm/page.tsx
 "use client";
 
 import { logUsage } from "@/lib/logUsage";
@@ -69,9 +68,9 @@ type CvProfile = {
 
 type Lang = "fr" | "en";
 
-// 🔗 ENDPOINT (texte IA LM + pitch uniquement)
-const LETTER_AND_PITCH_URL =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
+// 🔗 ENDPOINT LOCAL (Proxy Next.js)
+// On pointe vers notre API locale pour gérer l'auth proprement
+const LETTER_AND_PITCH_URL = "/api/generateLetterAndPitch";
 
 // =============================
 // ✅ reCAPTCHA Enterprise (client)
@@ -597,7 +596,7 @@ export default function AssistanceCandidaturePage() {
   };
 
   // =============================
-  // ✅ Génération IA (lettre / pitch)
+  // ✅ Génération IA (lettre / pitch) - MODIFIÉ POUR TOKEN
   // =============================
 
   const generateCoverLetterText = async (lang: Lang): Promise<string> => {
@@ -605,6 +604,13 @@ export default function AssistanceCandidaturePage() {
     if (!jobTitle && !jobDescription) {
       throw new Error("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
     }
+
+    // 1. Récupérer l'utilisateur pour le token
+    const user = auth.currentUser;
+    if (!user) throw new Error("Vous devez être connecté pour générer une lettre.");
+    
+    // 2. Récupérer le token Auth
+    const token = await user.getIdToken();
 
     const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
 
@@ -618,9 +624,13 @@ export default function AssistanceCandidaturePage() {
       profile,
     });
 
+    // 3. Appel vers l'API locale avec le TOKEN dans les headers
     const resp = await fetch(LETTER_AND_PITCH_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}` // <--- CLÉ DE L'AUTHENTIFICATION
+      },
       body: JSON.stringify({
         profile,
         jobTitle,
@@ -886,11 +896,20 @@ export default function AssistanceCandidaturePage() {
     setGlobalLoadingMessage("L’IA prépare ton pitch d’ascenseur…");
 
     try {
+      // 1. Récupérer User + Token
+      const user = auth.currentUser;
+      if (!user) throw new Error("Connecte-toi pour générer un pitch.");
+      const token = await user.getIdToken();
+
       const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
 
+      // 2. Appel API Locale avec Token
       const resp = await fetch(LETTER_AND_PITCH_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}` 
+        },
         body: JSON.stringify({
           profile,
           jobTitle: effectiveJobTitle,

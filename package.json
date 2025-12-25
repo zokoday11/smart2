@@ -17,6 +17,7 @@
     "firebase-admin": "^13.6.0",
     "firebase-functions": "^7.0.2",
     "framer-motion": "^11.0.0",
+    "jszip": "^3.10.1",
     "next": "^14.2.35",
     "next-intl": "^4.5.5",
     "node-fetch": "^3.3.2",
@@ -28,6 +29,7 @@
   },
   "devDependencies": {
     "@types/aos": "^3.0.7",
+    "@types/jszip": "^3.4.0",
     "@types/node": "^20.12.7",
     "@types/pdfmake": "^0.2.12",
     "@types/react": "^18.2.66",

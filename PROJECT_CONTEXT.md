@@ -46,7 +46,17 @@ app/
       page.tsx
     page.tsx
   api/
+    extractProfile/
+      route.ts
+    generate-cv/
+      generate-letter/
+        route.ts
+      route.ts
+    generate-zip/
+      route.ts
     generateInterviewQA/
+      route.ts
+    generateLetterAndPitch/
       route.ts
     interview/
       route.ts
@@ -137,6 +147,7 @@ functions/
   recaptcha-interview.js
 hooks/
   useAdminGuard.ts
+  useRechargeHistory.ts
   useUserCredits.ts
   useUserProfile.ts
 lib/
@@ -190,1280 +201,6 @@ tsconfig.json
 ```
 
 # Files
-
-## File: functions/recaptcha-interview.js
-````javascript
-"use strict";
-
-const functions = require("firebase-functions");
-const admin = require("firebase-admin");
-const { RecaptchaEnterpriseServiceClient } = require("@google-cloud/recaptcha-enterprise");
-
-// Init Admin
-if (!admin.apps.length) admin.initializeApp();
-
-const recaptchaClient = new RecaptchaEnterpriseServiceClient();
-
-/* ============================
-   CORS (Hosting + localhost)
-   ============================ */
-function setCors(req, res) {
-  const origin = req.headers.origin || "";
-  const allowed = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://assistant-ia-v4.web.app",
-    "https://assistant-ia-v4.firebaseapp.com",
-  ];
-
-  if (allowed.includes(origin)) {
-    res.set("Access-Control-Allow-Origin", origin);
-  } else {
-    // (Option) tu peux mettre ton domaine custom ici si tu en as un
-    // res.set("Access-Control-Allow-Origin", "https://tondomaine.com");
-  }
-
-  res.set("Vary", "Origin");
-  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-}
-
-/* ============================
-   reCAPTCHA config
-   ============================ */
-function getRecaptchaConfig() {
-  const cfg = (functions.config && functions.config() && functions.config().recaptcha) || {};
-  const projectId = cfg.project_id || process.env.RECAPTCHA_PROJECT_ID || "";
-  const siteKey = cfg.site_key || process.env.RECAPTCHA_SITE_KEY || "";
-  const thresholdRaw = cfg.threshold || process.env.RECAPTCHA_THRESHOLD || "0.5";
-
-  const threshold = Number(thresholdRaw);
-  return {
-    projectId,
-    siteKey,
-    threshold: Number.isFinite(threshold) ? threshold : 0.5,
-  };
-}
-
-function getClientIp(req) {
-  const xf = req.headers["x-forwarded-for"];
-  if (typeof xf === "string" && xf.trim()) return xf.split(",")[0].trim();
-  return (
-    req.ip ||
-    (req.connection && req.connection.remoteAddress) ||
-    (req.socket && req.socket.remoteAddress) ||
-    ""
-  );
-}
-
-function normalizeAction(action) {
-  return String(action || "").trim().toLowerCase();
-}
-
-/**
- * Vérifie un token reCAPTCHA Enterprise
- */
-async function verifyRecaptchaToken({ token, expectedAction, req }) {
-  const { projectId, siteKey, threshold } = getRecaptchaConfig();
-
-  // Si pas configuré, on ne bloque pas (mais on log)
-  if (!projectId || !siteKey) {
-    console.warn("[recaptcha] NOT CONFIGURED -> bypass (projectId/siteKey missing)");
-    return { ok: true, bypass: true, score: null, threshold };
-  }
-
-  if (!token) return { ok: false, reason: "missing_token" };
-
-  const userIp = getClientIp(req);
-  const userAgent = String(req.headers["user-agent"] || "");
-
-  const parent = `projects/${projectId}`;
-
-  const [assessment] = await recaptchaClient.createAssessment({
-    parent,
-    assessment: {
-      event: {
-        token,
-        siteKey,
-        expectedAction: expectedAction || undefined,
-        userAgent: userAgent || undefined,
-        userIpAddress: userIp || undefined,
-      },
-    },
-  });
-
-  const tokenProps = assessment && assessment.tokenProperties;
-  if (!tokenProps || tokenProps.valid !== true) {
-    return {
-      ok: false,
-      reason: "invalid_token",
-      invalidReason: tokenProps ? tokenProps.invalidReason : null,
-    };
-  }
-
-  // Action check (reCAPTCHA est case-sensitive)
-  if (expectedAction && tokenProps.action && String(tokenProps.action) !== String(expectedAction)) {
-    return {
-      ok: false,
-      reason: "action_mismatch",
-      expected: expectedAction,
-      got: tokenProps.action,
-    };
-  }
-
-  const score =
-    assessment &&
-    assessment.riskAnalysis &&
-    typeof assessment.riskAnalysis.score === "number"
-      ? assessment.riskAnalysis.score
-      : null;
-
-  if (typeof score === "number" && score < threshold) {
-    return { ok: false, reason: "low_score", score, threshold };
-  }
-
-  return { ok: true, score, threshold };
-}
-
-/* ============================
-   1) Endpoint public: /recaptchaVerify
-   ============================ */
-exports.recaptchaVerify = functions
-  .region("europe-west1")
-  .https.onRequest(async (req, res) => {
-    setCors(req, res);
-    if (req.method === "OPTIONS") return res.status(204).send("");
-
-    if (req.method !== "POST") {
-      return res.status(405).json({ ok: false, reason: "method_not_allowed" });
-    }
-    if (!req.is("application/json")) {
-      return res.status(400).json({ ok: false, reason: "invalid_content_type" });
-    }
-
-    try {
-      const { token, action } = req.body || {};
-      const expectedAction = normalizeAction(action);
-
-      if (!token || !expectedAction) {
-        return res.status(400).json({ ok: false, reason: "missing_token_or_action" });
-      }
-
-      const r = await verifyRecaptchaToken({ token, expectedAction, req });
-
-      if (!r.ok) {
-        return res.status(401).json({ ok: false, reason: r.reason, details: r });
-      }
-
-      return res.status(200).json({ ok: true, score: r.score ?? null });
-    } catch (e) {
-      console.error("recaptchaVerify error:", e);
-      return res.status(500).json({ ok: false, reason: "server_error" });
-    }
-  });
-
-/* ============================
-   2) Cloud Function: interview (protégée par reCAPTCHA)
-   ============================ */
-exports.interview = functions
-  .region("europe-west1")
-  .https.onRequest(async (req, res) => {
-    setCors(req, res);
-    if (req.method === "OPTIONS") return res.status(204).send("");
-
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "method_not_allowed" });
-    }
-    if (!req.is("application/json")) {
-      return res.status(400).json({ error: "invalid_content_type" });
-    }
-
-    try {
-      const body = req.body || {};
-
-      // ✅ on accepte plusieurs noms côté front
-      const token =
-        body.recaptchaToken ||
-        body.token ||
-        (body.recaptcha && body.recaptcha.token) ||
-        null;
-
-      // ✅ action: on force une convention stable
-      // IMPORTANT : le front doit générer un token avec CETTE action
-      const expectedAction = normalizeAction(body.recaptchaAction || body.actionName || "interview");
-
-      if (!token) {
-        return res.status(403).json({
-          error: "reCAPTCHA failed",
-          details: "token_missing_or_invalid",
-          expectedAction,
-        });
-      }
-
-      const r = await verifyRecaptchaToken({ token, expectedAction, req });
-      if (!r.ok) {
-        return res.status(403).json({
-          error: "reCAPTCHA failed",
-          details: r.reason,
-          score: r.score ?? null,
-          expectedAction,
-          extra: r,
-        });
-      }
-
-      // ✅ Ici, tu continues TON code interview (Gemini / sessions / credits etc.)
-      // Pour que ça compile direct, je renvoie juste un OK:
-      // Remplace cette partie par ton handler actuel (start/answer) si tu l’as déjà ici.
-
-      return res.status(200).json({ ok: true, message: "interview OK", score: r.score ?? null });
-    } catch (e) {
-      console.error("interview error:", e);
-      return res.status(500).json({ error: "internal_error" });
-    }
-  });
-````
-
-## File: lib/pdf/templates/cvAts.ts
-````typescript
-// src/lib/pdf/templates/cvAts.ts
-import type { PdfColors } from "../colors";
-
-export type CvDocModel = {
-  name: string;
-  title: string;
-  contactLine: string;
-  profile: string;
-
-  skills: {
-    cloud?: string[];
-    sec?: string[];
-    sys?: string[];
-    auto?: string[];
-    tools?: string[];
-    soft?: string[];
-  };
-
-  xp: Array<{
-    company: string;
-    city?: string;
-    role: string;
-    dates: string;
-    bullets: string[];
-  }>;
-
-  education: string[];
-  certs?: string;
-  langLine?: string;
-  hobbies?: string[];
-};
-
-function stripMd(s: string) {
-  return String(s || "")
-    .replace(/\*\*(.*?)\*\*/g, "$1")
-    .replace(/\*(.*?)\*/g, "$1")
-    .replace(/`(.*?)`/g, "$1")
-    .replace(/\[(.*?)\]\(.*?\)/g, "$1")
-    .trim();
-}
-
-function cleanBullet(s: string) {
-  return stripMd(s).replace(/^[•\-–]\s*/, "").trim();
-}
-
-function smartCompactProfile(profile: string, est: number) {
-  const p = stripMd(profile);
-  // petit “compact” si beaucoup de contenu (même idée que ton HTML auto) :contentReference[oaicite:3]{index=3}
-  if (est > 3600 && p.length > 420) return p.slice(0, 420).replace(/\s+\S*$/, "…");
-  if (est > 3000 && p.length > 480) return p.slice(0, 480).replace(/\s+\S*$/, "…");
-  return p;
-}
-
-// CV A4 1 page — style auto/compact/expanded + scale (zoom global)
-export function buildCvAtsPdf(
-  cv: CvDocModel,
-  lang: "fr" | "en",
-  colors: PdfColors,
-  styleMode: "auto" | "compact" | "expanded" = "auto",
-  scale = 1
-) {
-  const est =
-    (cv.profile?.length || 0) +
-    (cv.certs?.length || 0) +
-    (cv.langLine?.length || 0) +
-    (cv.hobbies || []).join(" ").length +
-    (cv.education || []).join(" ").length +
-    (cv.xp || [])
-      .map((x) => (x.role || "") + (x.company || "") + (x.city || "") + (x.dates || "") + (x.bullets || []).join(" "))
-      .join(" ").length +
-    Object.values(cv.skills || {})
-      .flat()
-      .join(" ").length;
-
-  let fontSize: number, headSize: number, titleSize: number, lineH: number, margins: number[];
-
-  if (styleMode === "compact") {
-    fontSize = 9.0; headSize = 18.0; titleSize = 11.8; lineH = 1.04; margins = [16, 12, 16, 12];
-  } else if (styleMode === "expanded") {
-    fontSize = 11.4; headSize = 22.5; titleSize = 15.2; lineH = 1.26; margins = [30, 26, 30, 28];
-  } else {
-    if (est < 1900) { fontSize = 11.4; headSize = 22.5; titleSize = 15.2; lineH = 1.26; margins = [30, 26, 30, 28]; }
-    else if (est < 2200) { fontSize = 11.1; headSize = 22.0; titleSize = 14.8; lineH = 1.22; margins = [28, 24, 28, 26]; }
-    else if (est < 2600) { fontSize = 10.8; headSize = 21.2; titleSize = 14.4; lineH = 1.18; margins = [26, 22, 26, 24]; }
-    else if (est < 3000) { fontSize = 10.5; headSize = 20.6; titleSize = 14.0; lineH = 1.15; margins = [24, 20, 24, 22]; }
-    else if (est < 3400) { fontSize = 10.1; headSize = 19.8; titleSize = 13.4; lineH = 1.12; margins = [22, 18, 22, 18]; }
-    else if (est < 3800) { fontSize = 9.8; headSize = 19.2; titleSize = 12.8; lineH = 1.08; margins = [20, 16, 20, 16]; }
-    else if (est < 4300) { fontSize = 9.4; headSize = 18.6; titleSize = 12.4; lineH = 1.06; margins = [18, 14, 18, 14]; }
-    else { fontSize = 9.0; headSize = 18.0; titleSize = 11.8; lineH = 1.04; margins = [16, 12, 16, 12]; }
-  }
-
-  // zoom global
-  fontSize = +(fontSize * scale).toFixed(2);
-  headSize = +(headSize * scale).toFixed(2);
-  titleSize = +(titleSize * scale).toFixed(2);
-  lineH = +(1 + (lineH - 1) * (0.8 + 0.2 * scale)).toFixed(3);
-  margins = margins.map((m) => Math.max(12, Math.round(m * (0.95 + 0.05 * scale))));
-
-  const profileText = smartCompactProfile(cv.profile, est);
-
-  const H = (t: string) => ({
-    text: t,
-    color: colors.brand,
-    bold: true,
-    fontSize: Math.max(10.6, fontSize + 0.6),
-    margin: [0, 6, 0, 3],
-  });
-
-  const thin = {
-    canvas: [{ type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 0.7, lineColor: colors.border }],
-    margin: [0, 2, 0, 6],
-  };
-
-  const s = cv.skills || {};
-  const skillsGrid = {
-    columns: [
-      {
-        width: "*",
-        stack: [
-          { text: lang === "fr" ? "Architecture & Cloud" : "Architecture & Cloud", bold: true, color: colors.muted, margin: [0, 0, 0, 1] },
-          { text: (s.cloud || []).join(", "), alignment: "justify" },
-
-          { text: lang === "fr" ? "Cybersécurité" : "Cybersecurity", bold: true, color: colors.muted, margin: [0, 5, 0, 1] },
-          { text: (s.sec || []).join(", "), alignment: "justify" },
-
-          { text: lang === "fr" ? "Soft skills" : "Soft skills", bold: true, color: colors.muted, margin: [0, 5, 0, 1] },
-          { text: (s.soft || []).join(", "), alignment: "justify" },
-        ],
-      },
-      {
-        width: "*",
-        stack: [
-          { text: lang === "fr" ? "Systèmes & Réseaux" : "Systems & Networks", bold: true, color: colors.muted, margin: [0, 0, 0, 1] },
-          { text: (s.sys || []).join(", "), alignment: "justify" },
-
-          { text: lang === "fr" ? "Automatisation & Outils (IA/API)" : "Automation & Tools (AI/API)", bold: true, color: colors.muted, margin: [0, 5, 0, 1] },
-          { text: ([...(s.auto || []), ...(s.tools || [])]).join(", "), alignment: "justify" },
-        ],
-      },
-    ],
-    columnGap: 14,
-  };
-
-  function xpBlock(x: CvDocModel["xp"][number]) {
-    const header = {
-      text: `${x.company}${x.city ? " — " + x.city : ""} — ${x.role} | ${x.dates}`,
-      margin: [0, 0.5, 0, 1],
-      bold: true,
-    };
-    const bullets = (x.bullets || []).map((b) => ({
-      text: `- ${cleanBullet(b)}`,
-      margin: [0, 0, 0, 0.4],
-      alignment: "justify",
-    }));
-    return [header, ...bullets];
-  }
-
-  const content: any[] = [
-    { text: cv.name, fontSize: headSize, bold: true, alignment: "center", margin: [0, 0, 0, 0] },
-    { text: cv.title, fontSize: titleSize, color: colors.brand, bold: true, alignment: "center", margin: [0, 1, 0, 3] },
-    { text: stripMd(cv.contactLine), bold: true, margin: [0, 0, 0, 4], alignment: "center" },
-    thin,
-
-    H(lang === "fr" ? "Profil" : "Profile"),
-    { text: profileText, margin: [0, 0, 0, 2], alignment: "justify" },
-
-    H(lang === "fr" ? "Compétences clés" : "Key Skills"),
-    skillsGrid,
-
-    H(lang === "fr" ? "Expériences professionnelles" : "Professional Experience"),
-    ...(cv.xp || []).flatMap(xpBlock),
-
-    H(lang === "fr" ? "Formation" : "Education"),
-    { ul: (cv.education || []).map((e) => stripMd(e)), margin: [0, 0, 0, 1] },
-
-    H(lang === "fr" ? "Certifications" : "Certifications"),
-    { text: stripMd(cv.certs || ""), margin: [0, 0, 0, 1], alignment: "justify" },
-
-    H(lang === "fr" ? "Langues" : "Languages"),
-    { text: stripMd(cv.langLine || "") },
-  ];
-
-  if (Array.isArray(cv.hobbies) && cv.hobbies.length) {
-    content.push(H(lang === "fr" ? "Centres d’intérêt / Hobbies" : "Interests"));
-    content.push({ text: cv.hobbies.join(" • "), margin: [0, 0, 0, 1] });
-  }
-
-  return {
-    pageSize: "A4",
-    pageMargins: margins,
-    defaultStyle: { font: "Roboto", fontSize, lineHeight: lineH, color: colors.ink },
-    content,
-  };
-}
-````
-
-## File: lib/pdf/templates/letter.ts
-````typescript
-// lib/pdf/templates/letter.ts
-import type { PdfColors } from "../colors";
-export type { PdfColors } from "../colors";
-
-export type LmModel = {
-  lang: "fr" | "en";
-  name: string;
-  contactLines: string[];
-  service: string;
-  companyName: string;
-  companyAddr?: string;
-  city: string;
-  dateStr: string;
-  subject: string;
-  salutation: string;
-  body: string; // corps uniquement
-  closing: string;
-  signature: string;
-};
-
-function splitParas(text: string) {
-  return (text || "")
-    .replace(/\n{3,}/g, "\n\n")
-    .split(/\n\s*\n/)
-    .map((p) => p.trim())
-    .filter(Boolean);
-}
-
-const DEFAULT_COLORS: PdfColors = {
-  brand: "#2563eb",
-  brandDark: "#1e40af",
-  ink: "#0f172a",
-  muted: "#475569",
-  border: "#e2e8f0",
-  bgSoft: "#f1f5f9",
-  hair: "#cbd5e1",
-};
-
-export function buildLmStyledPdf(lm: LmModel, colors: PdfColors, scale = 1) {
-  const bodyParas = splitParas(lm.body);
-
-  const baseFs = 10.5 * scale;
-  const nameFs = 12 * scale;
-
-  const brandColor = colors.brand || DEFAULT_COLORS.brand;
-  const mutedColor = colors.muted || DEFAULT_COLORS.muted;
-  const hairColor = colors.hair || DEFAULT_COLORS.hair;
-  const inkColor = colors.ink || DEFAULT_COLORS.ink;
-
-  const rightStack: any[] = [
-    { text: lm.service, color: mutedColor },
-    { text: lm.companyName, bold: true, color: mutedColor },
-    ...(lm.companyAddr ? lm.companyAddr.split(/\n+/).map((l) => ({ text: l })) : []),
-  ];
-
-  const hair = {
-    canvas: [
-      {
-        type: "line",
-        x1: 0,
-        y1: 0,
-        x2: 515,
-        y2: 0,
-        lineWidth: 1,
-        lineColor: hairColor,
-      },
-    ],
-    margin: [0, 6, 0, 10],
-  };
-
-  const dateLine =
-    lm.lang === "en" ? `At ${lm.city}, ${lm.dateStr}` : `À ${lm.city}, le ${lm.dateStr}`;
-
-  return {
-    pageSize: "A4",
-    pageMargins: [40, 36, 40, 36],
-    defaultStyle: {
-      font: "Roboto",
-      fontSize: baseFs,
-      lineHeight: 1.24,
-      color: inkColor,
-    },
-    content: [
-      // barre brand
-      {
-        canvas: [
-          { type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 3, lineColor: brandColor },
-        ],
-        margin: [0, 0, 0, 10],
-      },
-
-      // header 2 colonnes
-      {
-        columns: [
-          {
-            width: "*",
-            stack: [
-              { text: lm.name, bold: true, fontSize: nameFs, color: mutedColor },
-              ...(lm.contactLines || []).map((t) => ({ text: t })),
-            ],
-          },
-          {
-            width: "auto",
-            alignment: "right",
-            stack: rightStack,
-            margin: [0, 28, 0, 0],
-          },
-        ],
-        columnGap: 15,
-      },
-
-      hair,
-
-      { text: dateLine, margin: [0, 0, 0, 8] },
-      { text: lm.subject, bold: true, color: brandColor, margin: [0, 0, 0, 10] },
-      { text: lm.salutation, margin: [0, 0, 0, 8] },
-
-      ...bodyParas.map((p) => ({ text: p, margin: [0, 0, 0, 6] })),
-
-      { text: lm.closing, margin: [0, 12, 0, 2], alignment: "right" },
-      { text: lm.signature, bold: true, alignment: "right" },
-    ],
-  };
-}
-
-/**
- * ✅ Fallback qui accepte:
- * - un LmModel (structuré)
- * - OU un string (texte brut) => pour ton appel generateCvLm.ts
- *
- * Exemples:
- * buildLmFallbackPdf(params.lmTextFallback || "", colors, scale)
- * buildLmFallbackPdf(lmModel, colors, scale)
- */
-export function buildLmFallbackPdf(text: string, colors: PdfColors, scale?: number): any;
-export function buildLmFallbackPdf(lm: LmModel, colors: PdfColors, scale?: number): any;
-export function buildLmFallbackPdf(text: string, scale?: number): any;
-export function buildLmFallbackPdf(lm: LmModel, scale?: number): any;
-export function buildLmFallbackPdf(
-  first: string | LmModel,
-  second?: PdfColors | number,
-  third?: number
-) {
-  const colors: PdfColors =
-    typeof second === "object" && second ? second : DEFAULT_COLORS;
-
-  const scale =
-    typeof second === "number" ? second : typeof third === "number" ? third : 1;
-
-  // Si on a un modèle structuré -> on garde le rendu exact
-  if (typeof first === "object" && first) {
-    return buildLmStyledPdf(first, colors, scale);
-  }
-
-  // Sinon texte brut (string)
-  const rawText = String(first || "");
-  const paras = splitParas(rawText);
-
-  const brandColor = colors.brand || DEFAULT_COLORS.brand;
-  const hairColor = colors.hair || DEFAULT_COLORS.hair;
-  const inkColor = colors.ink || DEFAULT_COLORS.ink;
-
-  const baseFs = 10.5 * scale;
-
-  return {
-    pageSize: "A4",
-    pageMargins: [40, 36, 40, 36],
-    defaultStyle: {
-      font: "Roboto",
-      fontSize: baseFs,
-      lineHeight: 1.26,
-      color: inkColor,
-    },
-    content: [
-      // barre brand
-      {
-        canvas: [
-          { type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 3, lineColor: brandColor },
-        ],
-        margin: [0, 0, 0, 10],
-      },
-      // ligne fine
-      {
-        canvas: [
-          { type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 1, lineColor: hairColor },
-        ],
-        margin: [0, 0, 0, 12],
-      },
-      // texte brut en paragraphes
-      ...(paras.length ? paras : [""]).map((p) => ({ text: p, margin: [0, 0, 0, 7] })),
-    ],
-  };
-}
-````
-
-## File: lib/pdf/templates/types.ts
-````typescript
-// src/lib/pdf/templates/types.ts
-export type Lang = "fr" | "en";
-
-export type CvDocModel = {
-  name: string;
-  title: string;
-  contact: string; // "Paris | +33... | mail | linkedin"
-  profile: string;
-
-  skills: {
-    cloud?: string[];
-    sec?: string[];
-    sys?: string[];
-    auto?: string[];
-    tools?: string[];
-    soft?: string[];
-  };
-
-  xp: Array<{
-    company: string;
-    city?: string;
-    role: string;
-    dates: string;
-    bullets: string[];
-  }>;
-
-  education: string[];
-  certs: string;
-  langLine: string;
-  hobbies?: string[];
-};
-
-export type LmModel = {
-  lang: Lang;
-  name: string;
-  contactLines: string[]; // ["Téléphone: ...", "Email: ..."]
-  service: string;
-  companyName: string;
-  companyAddr?: string; // multi-line
-  city: string;
-  dateStr: string;
-  aPrefix: string; // "À " (FR) / "At " (EN)
-  subject: string;
-  salutation: string;
-  body: string; // paragraphes séparés par \n\n
-  closing: string;
-  signature: string;
-};
-````
-
-## File: lib/pdf/colors.ts
-````typescript
-// lib/pdf/colors.ts
-export type PdfColors = {
-  brand: string;
-  brandDark: string;
-  ink: string;
-  muted: string;
-  border: string;
-  bgSoft: string;
-  hair: string; // ✅ requis par letter.ts
-};
-
-function clamp(n: number, a: number, b: number) {
-  return Math.max(a, Math.min(b, n));
-}
-
-function normalizeHex(hex: string) {
-  let h = (hex || "").trim();
-  if (!h.startsWith("#")) h = `#${h}`;
-  if (h.length === 4) {
-    // #RGB -> #RRGGBB
-    h = `#${h[1]}${h[1]}${h[2]}${h[2]}${h[3]}${h[3]}`;
-  }
-  if (!/^#[0-9a-fA-F]{6}$/.test(h)) return "#2563eb";
-  return h.toLowerCase();
-}
-
-function hexToRgb(hex: string) {
-  const h = normalizeHex(hex).slice(1);
-  return {
-    r: parseInt(h.slice(0, 2), 16),
-    g: parseInt(h.slice(2, 4), 16),
-    b: parseInt(h.slice(4, 6), 16),
-  };
-}
-
-function rgbToHex(r: number, g: number, b: number) {
-  const to = (x: number) =>
-    clamp(Math.round(x), 0, 255).toString(16).padStart(2, "0");
-  return `#${to(r)}${to(g)}${to(b)}`;
-}
-
-function darken(hex: string, amount = 28) {
-  const { r, g, b } = hexToRgb(hex);
-  return rgbToHex(r - amount, g - amount, b - amount);
-}
-
-export function makePdfColors(brandHex: string): PdfColors {
-  const brand = normalizeHex(brandHex);
-  return {
-    brand,
-    brandDark: darken(brand, 28),
-
-    ink: "#0f172a", // slate-900
-    muted: "#475569", // slate-600
-    border: "#e2e8f0", // slate-200
-    bgSoft: "#f1f5f9", // slate-100
-    hair: "#cbd5e1", // slate-300 (ligne fine)
-  };
-}
-````
-
-## File: lib/pdf/fitOnePage.ts
-````typescript
-// src/lib/pdf/fitOnePage.ts
-import { PDFDocument } from "pdf-lib";
-import { pdfMakeToBlob } from "./pdfmakeClient";
-
-export async function countPdfPages(blob: Blob): Promise<number> {
-  const ab = await blob.arrayBuffer();
-  const pdf = await PDFDocument.load(ab);
-  return pdf.getPageCount();
-}
-
-export async function fitOnePage(
-  buildDoc: (scale: number) => any,
-  opts?: { min?: number; max?: number; iterations?: number; initial?: number }
-): Promise<{ blob: Blob; bestScale: number }> {
-  const min = opts?.min ?? 0.8;
-  const max = opts?.max ?? 1.6;
-  const iterations = opts?.iterations ?? 8;
-  const initial = opts?.initial ?? 1.0;
-
-  let low = min;
-  let high = max;
-
-  // test initial
-  let bestBlob: Blob | null = null;
-  let bestScale = initial;
-
-  let testBlob = await pdfMakeToBlob(buildDoc(initial));
-  let pages = await countPdfPages(testBlob);
-
-  if (pages > 1) {
-    high = initial;
-  } else {
-    bestBlob = testBlob;
-    low = initial;
-  }
-
-  for (let i = 0; i < iterations; i++) {
-    const mid = +(((low + high) / 2)).toFixed(3);
-    const blob = await pdfMakeToBlob(buildDoc(mid));
-    const n = await countPdfPages(blob);
-
-    if (n > 1) {
-      high = mid - 0.01;
-    } else {
-      bestBlob = blob;
-      bestScale = mid;
-      low = mid + 0.01;
-    }
-    if (high - low < 0.01) break;
-  }
-
-  if (!bestBlob) {
-    bestBlob = await pdfMakeToBlob(buildDoc(min));
-    bestScale = min;
-  }
-
-  return { blob: bestBlob, bestScale };
-}
-````
-
-## File: lib/pdf/generateCvLm.ts
-````typescript
-// src/lib/pdf/generateCvLm.ts
-import { makePdfColors } from "./colors";
-import { fitOnePage } from "./fitOnePage";
-import { mergePdfBlobs } from "./mergePdfs";
-import { downloadBlob } from "./pdfmakeClient";
-import { buildCvAtsPdf, type CvDocModel } from "./templates/cvAts";
-import { buildLmStyledPdf, buildLmFallbackPdf, type LmModel } from "./templates/letter";
-
-export async function generateAndDownloadCvLmPdf(params: {
-  brandHex: string;
-  cv: CvDocModel;
-  cvLang: "fr" | "en";
-  // LM: soit modèle structuré, soit texte brut
-  lm?: LmModel;
-  lmTextFallback?: string;
-  filename?: string;
-}) {
-  const colors = makePdfColors(params.brandHex);
-
-  // 1) CV -> fit 1 page
-  const cvFit = await fitOnePage((scale) =>
-    buildCvAtsPdf(params.cv, params.cvLang, colors, "auto", scale)
-  );
-
-  // 2) LM -> fit 1 page
-  const lmFit = await fitOnePage((scale) => {
-    if (params.lm) return buildLmStyledPdf(params.lm, colors, scale);
-    return buildLmFallbackPdf(params.lmTextFallback || "", colors, scale);
-  }, { min: 0.85, max: 1.6, iterations: 6, initial: 1.0 });
-
-  // 3) fusion (2 pages)
-  const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
-
-  downloadBlob(merged, params.filename || `CV_LM_${new Date().toISOString().slice(0, 10)}.pdf`);
-}
-````
-
-## File: lib/pdf/lmPrompt.ts
-````typescript
-// src/lib/pdf/lmPrompt.ts
-
-type LmPromptParams = {
-  lang: "fr" | "en";
-  cvText: string; // buildProfileContextForIA(profile)
-  jobTitle?: string;
-  companyName?: string;
-  jobDescription?: string;
-  constraints?: {
-    minWords?: number; // default 170
-    maxWords?: number; // default 240
-  };
-};
-
-/**
- * Prompt "corps de LM" : domaine-agnostique, basé CV + fiche de poste.
- * Sortie demandée: JSON { "body": "..." } (body = texte brut avec paragraphes séparés par \n\n)
- */
-export function buildLmBodyPrompt(p: LmPromptParams): string {
-  const lang = p.lang ?? "fr";
-  const jobTitle = (p.jobTitle || "").trim();
-  const companyName = (p.companyName || "").trim();
-  const jobDescription = (p.jobDescription || "").trim();
-  const minWords = p.constraints?.minWords ?? 170;
-  const maxWords = p.constraints?.maxWords ?? 240;
-
-  const safeJobTitle = jobTitle || (lang === "en" ? "the role" : "le poste");
-  const safeCompany = companyName || (lang === "en" ? "your company" : "votre entreprise");
-  const safeJD = jobDescription || "—";
-
-  if (lang === "en") {
-    return `
-You are a senior career coach and recruiter.
-
-TASK:
-Write ONLY the BODY of a professional cover letter tailored to the job, using ONLY the candidate info provided.
-It must work for ANY domain (tech, admin, sales, healthcare, etc.) by extracting key requirements from the job description and matching them to the candidate profile.
-
-INPUTS:
-- Job title: ${safeJobTitle}
-- Company: ${safeCompany}
-- Job description:
-${safeJD}
-
-- Candidate profile (source of truth):
-${p.cvText}
-
-STRICT RULES:
-- DO NOT invent facts, employers, degrees, tools, dates, metrics.
-- If a detail is missing, write generically (e.g., "I have delivered impactful projects") without fake numbers.
-- Output MUST be STRICT JSON only:
-{ "body": "..." }
-- "body" must be plain text with paragraphs separated by ONE blank line (\n\n).
-- No header, no address, no subject line, no greeting, no signature, no bullets, no emojis.
-
-CONTENT GUIDANCE (domain-agnostic):
-- 3 to 5 short paragraphs.
-1) Motivation for ${safeJobTitle} at ${safeCompany} + a credible hook based on the profile.
-2) Match 3–5 requirements from the job description to relevant skills/experience from the profile.
-3) Mention 1–2 concrete contributions/achievements from the candidate’s experience (only if present), otherwise describe typical contributions.
-4) How the candidate will contribute in the first months (methods, collaboration, outcomes).
-5) Polite closing inviting to discuss.
-
-LENGTH:
-Between ${minWords} and ${maxWords} words.
-Return the JSON now.
-`.trim();
-  }
-
-  // FR
-  return `
-Tu es un coach carrières senior et recruteur.
-
-MISSION :
-Rédige UNIQUEMENT le CORPS d’une lettre de motivation professionnelle, parfaitement adaptée au poste, en utilisant UNIQUEMENT les informations du candidat fournies.
-Le prompt doit fonctionner pour TOUS les domaines (tech, administratif, commercial, santé, etc.) : tu extrais les exigences de la fiche de poste et tu les relies au profil.
-
-ENTRÉES :
-- Intitulé du poste : ${safeJobTitle}
-- Entreprise : ${safeCompany}
-- Fiche de poste / description :
-${safeJD}
-
-- Profil candidat (source de vérité) :
-${p.cvText}
-
-RÈGLES STRICTES :
-- N’invente rien (entreprises, diplômes, outils, dates, chiffres).
-- Si une info manque, reste générique ("j’ai contribué à des projets à impact") sans métriques inventées.
-- Réponds OBLIGATOIREMENT en JSON STRICT, sans texte autour :
-{ "body": "..." }
-- "body" = texte brut avec paragraphes séparés par UNE ligne vide (\n\n).
-- Pas d’en-tête, pas d’adresses, pas d’objet, pas de formule d’appel, pas de signature, pas de listes à puces, pas d’émojis.
-
-DIRECTIVE CONTENU (multi-domaines) :
-- 3 à 5 paragraphes courts.
-1) Motivation pour ${safeJobTitle} chez ${safeCompany} + accroche crédible basée sur le profil.
-2) Fais le lien entre 3–5 attentes de la fiche de poste et les compétences/expériences du CV.
-3) Cite 1–2 contributions/réalisations concrètes SI elles existent dans le CV, sinon décris des apports typiques (qualité, rigueur, coordination, relation client, etc.).
-4) Explique comment le candidat contribuera dans les premiers mois (méthode, collaboration, résultats).
-5) Conclusion polie ouvrant sur un entretien.
-
-LONGUEUR :
-Entre ${minWords} et ${maxWords} mots.
-Retourne le JSON maintenant.
-`.trim();
-}
-````
-
-## File: lib/pdf/mergePdfs.ts
-````typescript
-// src/lib/pdf/mergePdfs.ts
-import { PDFDocument } from "pdf-lib";
-
-/**
- * Merge plusieurs PDFs (Blob) en un seul PDF (Blob).
- * Compatible Next.js / TS: évite le type Uint8Array<ArrayBufferLike> non accepté par BlobPart.
- */
-export async function mergePdfBlobs(blobs: Blob[]): Promise<Blob> {
-  const merged = await PDFDocument.create();
-
-  for (const b of blobs) {
-    const ab = await b.arrayBuffer();
-    const pdf = await PDFDocument.load(ab);
-
-    const pages = await merged.copyPages(pdf, pdf.getPageIndices());
-    for (const p of pages) merged.addPage(p);
-  }
-
-  const bytes = await merged.save();
-
-  // ✅ Cast sûr pour BlobPart (ArrayBuffer-backed)
-  const safeBytes = new Uint8Array(bytes);
-
-  return new Blob([safeBytes], { type: "application/pdf" });
-}
-````
-
-## File: lib/pdf/pdfmakeClient.ts
-````typescript
-// src/lib/pdf/pdfmakeClient.ts
-let cached: any | null = null;
-
-function buildVfsFromModule(mod: any) {
-  if (!mod) return null;
-
-  // Cas classique: { pdfMake: { vfs: {...} } }
-  const classic =
-    mod?.pdfMake?.vfs ??
-    mod?.default?.pdfMake?.vfs ??
-    mod?.default?.vfs ??
-    mod?.vfs;
-
-  if (classic && typeof classic === "object") return classic;
-
-  // ✅ Ton cas: le module expose directement les fichiers Roboto-*.ttf
-  // Ex: { "Roboto-Regular.ttf": "base64...", ..., default: {...} }
-  const candidate = typeof mod === "object" ? mod : null;
-  if (!candidate) return null;
-
-  const vfs: Record<string, string> = {};
-
-  for (const [k, v] of Object.entries(candidate)) {
-    if (k === "default") continue;
-    if (!k.toLowerCase().endsWith(".ttf")) continue;
-    if (typeof v !== "string") continue;
-    vfs[k] = v;
-  }
-
-  // Certains bundlers mettent les .ttf dans default
-  const def = candidate?.default;
-  if (def && typeof def === "object") {
-    for (const [k, v] of Object.entries(def)) {
-      if (!k.toLowerCase().endsWith(".ttf")) continue;
-      if (typeof v !== "string") continue;
-      vfs[k] = v;
-    }
-  }
-
-  return Object.keys(vfs).length ? vfs : null;
-}
-
-export async function getPdfMake() {
-  if (cached) return cached;
-
-  const pdfMakeMod: any = await import("pdfmake/build/pdfmake");
-  const pdfMake = pdfMakeMod.default ?? pdfMakeMod;
-
-  const fontsMod: any = await import("pdfmake/build/vfs_fonts");
-  const vfs = buildVfsFromModule(fontsMod);
-
-  if (!vfs) {
-    console.error("vfs_fonts module keys:", Object.keys(fontsMod || {}));
-    console.error("vfs_fonts.default keys:", Object.keys(fontsMod?.default || {}));
-    throw new Error("pdfmake vfs_fonts introuvable (vfs).");
-  }
-
-  pdfMake.vfs = vfs;
-
-  pdfMake.fonts = {
-    Roboto: {
-      normal: "Roboto-Regular.ttf",
-      bold: "Roboto-Medium.ttf",
-      italics: "Roboto-Italic.ttf",
-      bolditalics: "Roboto-MediumItalic.ttf",
-    },
-  };
-
-  cached = pdfMake;
-  return pdfMake;
-}
-
-export async function pdfMakeToBlob(docDef: any): Promise<Blob> {
-  const pdfMake = await getPdfMake();
-  return new Promise((resolve) => pdfMake.createPdf(docDef).getBlob(resolve));
-}
-
-export function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 15000);
-}
-````
-
-## File: lib/apiClient.ts
-````typescript
-"use client";
-
-import { API_BASE, tryGetRecaptchaToken } from "@/lib/recaptcha";
-
-type JsonHeaders = Record<string, string>;
-
-function normalizePath(path: string) {
-  return (path || "").replace(/^\/+/, "");
-}
-
-function buildRecaptchaError(action: string) {
-  return new Error(
-    `reCAPTCHA indisponible pour l’action "${action}". ` +
-      `Vérifie : (1) NEXT_PUBLIC_RECAPTCHA_SITE_KEY, (2) script chargé, (3) adblock, (4) domaine autorisé côté Google.`
-  );
-}
-
-export async function postJsonWithRecaptcha<T>(
-  path: string,
-  action: string,
-  body: any,
-  extraHeaders: JsonHeaders = {}
-): Promise<T> {
-  const token = await tryGetRecaptchaToken(action);
-  if (!token) throw buildRecaptchaError(action);
-
-  const res = await fetch(`${API_BASE}/${normalizePath(path)}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Recaptcha-Token": token,
-      ...extraHeaders,
-    },
-    body: JSON.stringify({
-      ...body,
-      recaptchaToken: token, // ✅ compatible avec ton backend
-      recaptchaAction: action,
-    }),
-    cache: "no-store",
-  });
-
-  const text = await res.text();
-  let data: any = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    // si le backend renvoie pas du JSON
-  }
-
-  if (!res.ok) {
-    const msg =
-      (data && (data.error || data.message)) ||
-      text ||
-      `HTTP ${res.status}`;
-    throw new Error(msg);
-  }
-
-  return data as T;
-}
-
-export async function postBlobWithRecaptcha(
-  path: string,
-  action: string,
-  body: any,
-  extraHeaders: JsonHeaders = {}
-): Promise<Blob> {
-  const token = await tryGetRecaptchaToken(action);
-  if (!token) throw buildRecaptchaError(action);
-
-  const res = await fetch(`${API_BASE}/${normalizePath(path)}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Recaptcha-Token": token,
-      ...extraHeaders,
-    },
-    body: JSON.stringify({
-      ...body,
-      recaptchaToken: token,
-      recaptchaAction: action,
-    }),
-    cache: "no-store",
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    let data: any = null;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {}
-    const msg =
-      (data && (data.error || data.message)) ||
-      text ||
-      `HTTP ${res.status}`;
-    throw new Error(msg);
-  }
-
-  return await res.blob();
-}
-````
-
-## File: .firebase/hosting.b3V0.cache
-````
-tech.txt,1766516748973,3cc77dc7579ee301c79c58a1da5d988087fb019c57e0d78f73a119a26fc00a4d
-tech.html,1766516748967,70478536984048f8c6baf85a4058f211be215908aa302b25aaed9a52c5f222ac
-signup.txt,1766516748973,67d7b353b52eddfad89558b7f87fa0ed0a8b9d01d3ac4a26af8f5c46c0aaaec0
-signup.html,1766516748966,13a430bdcfa6a23c937d07424d9976cba1c378d7fba5af9d709247d55dbae711
-manifest.webmanifest,1766516747523,b125a9afb1b3c4b81daaf5442dd9d589e2367c37c2fd3305fa23247173975337
-login.txt,1766516748972,caa566efee024b3a35054ae05a6f221d8495f025d7f380ea77aff75eb5fb3d5e
-login.html,1766516748966,d3998e585966bec43ed93623d16627486f69f8fab60f572b28cae0418e40727f
-index.txt,1766516748972,b0952ef67cb6b99e6c2afeaba613ffad79cb81f327adcc17ba2d877afab592dc
-index.html,1766516748965,9b9072f01f7c7b5092cee0c56e4e838dc370c49d1045768f26997eea029c3b26
-forgot-password.txt,1766516748971,88c0dd789a3046334a7199dcfcc9854cfc2551f6e0a3d67bde03695847b139c7
-forgot-password.html,1766516748964,c7999480bd7f5ecd38846e31c73bbc5a4d85cbdd954181b7b45e85e724dbcad9
-assistance-candidature.txt,1766516748972,571b66de82c739ba22388b13fa2683eeae37641c1f05ae600f98f1b66317d7b8
-assistance-candidature.html,1766516748964,497d9247344cccd26da023e712845771c7462cde598b6fe5e82f9c1d6435265c
-app.txt,1766516748972,7850b8a9e9ba265b34809ed488fba35e5e68db7e503f661eb1ac59a346b9067a
-app.html,1766516748966,73a6efe79ce7b661efb9f95998c80a538a98e79b73297ddf15162766e1fa4f58
-admin.txt,1766516748970,f803e183918a3f2766bc90dd598061cee600d5c7ee28285e0baf519cfd6cf810
-admin.html,1766516748962,e27231a563db9416d934f284b9a06cf556c887632aad85a59678fdbc833e139d
-404.html,1766516748361,0626120cd6599b9be504fa03b62df50001f4d6b7ad6f8cb18f42ef5bff48a7f3
-debug/polar.txt,1766516748967,162c79c96a088d3835c7deff2f7ee56b4824f4ff666e9cc3950531bb47524fc4
-debug/polar.html,1766516748960,9c12de9b764a377658e9776ec0b1b788f9a210cdbad24e04cb26a23b14ad27ac
-auth/verify-email.txt,1766516748967,63b1366132c2b0e2c175635e0649c2db808d8ec7667749d2639f53b758e377c7
-auth/verify-email.html,1766516748960,2f2ee707b9bc799fd433a74e7cb6dc81852665f6465c45576704e0988b31b106
-app/tracker.txt,1766516748970,18126b57901f775004395836548f7a73751e83b18b81872442dee1c87370dc22
-app/tracker.html,1766516748963,30b6204034b11845cb893ff05443198864a7adb00070b9adb7dd2ec98b08bcb3
-app/settings.txt,1766516748973,ccef11346e1bbd3e3b7ae52f767cba6a1aa6d92d4fcfd3793593ee8b7d9ccde9
-app/settings.html,1766516748966,5266df0af37d8fa6709cc6d2c863bbe4ab89b08efcac97998501d65a9b3d7b7b
-app/pitch.txt,1766516748969,36f5315cfc294be3857aa266a1740f5221496df763e9778ec8725bffd1a03544
-app/pitch.html,1766516748962,d6a772b420bd301d88a2ca95ae58b8e8cef8f1066b195f6141c8c37d3ecb53bf
-app/lm.txt,1766516748972,ab8e094152014d928f4b1837948edf892f04ac8a19b3a353a6ad42582165eb2f
-app/lm.html,1766516748964,e1ff1821ef676c6bba3853b7351d77bae4a3d321d16d9266707ecd3b0bf1f180
-app/interview.txt,1766516748971,fe4689f8802db6b00679134b9ee6b202e9e5f04e9f4bdc8cb6f1fa5920467554
-app/interview.html,1766516748964,f58af150bc197f2fd5351b159b958ad7c3d3a6b7f0aef7b7786cece06b0249f1
-app/history.txt,1766516748969,3d99fecc6e8369deb2ac7ff03c4b17d90cde33080bbc48ca2ca6cb30c8515953
-app/history.html,1766516748962,e13c02f140849dbd105464a044416fd5cecaf07c72d7f3cc9f9be4f1a2d5789a
-app/cv.txt,1766516748971,ae59d2a5c6c8bc3d41dca902c3119ff1dc33b3aeb63bef75758cf15824c15d58
-app/cv.html,1766516748964,6527edd251c87b7ca2c2310a42dca7da53e14ecb664b1e3d287d6616514f81c1
-app/credits.txt,1766516748968,24d4978dee084c63c1cbb323155cd4c70f6d02ca243de961f90d7e6b467f71fe
-app/credits.html,1766516748961,3cc63222ed5df58478beb80f7efb773c4d3b47f4af69d398f621ff2b2208e337
-app/apply.txt,1766516748969,8ea0c8e96099d408f8d6335b00bfa7124ac76c0c6c83be7dccd9dddfc4190d81
-app/apply.html,1766516748961,71be18f951c8b9bdf78fa5ffd11e7d108a8b6ef4ef461e65298d54e759f3f5e4
-api/polar/test,1766516748967,35d1b34b7807696b8413c672871fcf26b35d968667e349dfbe811cedc67ac17a
-admin/logs.txt,1766516748968,4193cfac968d950cd1d60e21536d13877be82d5fda4b328877374dcf3ffb6bbf
-admin/logs.html,1766516748961,7d85f1598fa19eb04fd7f41d2319e17fca3b8c1d30c79ba2e78bae763e7b8d1a
-admin/login.txt,1766516748966,fc9efe2a6fb3cbc9a59bc9c9a6f15f8407bc4554cb41a0b9a83ad59717910c6a
-admin/login.html,1766516748959,b77fe6a483e5cc895e0545a8dfa15d00ad77e642c37809d773749102a7da8e24
-_next/static/css/faac00ea2ad55afa.css,1766516747505,6d7858f4fcc4e1e9989a644e8cf8a19bb627645fdf7cac7bb293cc4e6ae1ada3
-_next/static/chunks/webpack-94aa307a0c675022.js,1766516747501,39d51b0f67df400cf90160e3e74e56e3b3ac0d30af506085df8bee1092e91cab
-_next/static/chunks/polyfills-42372ed130431b0a.js,1766516747505,67dee1c02c6a6700d63b5c1898cf2df618101a68a395db469192763d24925a23
-_next/static/chunks/main-app-7466cb2517b2ac24.js,1766516747498,3dad6f439d8b157d2427b4087aaeff0fef56e1e1041ee3b5f0fad10bf506a92d
-_next/static/chunks/main-76e1bcb595671093.js,1766516747504,bbcdc180a07d600a7f8dcfa6d3267afdec0b918f9bc722e4764b72782a68d238
-_next/static/chunks/framework-aec844d2ccbe7592.js,1766516747501,36f12099915a78862f76158596a2aac7e86dd87ba94f4d3b896a7749c5e4c9d6
-_next/static/chunks/fd9d1056-b4129a380d1be68f.js,1766516747498,8b73f2ae4babb3d70adf200a16329555cd03b390ca97f3fa3368428ebc73c549
-_next/static/chunks/ebf8faf4-eb27ebf8c37d4d67.js,1766516747497,a107c6566fbc2f52b78a30e52b2ae3b7b84b0da4ffe8d15f24849c217e372a5d
-_next/static/chunks/ca377847-044365abace2608d.js,1766516747496,c6e43c770559cc5ee6605295131dc3e9de57d9fda82d7043e9b70b2f97bc8002
-_next/static/chunks/941-da853eb9ae4bc965.js,1766516747494,f4b97a2711ed98aa8723dcc66969fec23e3ebc576ff38e09fd1f1cd10bd20a82
-_next/static/chunks/810-039b9229cc1a2fae.js,1766516747488,2f29a61132b062dab1e63516e7337a67aede0bce268795b569dfccfc5c400bab
-_next/static/chunks/7508b87c-2affb3ad7b55ab3d.js,1766516747486,798ec3d71f923e838d157bf4dd01e76244b35e1c9634e28e77c89c9df89a676d
-_next/static/chunks/648-a41745ebae293ba3.js,1766516747483,d08de5f20a30c50b96e1cb68dfbec730d23ae67cba384f345e34c09b6adddaf3
-_next/static/chunks/63b94182.662a1bbff33f68c9.js,1766516747489,86c28eeebf9d1883bb5afe89168408b3ccf891d873e2ac67eec46ef5baa42a41
-_next/static/chunks/600-2ae2ab76ace4e875.js,1766516747480,ea47caf34ad27d1a524604c65a1c0ecc0f6fb1f64426749920e60ac529a33563
-_next/static/chunks/5493da1b.e7544b77cf3a7468.js,1766516747486,76cae2b4134f6f89522b80ad97b81eb8b093f50a047c7faa2e0512533d603784
-_next/static/chunks/500-c984c19836bde651.js,1766516747477,94a6d0ca98e707e577d1f1b6336dcdf87e35f2c1be72c787845aad3abfdab19b
-_next/static/chunks/323-54d09e3358a73f44.js,1766516747481,2aae14a1d235667a06206f344a3f76216206cb0f4697ccc38edc1923e27c5d58
-_next/static/chunks/276-a01f3bf27c64a121.js,1766516747479,7959269d2568322cb0a6253c58e7242b54d27d373aa32b7b0c05474bf95e8fd1
-_next/static/chunks/pages/_error-7ba65e1336b92748.js,1766516747506,0402d6340a70945d851b2d22e156d955fbee54c1d8ec8b379f35fd464a8d08bf
-_next/static/chunks/pages/_app-72b849fbd24ac258.js,1766516747506,dae29acdf0128939e571909a9228115276818bce739f4d0f98c1da8ed68ba91d
-_next/static/chunks/app/page-04078e5e4ba66b1d.js,1766516747506,fd845f84ec7c187a3bb3e82cd5a690aa75f0b4ca0c53a65495ea449a96c15991
-_next/static/chunks/app/not-found-74a90fc08ab9437a.js,1766516747506,8ec8fde655d80c0e5d37c7714dac9911aa99f5add99e26b2820f5afcda111b2a
-_next/static/chunks/app/layout-9e322ebc6c69974b.js,1766516747505,57a38ab6c6c143610c4c5c55fe368f60c5aed79c207f486eb9d75bf8763d6394
-_next/static/chunks/app/tech/page-cc145f1ea41d0f3b.js,1766516747515,9782dc820a4127292f16e053f0bcc1695227f9ba956897623c527946b7b8fdc5
-_next/static/chunks/app/signup/page-8c48925c3f3c52ca.js,1766516747512,636d7396bfba3179391c46dc2cadcfe85fcd5c9955e05cb88622170aa8b44f23
-_next/static/chunks/app/login/page-8a1f8646938577f8.js,1766516747512,45da851b1c759ecdc39470f681d20a1f67bd96b97ce88568df91a0aff4ca6696
-_next/static/chunks/app/forgot-password/page-7ba7f56b957b3ead.js,1766516747512,59c307ab28b715a638e9ac9d484b2d73ac8bd3b271b1db0fb16ce4716a556865
-_next/static/chunks/app/debug/polar/page-e28997809c70dae8.js,1766516747519,eae0b7def982e0bf3068fde94e7f0f34defeceee17e2646fb7a9cb846c72169e
-_next/static/chunks/app/auth/verify-email/page-c03af4984154988e.js,1766516747519,6b22e7525d83798f87b4b2b1d90798e6972b3edc575929ee1352938bfa718515
-_next/static/chunks/app/assistance-candidature/page-f38626f0664fd689.js,1766516747510,81d9766776f30fbac7fbd008ba3ab85a44d797761bc1a6972d105a47c69f101f
-_next/static/chunks/app/app/page-3d33f0691cc7052c.js,1766516747512,f79254300ae18826e790c276848a5aa9223b69f41cb2b8516b8841a1e43a435b
-_next/static/chunks/app/app/layout-7aa6ad0f76d78662.js,1766516747509,47da4ba9f8b5600fd9cb70eb46bf190b3ea02b503488dfb3560c83c2a3d7b7b8
-_next/static/chunks/app/app/tracker/page-8f13d48cb47ca503.js,1766516747519,0b68abda42bcfe86ea7274e10859d1964851010b96b165ed852ecfd58ae16571
-_next/static/chunks/app/app/settings/page-654d883b731b8e6b.js,1766516747518,a65265b14afa8476fb7b78ff2f3f18b8989aec6b6b50f4b02960185d8fca1d76
-_next/static/chunks/app/app/pitch/page-a42bf5337283b380.js,1766516747517,8bb08510d6cd6129e33e6ec8e6fbd346c590b1fce79e8c3fd1af1c8492f985d1
-_next/static/chunks/app/app/lm/page-a1057059c1ffab1f.js,1766516747518,34ed764c2ca1bf552158c78b6a6350f2cdd4411a752d4d7b3661952c6d1772f2
-_next/static/chunks/app/app/interview/page-5d2b46a3565c14fc.js,1766516747517,e004acddbc6b4612633faad87f187fd7fccee1994dfd7a383d0134b3ba6e8e69
-_next/static/chunks/app/app/history/page-b44f1b622671fb6b.js,1766516747516,2b50c7db092b6dc9ae36249d114bd85396746f0b795a72f18bc9e9432fdd325b
-_next/static/chunks/app/app/cv/page-492c1c2b5ea110d3.js,1766516747517,27b93316c1ef03d32314815e1199788b00fbc1166d05264ad35be6c9b1aed703
-_next/static/chunks/app/app/credits/page-afe0ce4cf8da1f59.js,1766516747516,7572d8149de19adcb718582a8fbe62aacc563f5bf5998fc4683b678a5ad3af9c
-_next/static/chunks/app/app/apply/page-cf0ee0e768561642.js,1766516747516,1b88d79376396f77cdfb2520e7eec3848bd4533744dcf0d4638c8768c5073c5f
-_next/static/chunks/app/admin/page-f161718d3c048788.js,1766516747509,8bc2d31560e4e32b0c29fd167e4bda2a4c421fdbf15a83fe5ad1253555f62b2a
-_next/static/chunks/app/admin/logs/page-e8c5c4ae49457b18.js,1766516747515,554379c156358ee21df7e2bad9172a59004c4a34179d606eec21ae1da9d2e808
-_next/static/chunks/app/admin/login/page-d0fa36fddfc7acd4.js,1766516747515,b90b810232b2619ad3be8ca04464545ed5bee12883d847e4577c1320ac8f4e14
-_next/static/chunks/app/_not-found/page-7494094633467ef3.js,1766516747508,dcfa115b285fc1e7d920913e1a0464349f8c270c107df17678afbcaee62abec0
-_next/static/IlA4IUG3fQpM1zdQiAMyW/_ssgManifest.js,1766516747501,02dbc1aeab6ef0a6ff2ff9a1643158cf9bb38929945eaa343a3627dee9ba6778
-_next/static/IlA4IUG3fQpM1zdQiAMyW/_buildManifest.js,1766516747503,f46b17d6e2e887329d388286773626796e64b52f4cd965c9b0fe037e97f3ad58
-````
 
 ## File: .firebase/hosting.Lm5leHQ.cache
 ````
@@ -3429,6 +2166,1081 @@ export default function AdminDashboardPage() {
 }
 ````
 
+## File: app/api/extractProfile/route.ts
+````typescript
+import { NextResponse } from "next/server";
+
+const UPSTREAM =
+  process.env.EXTRACT_PROFILE_UPSTREAM ||
+  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/extractProfile";
+
+export async function POST(req: Request) {
+  const auth = req.headers.get("authorization") || "";
+  const recaptcha = req.headers.get("x-recaptcha-token") || "";
+
+  const body = await req.json().catch(() => null);
+
+  if (!body || !body.base64Pdf) {
+    return NextResponse.json(
+      { error: "Champ 'base64Pdf' manquant." },
+      { status: 400 }
+    );
+  }
+
+  const upstreamRes = await fetch(UPSTREAM, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(auth ? { Authorization: auth } : {}),
+      ...(recaptcha ? { "X-Recaptcha-Token": recaptcha } : {}),
+    },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+
+  const text = await upstreamRes.text();
+  const contentType =
+    upstreamRes.headers.get("content-type") || "application/json";
+
+  return new NextResponse(text, {
+    status: upstreamRes.status,
+    headers: { "Content-Type": contentType },
+  });
+}
+````
+
+## File: app/api/generate-cv/generate-letter/route.ts
+````typescript
+import { NextResponse } from "next/server";
+import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+
+export const runtime = "nodejs";
+
+function getAdminApp() {
+  if (getApps().length) return getApps()[0];
+
+  const projectId = process.env.FIREBASE_ADMIN_PROJECT_ID || process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_ADMIN_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.FIREBASE_ADMIN_PRIVATE_KEY;
+
+  if (projectId && clientEmail && privateKeyRaw) {
+    const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+    return initializeApp({
+      credential: cert({ projectId, clientEmail, privateKey }),
+    });
+  }
+
+  return initializeApp({
+    credential: applicationDefault(),
+  });
+}
+
+async function requireUser(req: Request) {
+  getAdminApp();
+
+  const authHeader = req.headers.get("authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+
+  if (!token) {
+    return { ok: false as const, status: 401, error: "Missing Authorization Bearer token" };
+  }
+
+  try {
+    const decoded = await getAuth().verifyIdToken(token);
+    return { ok: true as const, uid: decoded.uid, email: decoded.email || "" };
+  } catch (e) {
+    console.error("verifyIdToken error:", e);
+    return { ok: false as const, status: 401, error: "Invalid token" };
+  }
+}
+
+async function consumeCreditsAndLog(params: {
+  uid: string;
+  email: string;
+  cost: number;
+  tool: string;
+  docType: "cv" | "lm" | "other";
+  meta?: any;
+}) {
+  getAdminApp();
+  const db = getFirestore();
+
+  const userRef = db.collection("users").doc(params.uid);
+  const usageRef = db.collection("usageLogs").doc();
+  const now = Date.now();
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const data = snap.exists ? snap.data() || {} : {};
+    const currentCredits = typeof data.credits === "number" ? data.credits : 0;
+
+    if (currentCredits < params.cost) {
+      const err: any = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      throw err;
+    }
+
+    tx.set(
+      userRef,
+      {
+        credits: currentCredits - params.cost,
+        totalIaCalls: FieldValue.increment(1),
+        totalDocumentsGenerated: FieldValue.increment(params.docType === "cv" || params.docType === "lm" ? 1 : 0),
+        totalCvGenerated: FieldValue.increment(params.docType === "cv" ? 1 : 0),
+        totalLmGenerated: FieldValue.increment(params.docType === "lm" ? 1 : 0),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    tx.set(
+      usageRef,
+      {
+        userId: params.uid,
+        email: params.email || "",
+        action: "generate_document",
+        docType: params.docType,
+        eventType: "generate",
+        tool: params.tool,
+        creditsDelta: -params.cost,
+        meta: params.meta || null,
+        createdAt: now,
+        createdAtServer: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+function buildProfileContextForIA(profile: any) {
+  const p = profile || {};
+
+  let skillsArr: any[] = [];
+  if (Array.isArray(p.skills)) {
+    skillsArr = p.skills;
+  } else if (p.skills && typeof p.skills === "object") {
+    if (Array.isArray(p.skills.sections)) {
+      p.skills.sections.forEach((sec: any) => {
+        if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
+      });
+    }
+    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
+  }
+
+  const skillsStr = (skillsArr || []).join(", ");
+
+  const expStr = Array.isArray(p.experiences)
+    ? p.experiences
+        .map(
+          (e: any) =>
+            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
+        )
+        .join("; \n")
+    : "";
+
+  const eduStr = Array.isArray(p.education)
+    ? p.education
+        .map((e: any) => `${e.degree || e.title || ""} - ${e.school || e.institution || ""} (${e.dates || ""})`)
+        .join("; \n")
+    : "";
+
+  return `Nom: ${p.fullName || p.name || ""}
+Titre: ${p.profileHeadline || p.title || ""}
+Contact: ${p.email || ""} | ${p.phone || ""} | ${p.linkedin || ""} | ${p.city || ""}
+Résumé de profil: ${p.profileSummary || p.summary || ""}
+Compétences: ${skillsStr}
+Expériences: 
+${expStr}
+Formations: 
+${eduStr}
+Certifications: ${p.certs || ""}
+Langues: ${p.langLine || p.lang || ""}`.trim();
+}
+
+async function callGeminiText(prompt: string, apiKey: string, temperature = 0.7, maxOutputTokens = 2400) {
+  const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature, maxOutputTokens },
+  };
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const errorText = await resp.text();
+    throw new Error("Erreur Gemini (texte): " + errorText);
+  }
+
+  const data = await resp.json();
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const text = parts
+    .map((p: any) => (typeof p.text === "string" ? p.text : ""))
+    .join("\n")
+    .trim();
+
+  if (!text) throw new Error("Réponse Gemini (texte) vide");
+  return text;
+}
+
+function buildFallbackLetterAndPitch(profile: any, jobTitle: string, companyName: string, jobDescription: string, lang: string) {
+  const p = profile || {};
+  const name = p.fullName || "";
+  const primaryDomain = p.primaryDomain || "";
+  const summary = p.profileSummary || "";
+  const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
+  const role = firstExp?.role || firstExp?.title || "";
+  const company = firstExp?.company || "";
+  const years = Array.isArray(p.experiences) && p.experiences.length > 0 ? p.experiences.length : null;
+
+  if (lang === "en") {
+    return {
+      pitch:
+        summary ||
+        `I am ${name || "a candidate"} with ${years ? years + " years of experience" : "solid experience"} in ${
+          primaryDomain || "my field"
+        }, motivated by the ${jobTitle || "role"} at ${companyName || "your company"}.`,
+      coverLetter: `I am writing to express my interest in the position of ${jobTitle || "your advertised role"}. With ${
+        years ? years + " years of experience" : "solid experience"
+      } in ${primaryDomain || "my field"}, I have developed strong skills relevant to this opportunity.
+
+In my previous experience at ${company || "my last company"}, I contributed to projects with measurable impact and collaborated with different stakeholders.
+
+I would be delighted to discuss how I can contribute to your team.`,
+    };
+  }
+
+  return {
+    pitch:
+      summary ||
+      `Je suis ${name || "un(e) candidat(e)"} avec ${
+        years ? years + " ans d’expérience" : "une solide expérience"
+      } ${primaryDomain ? "dans " + primaryDomain : ""}, motivé(e) par le poste de ${
+        jobTitle || "votre poste"
+      } chez ${companyName || "votre entreprise"}.`,
+    coverLetter: `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
+      companyName || "votre entreprise"
+    }. Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
+      primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
+    }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
+
+Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`,
+  };
+}
+
+export async function POST(req: Request) {
+  const auth = await requireUser(req);
+  if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
+
+  let body: any = null;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const profile = body?.profile;
+  const jobDescription = body?.jobDescription || "";
+  const jobTitle = body?.jobTitle || "";
+  const companyName = body?.companyName || "";
+  const langRaw = body?.lang || "fr";
+  const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+
+  if (!profile) return NextResponse.json({ ok: false, error: "Missing profile" }, { status: 400 });
+  if (!jobTitle && !jobDescription) {
+    return NextResponse.json(
+      { ok: false, error: "Ajoute au moins l'intitulé du poste ou un extrait de la description." },
+      { status: 400 }
+    );
+  }
+
+  // ✅ Débit -1 crédit + log
+  try {
+    await consumeCreditsAndLog({
+      uid: auth.uid,
+      email: auth.email,
+      cost: 1,
+      tool: "generateLetterAndPitch",
+      docType: "lm",
+      meta: { jobTitle, companyName, lang },
+    });
+  } catch (e: any) {
+    if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
+      return NextResponse.json({ ok: false, error: "NO_CREDITS" }, { status: 402 });
+    }
+    console.error("consumeCreditsAndLog error:", e);
+    return NextResponse.json({ ok: false, error: "CREDITS_ERROR" }, { status: 500 });
+  }
+
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+
+  const cvText = buildProfileContextForIA(profile);
+
+  if (!GEMINI_API_KEY) {
+    const fb = buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang);
+    return NextResponse.json({ ok: true, coverLetter: fb.coverLetter, pitch: fb.pitch, lang }, { status: 200 });
+  }
+
+  const prompt =
+    lang === "en"
+      ? `You are a senior career coach and recruiter.
+
+Return STRICTLY valid JSON:
+{ "coverLetter": "string", "pitch": "string" }
+
+COVER LETTER RULES:
+- "coverLetter" must be ONLY the BODY (no header, no subject, no greeting, no signature).
+- 3 to 5 short paragraphs separated by a blank line.
+- Do not invent facts, companies, tools, numbers.
+- Use ONLY the candidate profile and the job description.
+
+CANDIDATE PROFILE (source of truth):
+${cvText}
+
+JOB DESCRIPTION:
+${jobDescription || "—"}
+
+JOB TITLE: ${jobTitle || "the role"}
+COMPANY: ${companyName || "your company"}`
+      : `Tu es un coach carrières senior et recruteur.
+
+Retourne STRICTEMENT un JSON valide :
+{ "coverLetter": "string", "pitch": "string" }
+
+RÈGLES LETTRE :
+- "coverLetter" = UNIQUEMENT le CORPS (pas d’en-tête, pas d’objet, pas de formule d’appel, pas de signature).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Ne pas inventer (entreprises/outils/chiffres).
+- Utilise UNIQUEMENT le profil candidat + la fiche de poste.
+
+PROFIL CANDIDAT (source de vérité) :
+${cvText}
+
+FICHE DE POSTE :
+${jobDescription || "—"}
+
+INTITULÉ : ${jobTitle || "le poste"}
+ENTREPRISE : ${companyName || "votre entreprise"}`;
+
+  let coverLetter = "";
+  let pitch = "";
+
+  try {
+    const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.7, 2200);
+    const cleaned = String(raw).replace(/```json|```/gi, "").trim();
+
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      parsed = { coverLetter: cleaned, pitch: "" };
+    }
+
+    coverLetter = typeof parsed.coverLetter === "string" ? parsed.coverLetter.trim() : "";
+    pitch = typeof parsed.pitch === "string" ? parsed.pitch.trim() : "";
+  } catch (e) {
+    console.error("Gemini generateLetterAndPitch error:", e);
+  }
+
+  if (!coverLetter || !pitch) {
+    const fb = buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang);
+    if (!coverLetter) coverLetter = fb.coverLetter;
+    if (!pitch) pitch = fb.pitch;
+  }
+
+  return NextResponse.json({ ok: true, coverLetter, pitch, lang }, { status: 200 });
+}
+````
+
+## File: app/api/generate-cv/route.ts
+````typescript
+import { NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+// URL de ta Cloud Function Google
+const UPSTREAM =
+  process.env.GENERATE_LETTER_UPSTREAM ||
+  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
+
+export async function POST(req: Request) {
+  try {
+    // 1. Récupération des headers (Auth + Recaptcha)
+    const auth = req.headers.get("authorization") || "";
+    const headerRecaptcha = req.headers.get("x-recaptcha-token") || "";
+
+    const body = await req.json().catch(() => null);
+    if (!body) {
+      return NextResponse.json({ error: "Body JSON invalide." }, { status: 400 });
+    }
+
+    // 2. Support recaptcha dans header OU body
+    const bodyRecaptcha =
+      typeof body?.recaptchaToken === "string" ? body.recaptchaToken : "";
+    const recaptcha = headerRecaptcha || bodyRecaptcha;
+
+    // 3. Appel Cloud Function (Server-to-Server)
+    const upstreamRes = await fetch(UPSTREAM, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth ? { Authorization: auth } : {}), // On transmet le token
+        ...(recaptcha ? { "X-Recaptcha-Token": recaptcha } : {}),
+      },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+
+    // 4. Renvoi de la réponse
+    const contentType =
+      upstreamRes.headers.get("content-type") || "application/json";
+    const text = await upstreamRes.text();
+
+    return new NextResponse(text, {
+      status: upstreamRes.status,
+      headers: { "Content-Type": contentType },
+    });
+  } catch (e: any) {
+    console.error("API /generateLetterAndPitch error:", e);
+    return NextResponse.json({ error: "internal_error" }, { status: 500 });
+  }
+}
+````
+
+## File: app/api/generate-zip/route.ts
+````typescript
+// app/api/generate-zip/route.ts
+
+import { NextResponse } from "next/server";
+import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import JSZip from "jszip";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+
+// ⚠️ Pour typer proprement le cast à la fin
+type BodyInitCompat = BodyInit | null | undefined;
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+function getAdminApp() {
+  if (getApps().length) return getApps()[0];
+
+  const projectId = process.env.FIREBASE_ADMIN_PROJECT_ID || process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_ADMIN_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.FIREBASE_ADMIN_PRIVATE_KEY;
+
+  if (projectId && clientEmail && privateKeyRaw) {
+    const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+    return initializeApp({
+      credential: cert({ projectId, clientEmail, privateKey }),
+    });
+  }
+
+  return initializeApp({
+    credential: applicationDefault(),
+  });
+}
+
+async function requireUser(req: Request) {
+  getAdminApp();
+
+  const authHeader = req.headers.get("authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+
+  if (!token) {
+    return { ok: false as const, status: 401, error: "Missing Authorization Bearer token" };
+  }
+
+  try {
+    const decoded = await getAuth().verifyIdToken(token);
+    return { ok: true as const, uid: decoded.uid, email: decoded.email || "" };
+  } catch (e) {
+    console.error("verifyIdToken error:", e);
+    return { ok: false as const, status: 401, error: "Invalid token" };
+  }
+}
+
+async function consumeCreditsAndLog(params: {
+  uid: string;
+  email: string;
+  cost: number; // ex 2
+  tool: string; // generateCvLmZip
+  docType: "cv" | "lm" | "other";
+  meta?: any;
+}) {
+  getAdminApp();
+  const db = getFirestore();
+
+  const userRef = db.collection("users").doc(params.uid);
+  const usageRef = db.collection("usageLogs").doc();
+  const now = Date.now();
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const data = snap.exists ? snap.data() || {} : {};
+    const currentCredits = typeof data.credits === "number" ? data.credits : 0;
+
+    if (currentCredits < params.cost) {
+      const err: any = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      throw err;
+    }
+
+    tx.set(
+      userRef,
+      {
+        credits: currentCredits - params.cost,
+        totalIaCalls: FieldValue.increment(1),
+        totalDocumentsGenerated: FieldValue.increment(2), // zip = 2 docs (cv + lm)
+        totalCvGenerated: FieldValue.increment(1),
+        totalLmGenerated: FieldValue.increment(1),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    tx.set(
+      usageRef,
+      {
+        userId: params.uid,
+        email: params.email || "",
+        action: "generate_document",
+        docType: params.docType,
+        eventType: "generate",
+        tool: params.tool,
+        creditsDelta: -params.cost,
+        meta: params.meta || null,
+        createdAt: now,
+        createdAtServer: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+function buildProfileContextForIA(profile: any) {
+  const p = profile || {};
+
+  let skillsArr: any[] = [];
+  if (Array.isArray(p.skills)) {
+    skillsArr = p.skills;
+  } else if (p.skills && typeof p.skills === "object") {
+    if (Array.isArray(p.skills.sections)) {
+      p.skills.sections.forEach((sec: any) => {
+        if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
+      });
+    }
+    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
+  }
+
+  const skillsStr = (skillsArr || []).join(", ");
+
+  const expStr = Array.isArray(p.experiences)
+    ? p.experiences
+        .map(
+          (e: any) =>
+            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
+        )
+        .join("; \n")
+    : "";
+
+  const eduStr = Array.isArray(p.education)
+    ? p.education
+        .map((e: any) => `${e.degree || e.title || ""} - ${e.school || e.institution || ""} (${e.dates || ""})`)
+        .join("; \n")
+    : "";
+
+  return `Nom: ${p.fullName || p.name || ""}
+Titre: ${p.profileHeadline || p.title || ""}
+Contact: ${p.email || ""} | ${p.phone || ""} | ${p.linkedin || ""} | ${p.city || ""}
+Résumé de profil: ${p.profileSummary || p.summary || ""}
+Compétences: ${skillsStr}
+Expériences: 
+${expStr}
+Formations: 
+${eduStr}
+Certifications: ${p.certs || ""}
+Langues: ${p.langLine || p.lang || ""}`.trim();
+}
+
+async function callGeminiText(
+  prompt: string,
+  apiKey: string,
+  temperature = 0.65,
+  maxOutputTokens = 1400
+) {
+  const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature, maxOutputTokens },
+  };
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const errorText = await resp.text();
+    throw new Error("Erreur Gemini (texte): " + errorText);
+  }
+
+  const data = await resp.json();
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const text = parts
+    .map((p: any) => (typeof p.text === "string" ? p.text : ""))
+    .join("\n")
+    .trim();
+
+  if (!text) throw new Error("Réponse Gemini (texte) vide");
+  return text;
+}
+
+function buildFallbackLetterBody(profile: any, jobTitle: string, companyName: string, lang: string) {
+  const p = profile || {};
+  const primaryDomain = p.primaryDomain || "";
+  const summary = p.profileSummary || "";
+  const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
+  const role = firstExp?.role || firstExp?.title || "";
+  const company = firstExp?.company || "";
+  const years = Array.isArray(p.experiences) && p.experiences.length > 0 ? p.experiences.length : null;
+
+  if (lang === "en") {
+    return `I am writing to express my interest in the position of ${jobTitle || "your advertised role"} at ${
+      companyName || "your company"
+    }. ${summary || ""}
+
+With ${years ? years + " years of experience" : "solid experience"} in ${primaryDomain || "my field"}, I have developed skills relevant to this opportunity.
+
+In my previous experience at ${company || "my last company"}, I contributed to projects and collaborated with different stakeholders.
+
+I would be delighted to discuss how I can contribute to your team.`;
+  }
+
+  return `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
+    companyName || "votre entreprise"
+  }. ${summary || ""}
+
+Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
+    primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
+  }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
+
+Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`;
+}
+
+async function createSimpleCvPdf(profile: any, options: any) {
+  const { targetJob = "", lang = "fr", contract = "", jobLink = "", jobDescription = "" } = options || {};
+
+  const p = profile || {};
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([595.28, 841.89]); // A4
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const { width, height } = page.getSize();
+  const marginX = 50;
+  let y = height - 60;
+
+  function drawLine(text: string, size = 11, bold = false) {
+    if (!text || y < 50) return;
+    const f = bold ? fontBold : font;
+    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+    y -= size + 4;
+  }
+
+  function drawParagraph(text: string, size = 10) {
+    if (!text) return;
+    const f = font;
+    const maxWidth = width - marginX * 2;
+    const paragraphs = text.split(/\n{2,}/);
+
+    for (const paragraph of paragraphs) {
+      const words = paragraph.split(/\s+/);
+      let line = "";
+
+      for (const w of words) {
+        const testLine = line ? line + " " + w : w;
+        const testWidth = f.widthOfTextAtSize(testLine, size);
+        if (testWidth > maxWidth) {
+          if (y < 50) return;
+          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+          y -= size + 3;
+          line = w;
+        } else {
+          line = testLine;
+        }
+      }
+
+      if (line && y >= 50) {
+        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+        y -= size + 6;
+      }
+      y -= 2;
+    }
+  }
+
+  function drawSectionTitle(title: string) {
+    if (!title || y < 60) return;
+    page.drawText(title, { x: marginX, y, size: 11, font: fontBold, color: rgb(0.08, 0.15, 0.45) });
+    y -= 14;
+  }
+
+  function drawBullet(text: string, size = 9) {
+    if (!text || y < 50) return;
+    const f = font;
+    const bulletX = marginX + 8;
+    const maxWidth = width - marginX * 2 - 10;
+    const words = text.split(/\s+/);
+    let line = "";
+    let firstLine = true;
+
+    for (const w of words) {
+      const testLine = line ? line + " " + w : w;
+      const testWidth = f.widthOfTextAtSize(testLine, size);
+      if (testWidth > maxWidth) {
+        if (y < 50) return;
+        page.drawText(firstLine ? "• " + line : "  " + line, {
+          x: bulletX,
+          y,
+          size,
+          font: f,
+          color: rgb(0.1, 0.12, 0.16),
+        });
+        y -= size + 3;
+        line = w;
+        firstLine = false;
+      } else {
+        line = testLine;
+      }
+    }
+
+    if (line && y >= 50) {
+      page.drawText(firstLine ? "• " + line : "  " + line, {
+        x: bulletX,
+        y,
+        size,
+        font: f,
+        color: rgb(0.1, 0.12, 0.16),
+      });
+      y -= size + 3;
+    }
+  }
+
+  // Header
+  drawLine(p.fullName || "", 16, true);
+  const jobLine = targetJob || contract || p.contractType || (lang === "en" ? "Target position" : "Poste recherché");
+  drawLine(jobLine, 11, false);
+
+  const contactParts = [p.email || "", p.phone || "", p.city || "", p.linkedin || ""].filter(Boolean);
+  if (contactParts.length) drawLine(contactParts.join(" · "), 9, false);
+
+  if (jobLink) drawLine((lang === "en" ? "Job link: " : "Lien de l'offre : ") + jobLink, 8, false);
+
+  y -= 6;
+
+  if (p.profileSummary) {
+    drawSectionTitle(lang === "en" ? "Profile" : "Profil");
+    drawParagraph(p.profileSummary, 9.5);
+    y -= 4;
+  }
+
+  if (p.skills && Array.isArray(p.skills.sections) && p.skills.sections.length) {
+    drawSectionTitle(lang === "en" ? "Key skills" : "Compétences clés");
+    p.skills.sections.forEach((sec: any) => {
+      if (!sec || (!sec.title && !Array.isArray(sec.items))) return;
+      if (sec.title) drawLine(sec.title, 9.5, true);
+      if (Array.isArray(sec.items)) drawParagraph(sec.items.join(" · "), 9);
+      y -= 2;
+    });
+  }
+
+  if (Array.isArray(p.experiences) && p.experiences.length) {
+    drawSectionTitle(lang === "en" ? "Experience" : "Expériences professionnelles");
+    p.experiences.forEach((exp: any) => {
+      if (y < 90) return;
+      const header = [exp.role, exp.company].filter(Boolean).join(" — ");
+      if (header) drawLine(header, 10, true);
+      if (exp.dates) drawLine(exp.dates, 8.5, false);
+      if (Array.isArray(exp.bullets)) exp.bullets.slice(0, 4).forEach((b: string) => drawBullet(b, 8.5));
+      y -= 4;
+    });
+  }
+
+  if (Array.isArray(p.education) && p.education.length && y > 80) {
+    drawSectionTitle(lang === "en" ? "Education" : "Formation");
+    p.education.forEach((ed: any) => {
+      if (y < 60) return;
+      const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
+      if (header) drawLine(header, 9.5, true);
+      if (ed.dates) drawLine(ed.dates, 8.5, false);
+      y -= 4;
+    });
+  }
+
+  if (p.langLine && y > 60) {
+    drawSectionTitle(lang === "en" ? "Languages" : "Langues");
+    drawParagraph(p.langLine, 9);
+  }
+
+  if (Array.isArray(p.hobbies) && p.hobbies.length && y > 60) {
+    drawSectionTitle(lang === "en" ? "Interests" : "Centres d'intérêt");
+    drawParagraph(p.hobbies.join(" · "), 9);
+  }
+
+  const pdfBytes = await pdfDoc.save();
+  return Buffer.from(pdfBytes);
+}
+
+async function createLetterPdf(coverLetter: string, meta: any) {
+  const { jobTitle = "", companyName = "", candidateName = "", lang = "fr" } = meta || {};
+
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([595.28, 841.89]); // A4
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const { width, height } = page.getSize();
+  const marginX = 60;
+  let y = height - 70;
+
+  function drawLine(text: string, size = 11, bold = false) {
+    if (!text || y < 60) return;
+    const f = bold ? fontBold : font;
+    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
+    y -= size + 4;
+  }
+
+  function drawParagraph(text: string, size = 11) {
+    if (!text) return;
+    const f = font;
+    const maxWidth = width - marginX * 2;
+    const paragraphs = text.split(/\n{2,}/);
+
+    for (const paragraph of paragraphs) {
+      const words = paragraph.split(/\s+/);
+      let line = "";
+
+      for (const w of words) {
+        const testLine = line ? line + " " + w : w;
+        const testWidth = f.widthOfTextAtSize(testLine, size);
+        if (testWidth > maxWidth) {
+          if (y < 60) return;
+          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
+          y -= size + 4;
+          line = w;
+        } else {
+          line = testLine;
+        }
+      }
+
+      if (line && y >= 60) {
+        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
+        y -= size + 8;
+      }
+
+      y -= 4;
+    }
+  }
+
+  if (candidateName) drawLine(candidateName, 14, true);
+
+  if (jobTitle || companyName) {
+    const titleLine =
+      lang === "en"
+        ? `Application for ${jobTitle || "the position"} – ${companyName || "Company"}`
+        : `Candidature : ${jobTitle || "poste"} – ${companyName || "Entreprise"}`;
+    drawLine(titleLine, 11, false);
+  }
+
+  y -= 10;
+  drawParagraph(coverLetter, 11);
+
+  const pdfBytes = await pdfDoc.save();
+  return Buffer.from(pdfBytes);
+}
+
+export async function POST(req: Request) {
+  const auth = await requireUser(req);
+  if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
+
+  let body: any = null;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const profile = body?.profile;
+  const targetJob = body?.targetJob || "";
+  const langRaw = body?.lang || "fr";
+  const contract = body?.contract || "";
+  const jobLink = body?.jobLink || "";
+  const jobDescription = body?.jobDescription || "";
+
+  const lm = body?.lm || {};
+  const companyName = lm?.companyName || "";
+  const jobTitle = lm?.jobTitle || targetJob || "";
+  const lmJobDescription = lm?.jobDescription || jobDescription || "";
+  const lmLangRaw = lm?.lang || langRaw;
+
+  const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+  const lmLang = String(lmLangRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+
+  if (!profile) return NextResponse.json({ ok: false, error: "Missing profile" }, { status: 400 });
+
+  // ✅ Débit -2 crédits (CV + LM) + log
+  try {
+    await consumeCreditsAndLog({
+      uid: auth.uid,
+      email: auth.email,
+      cost: 2,
+      tool: "generateCvLmZip",
+      docType: "other",
+      meta: { targetJob, jobTitle, companyName, lang, lmLang },
+    });
+  } catch (e: any) {
+    if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
+      return NextResponse.json({ ok: false, error: "NO_CREDITS" }, { status: 402 });
+    }
+    console.error("consumeCreditsAndLog error:", e);
+    return NextResponse.json({ ok: false, error: "CREDITS_ERROR" }, { status: 500 });
+  }
+
+  // CV PDF
+  let cvBuffer: Buffer;
+  try {
+    cvBuffer = await createSimpleCvPdf(profile, {
+      targetJob,
+      lang,
+      contract,
+      jobLink,
+      jobDescription,
+    });
+  } catch (e: any) {
+    console.error("CV PDF error:", e);
+    return NextResponse.json({ ok: false, error: e?.message || "CV_PDF_ERROR" }, { status: 500 });
+  }
+
+  // LM BODY via Gemini
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+  const cvText = buildProfileContextForIA(profile);
+
+  let coverLetterBody = "";
+
+  if (GEMINI_API_KEY) {
+    const promptLm =
+      lmLang === "en"
+        ? `
+You are a senior career coach and recruiter.
+
+TASK:
+Write ONLY the BODY of a cover letter tailored to the job, using ONLY the provided information (CV + job description).
+
+INPUTS:
+- Job title: "${jobTitle || "the role"}"
+- Company: "${companyName || "your company"}"
+- Job description:
+${lmJobDescription || "—"}
+
+- Candidate profile (source of truth):
+${cvText}
+
+STRICT RULES:
+- Do NOT invent facts (no fake metrics, clients, tools, dates).
+- 3 to 5 paragraphs separated by ONE blank line.
+- No header, no subject line, no greeting, no signature.
+- Output MUST be STRICT JSON only:
+{ "body": "..." }
+`.trim()
+        : `
+Tu es un coach carrières senior et recruteur.
+
+MISSION :
+Rédige UNIQUEMENT le CORPS d’une lettre de motivation adaptée au poste, basée UNIQUEMENT sur les infos fournies (CV + fiche de poste).
+
+ENTRÉES :
+- Intitulé : "${jobTitle || targetJob || "le poste"}"
+- Entreprise : "${companyName || "votre entreprise"}"
+- Fiche de poste :
+${lmJobDescription || "—"}
+
+- Profil candidat :
+${cvText}
+
+RÈGLES :
+- Ne pas inventer (pas de chiffres/clients/technos non présents).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Pas d’en-tête, pas d’objet, pas de salutation, pas de signature.
+- Réponds STRICTEMENT en JSON :
+{ "body": "..." }
+`.trim();
+
+    try {
+      const rawLm = await callGeminiText(promptLm, GEMINI_API_KEY, 0.65, 1400);
+      const cleaned = String(rawLm).replace(/```json|```/gi, "").trim();
+      try {
+        const parsed = JSON.parse(cleaned);
+        coverLetterBody = typeof parsed.body === "string" ? parsed.body.trim() : "";
+      } catch {
+        coverLetterBody = String(rawLm || "").trim();
+      }
+    } catch (e) {
+      console.error("Gemini LM error:", e);
+    }
+  }
+
+  if (!coverLetterBody) {
+    coverLetterBody = buildFallbackLetterBody(profile, jobTitle, companyName, lmLang);
+  }
+
+  // LM PDF
+  let lmBuffer: Buffer;
+  try {
+    lmBuffer = await createLetterPdf(coverLetterBody, {
+      jobTitle,
+      companyName,
+      candidateName: profile.fullName || "",
+      lang: lmLang,
+    });
+  } catch (e: any) {
+    console.error("LM PDF error:", e);
+    return NextResponse.json({ ok: false, error: e?.message || "LM_PDF_ERROR" }, { status: 500 });
+  }
+
+  // ZIP ✅ (avec cast pour calmer TypeScript)
+  try {
+    const zip = new JSZip();
+    zip.file("cv-ia.pdf", cvBuffer);
+    zip.file(lmLang === "en" ? "cover-letter.pdf" : "lettre-motivation.pdf", lmBuffer);
+
+    const zipContent = await zip.generateAsync({ type: "uint8array" });
+
+    return new NextResponse(zipContent as unknown as BodyInitCompat, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Disposition": 'attachment; filename="cv-lm-ia.zip"',
+        "Content-Length": String(zipContent.byteLength),
+      },
+    });
+  } catch (e: any) {
+    console.error("ZIP error:", e);
+    return NextResponse.json({ ok: false, error: e?.message || "ZIP_ERROR" }, { status: 500 });
+  }
+}
+````
+
 ## File: app/api/generateInterviewQA/route.ts
 ````typescript
 // app/api/generateInterviewQA/route.ts
@@ -3676,419 +3488,355 @@ Missions / résultats :
 }
 ````
 
-## File: app/api/interview/route.ts
+## File: app/api/generateLetterAndPitch/route.ts
 ````typescript
-// app/api/interview/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import {
-  buildPrompt,
-  InterviewLevel,
-  InterviewChannel,
-  HistoryItem,
-} from "@/lib/interviewPrompt";
-import { verifyUserAndCredits, consumeCredit } from "@/lib/server/credits";
+import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
+// Si tu veux consommer des crédits / logs plus tard :
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 export const runtime = "nodejs";
 
 /**
- * ✅ reCAPTCHA OFF par défaut
- * -> Active uniquement si INTERVIEW_REQUIRE_RECAPTCHA=true
+ * Initialisation Firebase Admin
  */
-const REQUIRE_RECAPTCHA =
-  (process.env.INTERVIEW_REQUIRE_RECAPTCHA || "").toLowerCase().trim() ===
-  "true";
+function getAdminApp() {
+  if (getApps().length) return getApps()[0];
 
-// ---- Sessions en mémoire (DEV) ---- //
-type InterviewSession = {
-  userId: string;
-  createdAt: string;
-  lastUpdated: string;
-  jobDesc: string;
-  cvSummary: string;
-  mode: string;
-  level: InterviewLevel;
-  channel: InterviewChannel;
-  status: "active" | "completed";
-  currentStep: number;
-  history: HistoryItem[];
-  score?: number | null;
-  finalSummary?: string | null;
-};
+  const projectId = process.env.FIREBASE_ADMIN_PROJECT_ID || process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_ADMIN_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.FIREBASE_ADMIN_PRIVATE_KEY;
 
-const memorySessions = new Map<string, InterviewSession>();
-
-function createSessionId() {
-  try {
-    // @ts-ignore
-    return crypto.randomUUID();
-  } catch {
-    return Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
-  }
-}
-
-function purgeOldSessions(maxAgeMs = 1000 * 60 * 60 * 6) {
-  const now = Date.now();
-  for (const [sid, s] of memorySessions.entries()) {
-    const t = Date.parse(s.lastUpdated || s.createdAt);
-    if (!Number.isNaN(t) && now - t > maxAgeMs) memorySessions.delete(sid);
-  }
-}
-
-// ---------------- reCAPTCHA (Enterprise via CF recaptchaVerify) ----------------
-type RecaptchaVerifyResult =
-  | { ok: true; score?: number }
-  | { ok: false; reason: string; score?: number };
-
-function stripTrailingSlash(s: string) {
-  return s.endsWith("/") ? s.slice(0, -1) : s;
-}
-
-function getApiBaseServer(): string {
-  return stripTrailingSlash(
-    process.env.CLOUD_FUNCTIONS_BASE_URL ||
-      process.env.API_BASE_URL ||
-      "https://europe-west1-assistant-ia-v4.cloudfunctions.net"
-  );
-}
-
-async function verifyRecaptchaEnterpriseViaCF(
-  token: string,
-  action: string
-): Promise<RecaptchaVerifyResult> {
-  const base = getApiBaseServer();
-  try {
-    const res = await fetch(`${base}/recaptchaVerify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token, action: (action || "").trim() }),
-      cache: "no-store",
+  if (projectId && clientEmail && privateKeyRaw) {
+    const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+    return initializeApp({
+      credential: cert({ projectId, clientEmail, privateKey }),
     });
+  }
 
-    const data: any = await res.json().catch(() => null);
+  return initializeApp({
+    credential: applicationDefault(),
+  });
+}
 
-    if (!res.ok || !data?.ok) {
-      return {
-        ok: false,
-        reason: String(data?.reason || data?.error || "recaptcha_failed"),
-        score: typeof data?.score === "number" ? data.score : undefined,
-      };
-    }
+/**
+ * Vérifie le token Firebase envoyé par le front
+ */
+async function requireUser(req: NextRequest) {
+  getAdminApp();
 
+  const authHeader = req.headers.get("authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+
+  if (!token) {
     return {
-      ok: true,
-      score: typeof data?.score === "number" ? data.score : undefined,
+      ok: false as const,
+      status: 401,
+      error: "Missing Authorization Bearer token",
     };
-  } catch (e: any) {
-    return { ok: false, reason: e?.message || "network_error" };
   }
-}
 
-// ---- Handler principal ---- //
-export async function POST(req: NextRequest) {
   try {
-    purgeOldSessions();
-
-    const body = await req.json().catch(() => null);
-    if (!body || typeof body !== "object") {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-    }
-
-    const { action } = body as any;
-
-    // ✅ token peut venir de plusieurs endroits (selon ton front)
-    const recaptchaToken =
-      (body as any)?.recaptchaToken ||
-      (body as any)?.token ||
-      (body as any)?.recaptcha?.token ||
-      null;
-
-    const recaptchaAction =
-      (body as any)?.recaptchaAction ||
-      (body as any)?.recaptcha?.action ||
-      "interview";
-
-    // ✅ reCAPTCHA (optionnel)
-    if (REQUIRE_RECAPTCHA) {
-      if (!recaptchaToken || typeof recaptchaToken !== "string") {
-        return NextResponse.json(
-          {
-            error: "reCAPTCHA failed",
-            details: "token_missing_or_invalid",
-            requireRecaptcha: true,
-            expectedAction: recaptchaAction,
-          },
-          { status: 403 }
-        );
-      }
-
-      const rec = await verifyRecaptchaEnterpriseViaCF(
-        recaptchaToken,
-        recaptchaAction
-      );
-
-      if (!rec.ok) {
-        return NextResponse.json(
-          {
-            error: "reCAPTCHA failed",
-            details: rec.reason,
-            score: rec.score ?? null,
-            requireRecaptcha: true,
-            expectedAction: recaptchaAction,
-          },
-          { status: 403 }
-        );
-      }
-    }
-
-    // ---------- START ---------- //
-    if (action === "start") {
-      const { userId, jobDesc, cvSummary, mode, channel, level } = body as any;
-
-      if (!userId) {
-        return NextResponse.json({ error: "Missing userId" }, { status: 400 });
-      }
-
-      const user = await verifyUserAndCredits(userId);
-      if (!user) {
-        return NextResponse.json(
-          { error: "Unauthorized or no credits" },
-          { status: 401 }
-        );
-      }
-
-      const nowIso = new Date().toISOString();
-      const safeMode = (mode || "mixed") as string;
-      const safeChannel = (channel || "written") as InterviewChannel;
-      const safeLevel = (level || "junior") as InterviewLevel;
-
-      const sessionId = createSessionId();
-
-      const sessionData: InterviewSession = {
-        userId,
-        createdAt: nowIso,
-        lastUpdated: nowIso,
-        jobDesc: jobDesc || "",
-        cvSummary: cvSummary || "",
-        mode: safeMode,
-        level: safeLevel,
-        channel: safeChannel,
-        status: "active",
-        currentStep: 1,
-        history: [],
-      };
-
-      memorySessions.set(sessionId, sessionData);
-
-      const prompt = buildPrompt({
-        cvSummary: sessionData.cvSummary,
-        jobDesc: sessionData.jobDesc,
-        mode: sessionData.mode,
-        level: sessionData.level,
-        channel: sessionData.channel,
-        history: [],
-        step: 1,
-      });
-
-      const llmResponseText = await callLLM(prompt);
-
-      let parsed: any;
-      try {
-        parsed = JSON.parse(llmResponseText);
-      } catch {
-        parsed = { next_question: "Parlez-moi de vous.", short_analysis: null };
-      }
-
-      const firstQuestion = parsed.next_question || "Parlez-moi de vous.";
-
-      const historyItem: HistoryItem = {
-        role: "interviewer",
-        text: firstQuestion,
-        createdAt: new Date().toISOString(),
-      };
-
-      const updatedSession = memorySessions.get(sessionId);
-      if (updatedSession) {
-        updatedSession.history.push(historyItem);
-        updatedSession.currentStep = 1;
-        updatedSession.lastUpdated = new Date().toISOString();
-        memorySessions.set(sessionId, updatedSession);
-      }
-
-      await consumeCredit(userId);
-
-      return NextResponse.json({
-        sessionId,
-        firstQuestion,
-        shortAnalysis: parsed.short_analysis ?? null,
-      });
-    }
-
-    // ---------- ANSWER ---------- //
-    if (action === "answer") {
-      const { userId, sessionId, userMessage, channel, step } = body as any;
-
-      if (!userId || !sessionId || !userMessage?.trim()) {
-        return NextResponse.json(
-          { error: "Missing userId, sessionId or userMessage" },
-          { status: 400 }
-        );
-      }
-
-      const user = await verifyUserAndCredits(userId);
-      if (!user) {
-        return NextResponse.json(
-          { error: "Unauthorized or no credits" },
-          { status: 401 }
-        );
-      }
-
-      const session = memorySessions.get(sessionId);
-      if (!session) {
-        return NextResponse.json({ error: "Session not found" }, { status: 404 });
-      }
-
-      if (session.userId !== userId) {
-        return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-      }
-
-      const history = Array.isArray(session.history) ? [...session.history] : [];
-
-      history.push({
-        role: "candidate",
-        text: userMessage,
-        createdAt: new Date().toISOString(),
-      });
-
-      const nextStep =
-        typeof step === "number" && Number.isFinite(step)
-          ? step
-          : (session.currentStep || 1) + 1;
-
-      const prompt = buildPrompt({
-        cvSummary: session.cvSummary,
-        jobDesc: session.jobDesc,
-        mode: session.mode,
-        level: (session.level || "junior") as InterviewLevel,
-        channel: (channel || session.channel || "written") as InterviewChannel,
-        history,
-        step: nextStep,
-      });
-
-      const llmResponseText = await callLLM(prompt);
-
-      let parsed: any;
-      try {
-        parsed = JSON.parse(llmResponseText);
-      } catch {
-        parsed = {
-          next_question: "Merci. Peux-tu illustrer avec un exemple concret ?",
-          short_analysis: "",
-          final_summary: null,
-          final_score: null,
-        };
-      }
-
-      const nextQuestion =
-        parsed.next_question || "Merci, l’entretien est terminé.";
-      const shortAnalysis = parsed.short_analysis ?? "";
-      const isFinal = Boolean(parsed.final_summary);
-
-      history.push({
-        role: "interviewer",
-        text: nextQuestion,
-        createdAt: new Date().toISOString(),
-      });
-
-      const updated: InterviewSession = {
-        ...session,
-        history,
-        lastUpdated: new Date().toISOString(),
-        currentStep: nextStep,
-      };
-
-      if (isFinal) {
-        updated.status = "completed";
-        updated.score = parsed.final_score ?? null;
-        updated.finalSummary = parsed.final_summary ?? null;
-      }
-
-      memorySessions.set(sessionId, updated);
-
-      await consumeCredit(userId);
-
-      return NextResponse.json({
-        nextQuestion,
-        shortAnalysis,
-        finalSummary: parsed.final_summary ?? null,
-        finalScore: parsed.final_score ?? null,
-        isFinal,
-      });
-    }
-
-    return NextResponse.json({ error: "Unknown action" }, { status: 400 });
-  } catch (err) {
-    console.error("Interview API error:", err);
-    return NextResponse.json({ error: "Internal error" }, { status: 500 });
+    const decoded = await getAuth().verifyIdToken(token);
+    return {
+      ok: true as const,
+      uid: decoded.uid,
+      email: decoded.email || "",
+    };
+  } catch (e) {
+    console.error("verifyIdToken error:", e);
+    return {
+      ok: false as const,
+      status: 401,
+      error: "Invalid or expired token",
+    };
   }
 }
 
-// ---- APPEL GEMINI ---- //
-async function callLLM(prompt: string): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY;
+/**
+ * Construction d’un contexte texte à partir du profil CV
+ * (inspiré de ce que tu fais ailleurs)
+ */
+function buildProfileContext(profile: any): string {
+  if (!profile) return "";
 
-  if (!apiKey) {
-    return JSON.stringify({
-      next_question:
-        "Mode démo : peux-tu me résumer ton expérience la plus récente en lien avec ce poste ?",
-      short_analysis:
-        "Mode démo sans Gemini : configure GEMINI_API_KEY pour avoir l’analyse réelle.",
-      final_summary: null,
-      final_score: null,
-    });
-  }
+  const p = profile || {};
 
-  const modelRaw = process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
-  const model = modelRaw.startsWith("models/") ? modelRaw : `models/${modelRaw}`;
-  const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
+  const experiences = Array.isArray(p.experiences) ? p.experiences : [];
+  const education = Array.isArray(p.education) ? p.education : [];
+  const skillsSections =
+    p.skills && Array.isArray(p.skills.sections) ? p.skills.sections : [];
+  const tools = p.skills && Array.isArray(p.skills.tools) ? p.skills.tools : [];
 
-  const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
+  const xpLines = experiences
+    .slice(0, 5)
+    .map((xp: any, i: number) => {
+      const bullets = Array.isArray(xp.bullets)
+        ? xp.bullets.slice(0, 4).map((b: string) => `- ${b}`).join("\n")
+        : "";
+      return `XP${i + 1} : ${xp.role || xp.title || ""} @ ${xp.company || ""} (${xp.dates || ""})
+${bullets}`;
+    })
+    .join("\n\n");
 
-  const resp = await fetch(url, {
+  const skillLines = skillsSections
+    .slice(0, 4)
+    .map((s: any) => `${s.title || ""}: ${(Array.isArray(s.items) ? s.items.slice(0, 10) : []).join(", ")}`)
+    .join("\n");
+
+  const toolsLine = tools.slice(0, 20).join(", ");
+
+  const eduLines = education
+    .slice(0, 4)
+    .map(
+      (e: any) =>
+        `${e.degree || e.title || ""} - ${e.school || e.institution || ""} (${e.dates || ""})`
+    )
+    .join("\n");
+
+  return `
+NOM: ${p.fullName || p.name || ""}
+EMAIL: ${p.email || ""}
+TITRE: ${p.contractTypeFull || p.contractType || ""}
+
+RÉSUMÉ:
+${p.profileSummary || ""}
+
+EXPÉRIENCES:
+${xpLines}
+
+COMPÉTENCES:
+${skillLines}
+
+OUTILS:
+${toolsLine}
+
+FORMATION:
+${eduLines}
+
+CERTIFICATIONS:
+${p.certs || ""}
+
+LANGUES:
+${p.langLine || ""}
+
+SOFT SKILLS:
+${Array.isArray(p.softSkills) ? p.softSkills.join(", ") : ""}
+`.trim();
+}
+
+/**
+ * Appel à l’API Gemini (comme dans ton autre route)
+ */
+async function callGeminiText(
+  prompt: string,
+  apiKey: string,
+  temperature = 0.7,
+  maxOutputTokens = 1400
+) {
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature, maxOutputTokens },
+  };
+
+  const resp = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
+    body: JSON.stringify(body),
   });
 
   if (!resp.ok) {
-    const errorText = await resp.text().catch(() => "");
-    console.error("Gemini error (interview):", resp.status, errorText);
-    return JSON.stringify({
-      next_question:
-        "Je n'arrive pas à joindre l’IA. Donne-moi : contexte / actions / résultats (STAR).",
-      short_analysis: `Fallback Gemini HTTP ${resp.status}`,
-      final_summary: null,
-      final_score: null,
-    });
+    const text = await resp.text();
+    console.error("Gemini error:", text);
+    throw new Error("Erreur Gemini: " + text);
   }
 
-  const data = await resp.json().catch(() => null);
+  const data = await resp.json();
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const text = parts
+    .map((p: any) => (typeof p.text === "string" ? p.text : ""))
+    .join("\n")
+    .trim();
 
-  const textRaw: string =
-    data?.candidates?.[0]?.content?.parts
-      ?.map((p: any) => p.text || "")
-      .join("")
-      .trim() || "";
+  if (!text) throw new Error("Réponse Gemini vide");
+  return text;
+}
 
-  if (!textRaw) {
-    return JSON.stringify({
-      next_question: "Peux-tu préciser ?",
-      short_analysis: "",
-      final_summary: null,
-      final_score: null,
-    });
+/**
+ * Route POST /api/generateLetterAndPitch
+ */
+export async function POST(req: NextRequest) {
+  // 1) Auth Firebase (token envoyé par le front)
+  const auth = await requireUser(req);
+  if (!auth.ok) {
+    return NextResponse.json(
+      { ok: false, error: auth.error },
+      { status: auth.status }
+    );
   }
 
-  return textRaw.trim();
+  // 2) Lecture du body
+  let body: any;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json(
+      { ok: false, error: "Invalid JSON body" },
+      { status: 400 }
+    );
+  }
+
+  const {
+    profile,
+    jobTitle = "",
+    companyName = "",
+    jobDescription = "",
+    lang = "fr",
+    // recaptchaToken, // tu peux le vérifier ici si tu veux
+  } = body || {};
+
+  if (!profile) {
+    return NextResponse.json(
+      { ok: false, error: "Missing profile" },
+      { status: 400 }
+    );
+  }
+
+  const langNorm = String(lang).toLowerCase().startsWith("en") ? "en" : "fr";
+
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+  if (!GEMINI_API_KEY) {
+    return NextResponse.json(
+      { ok: false, error: "Missing GEMINI_API_KEY server-side" },
+      { status: 500 }
+    );
+  }
+
+  // 3) Contexte pour l’IA
+  const profileContext = buildProfileContext(profile);
+
+  // 4) Prompt combiné Lettre + Pitch (JSON strict)
+  const prompt =
+    langNorm === "en"
+      ? `
+You are a senior career coach and tech recruiter.
+
+Write TWO things for a job application, using ONLY the information below.
+
+JOB:
+- Title: "${jobTitle || "the role"}"
+- Company: "${companyName || "the company"}"
+- Job description (may include extra instructions from the user):
+${jobDescription || "—"}
+
+CANDIDATE PROFILE (source of truth, do not invent):
+${profileContext}
+
+TASKS:
+1) A strong, concrete COVER LETTER BODY (no header, no address, no signature).
+   - 3 to 5 paragraphs.
+   - 220 to 320 words.
+   - Explicitly use 2–3 experiences, skills, and tools from the profile.
+   - Tone: professional, specific, no fluff.
+   - Adapt to the job and company.
+
+2) A short ELEVATOR PITCH:
+   - 2 to 4 sentences.
+   - Can be used orally or in emails / LinkedIn.
+   - Direct, impactful, summarising value for this role.
+
+STRICT OUTPUT FORMAT:
+Return ONLY valid JSON:
+{
+  "coverLetter": "...",
+  "pitch": "..."
+}
+`.trim()
+      : `
+Tu es un coach carrières senior et un recruteur IT.
+
+Rédige DEUX éléments pour une candidature, en utilisant UNIQUEMENT les infos ci-dessous.
+
+POSTE :
+- Intitulé : "${jobTitle || "le poste"}"
+- Entreprise : "${companyName || "l'entreprise"}"
+- Description de l'offre (peut inclure des instructions utilisateur) :
+${jobDescription || "—"}
+
+PROFIL CANDIDAT (source de vérité, ne rien inventer) :
+${profileContext}
+
+TÂCHES :
+1) CORPS de LETTRE DE MOTIVATION :
+   - 3 à 5 paragraphes.
+   - 220 à 320 mots.
+   - Pas d’en-tête, pas d’adresse, pas de signature.
+   - Utilise explicitement 2–3 expériences, compétences et outils cités.
+   - Ton professionnel, concret, adapté au poste et à l’entreprise.
+
+2) PITCH D’ASCENSEUR :
+   - 2 à 4 phrases.
+   - Utilisable à l’oral / mail / LinkedIn.
+   - Direct, percutant, orienté valeur.
+
+FORMAT DE SORTIE STRICT :
+Rends UNIQUEMENT du JSON valide :
+{
+  "coverLetter": "...",
+  "pitch": "..."
+}
+`.trim();
+
+  try {
+    const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.7, 1600);
+
+    // On nettoie les éventuels ```json ``` etc.
+    const cleaned = String(raw).replace(/```json|```/gi, "").trim();
+
+    let coverLetter = "";
+    let pitch = "";
+
+    try {
+      const parsed = JSON.parse(cleaned);
+      coverLetter =
+        typeof parsed.coverLetter === "string" ? parsed.coverLetter.trim() : "";
+      pitch = typeof parsed.pitch === "string" ? parsed.pitch.trim() : "";
+    } catch (e) {
+      console.warn("JSON parse error on Gemini response, returning raw text:", e);
+      // Fallback : tout dans coverLetter
+      coverLetter = cleaned;
+      pitch = "";
+    }
+
+    if (!coverLetter) {
+      coverLetter = "Lettre non générée correctement par l'IA.";
+    }
+
+    return NextResponse.json(
+      {
+        ok: true,
+        coverLetter,
+        pitch,
+      },
+      { status: 200 }
+    );
+  } catch (e: any) {
+    console.error("generateLetterAndPitch server error:", e);
+    return NextResponse.json(
+      {
+        ok: false,
+        error: e?.message || "GENERATION_ERROR",
+      },
+      { status: 500 }
+    );
+  }
 }
 ````
 
@@ -6021,416 +5769,6 @@ export default function ApplyPage() {
 }
 ````
 
-## File: app/app/credits/page.tsx
-````typescript
-"use client";
-
-import { useEffect, useRef, useState } from "react";
-import { useUserCredits } from "@/hooks/useUserCredits";
-import { useAuth } from "@/context/AuthContext";
-import { getRecaptchaToken } from "@/lib/recaptcha";
-
-type PackKey = "20" | "50" | "100";
-
-const CREDIT_PACKS: {
-  key: PackKey;
-  label: string;
-  credits: number;
-  desc: string;
-}[] = [
-  {
-    key: "20",
-    credits: 20,
-    label: "Pack Découverte",
-    desc: "Idéal pour tester les fonctionnalités IA.",
-  },
-  {
-    key: "50",
-    credits: 50,
-    label: "Pack Boost",
-    desc: "Parfait pour une phase active de recherche.",
-  },
-  {
-    key: "100",
-    credits: 100,
-    label: "Pack Intensif",
-    desc: "Pour candidatures + entretiens à fond.",
-  },
-];
-
-// ⚙️ Base de l'API :
-// - en prod : Cloud Functions
-// - en dev : tu peux override avec NEXT_PUBLIC_API_BASE_URL dans .env.local
-const DEFAULT_API_BASE =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
-
-const API_BASE =
-  (process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE).replace(/\/+$/, "");
-
-export default function CreditsPage() {
-  const { user } = useAuth();
-  const { credits, loading, error } = useUserCredits();
-
-  const [buyLoading, setBuyLoading] = useState<PackKey | null>(null);
-  const [buyError, setBuyError] = useState<string | null>(null);
-
-  // 👉 URL d’embed du checkout Polar (quand non null, on affiche la popup)
-  const [embedUrl, setEmbedUrl] = useState<string | null>(null);
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
-
-  // 🎉 Animation / bandeau succès dans la page
-  const [showSuccessAnimation, setShowSuccessAnimation] = useState(false);
-
-  // Pour info, si un jour tu veux savoir quel pack a été démarré
-  const [lastPack, setLastPack] = useState<PackKey | null>(null);
-
-  // Message global en haut de page (success / cancel)
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
-
-  // ✅ IMPORTANT (Option B) :
-  // on mémorise le solde AVANT l’achat, puis on ferme automatiquement la popup
-  // dès que credits > soldeAvant (webhook OK -> Firestore se met à jour)
-  const [creditsBeforePurchase, setCreditsBeforePurchase] = useState<number | null>(
-    null
-  );
-
-  const triggerSuccessClose = (message?: string) => {
-    setEmbedUrl(null);
-    setBuyLoading(null);
-    setLastPack(null);
-    setCreditsBeforePurchase(null);
-
-    setShowSuccessAnimation(true);
-    window.setTimeout(() => setShowSuccessAnimation(false), 4000);
-
-    setStatusMessage(
-      message ||
-        "✅ Paiement confirmé ! Tes crédits ont été ajoutés à ton compte."
-    );
-  };
-
-  const handleBuy = async (pack: PackKey) => {
-    try {
-      setBuyError(null);
-      setStatusMessage(null);
-
-      if (!user?.uid || !user.email) {
-        setBuyError("Tu dois être connecté pour recharger tes crédits.");
-        return;
-      }
-
-      setBuyLoading(pack);
-      setLastPack(pack);
-
-      // On capture le solde actuel pour détecter l’augmentation après webhook
-      if (typeof credits === "number") {
-        setCreditsBeforePurchase(credits);
-      } else {
-        setCreditsBeforePurchase(0);
-      }
-
-      // 👉 Appel à ta Cloud Function HTTPS : /polarCheckout
-      const endpoint = `${API_BASE}/polarCheckout`;
-
-      // ✅ reCAPTCHA token
-      let recaptchaToken = "";
-      try {
-        recaptchaToken = await getRecaptchaToken("polar_checkout");
-      } catch {
-        setBuyError(
-          "Sécurité: impossible de valider reCAPTCHA (script bloqué ?). Désactive l'adblock et réessaie."
-        );
-        setBuyLoading(null);
-        setCreditsBeforePurchase(null);
-        return;
-      }
-
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          packId: pack, // "20" | "50" | "100"
-          userId: user.uid, // pour externalCustomerId
-          email: user.email, // pour customerEmail
-          recaptchaToken, // ✅ ajouté
-        }),
-      });
-
-      const contentType = res.headers.get("content-type") || "";
-      let data: any = null;
-
-      if (contentType.includes("application/json")) {
-        data = await res.json();
-      } else {
-        const text = await res.text();
-        console.error(
-          "[Credits] Réponse non JSON de /polarCheckout :",
-          text.slice(0, 300)
-        );
-        throw new Error(
-          "Le serveur de paiement a renvoyé une réponse invalide (HTML). Vérifie la fonction polarCheckout."
-        );
-      }
-
-      if (!res.ok || !data?.url) {
-        console.error("Erreur API /polarCheckout :", data);
-        throw new Error(data?.error || "Impossible de créer le paiement Polar.");
-      }
-
-      // 👉 On ajoute les params d’embed : embed=true & embed_origin=...
-      const origin = window.location.origin;
-      const urlBase = data.url as string;
-      const sep = urlBase.includes("?") ? "&" : "?";
-      const fullEmbedUrl = `${urlBase}${sep}embed=true&embed_origin=${encodeURIComponent(
-        origin
-      )}`;
-
-      setEmbedUrl(fullEmbedUrl); // ouvre la popup
-    } catch (e: any) {
-      console.error("Erreur checkout Polar (iframe) :", e);
-      setBuyError(
-        e?.message ||
-          "Erreur lors de la création du paiement. Essaie à nouveau dans quelques instants."
-      );
-      setBuyLoading(null);
-      setCreditsBeforePurchase(null);
-    }
-  };
-
-  // 🔐 (Option A / bonus) : si un jour Polar redirige l’iframe vers ton domaine,
-  // on peut fermer via status=success. Mais actuellement l’iframe reste chez Polar,
-  // donc ça ne marche pas (cross-origin).
-  const handleIframeLoad = () => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-
-    try {
-      const win = iframe.contentWindow;
-      if (!win) return;
-
-      const href = win.location.href; // accessible seulement si même origine
-
-      if (href.includes("/app/credits") && href.includes("status=success")) {
-        triggerSuccessClose(
-          "✅ Paiement confirmé ! Tes crédits vont se mettre à jour dans quelques instants."
-        );
-      }
-
-      if (href.includes("/app/credits") && href.includes("status=cancel")) {
-        setEmbedUrl(null);
-        setBuyLoading(null);
-        setLastPack(null);
-        setCreditsBeforePurchase(null);
-        setStatusMessage("Paiement annulé.");
-      }
-    } catch {
-      // cross-origin -> normal
-    }
-  };
-
-  // ✅ LA FERMETURE AUTO (Option B) :
-  // Dès que les crédits augmentent après l’achat, on ferme la popup.
-  useEffect(() => {
-    if (!embedUrl) return;
-    if (creditsBeforePurchase === null) return;
-    if (loading) return;
-    if (typeof credits !== "number") return;
-
-    if (credits > creditsBeforePurchase) {
-      triggerSuccessClose("✅ Paiement confirmé ! Tes crédits ont été ajoutés.");
-    }
-  }, [credits, loading, embedUrl, creditsBeforePurchase]);
-
-  const closeModal = () => {
-    setEmbedUrl(null);
-    setBuyLoading(null);
-    setLastPack(null);
-    setCreditsBeforePurchase(null);
-  };
-
-  // Si on arrive sur /app/credits?status=success dans la page normale (sans iframe)
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const url = new URL(window.location.href);
-    const status = url.searchParams.get("status");
-
-    if (status === "success") {
-      setStatusMessage("✅ Paiement confirmé ! Tes crédits ont été pris en compte.");
-      setShowSuccessAnimation(true);
-      setTimeout(() => setShowSuccessAnimation(false), 4000);
-    } else if (status === "cancel") {
-      setStatusMessage("Paiement annulé.");
-    }
-  }, []);
-
-  return (
-    <div className="space-y-6">
-      {/* Animation succès flottante */}
-      {showSuccessAnimation && (
-        <div className="fixed top-4 left-1/2 z-40 -translate-x-1/2">
-          <div className="rounded-full border border-emerald-400/70 bg-emerald-500/10 px-4 py-2 shadow-lg backdrop-blur flex items-center gap-2 animate-[fadeInOut_4s_ease-in-out]">
-            <span className="text-lg">⚡</span>
-            <span className="text-[13px] text-emerald-200">
-              Crédits ajoutés à ton compte !
-            </span>
-          </div>
-        </div>
-      )}
-
-      {/* Titre + résumé */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-        <div>
-          <h1 className="text-lg sm:text-xl font-semibold text-[var(--ink)]">
-            Crédits IA
-          </h1>
-          <p className="text-[12px] text-[var(--muted)]">
-            Utilise tes crédits pour analyser ton CV, générer des lettres de motivation,
-            des pitchs, et préparer tes entretiens.
-          </p>
-        </div>
-
-        {/* Petit récap du solde */}
-        <div className="inline-flex flex-col items-end gap-1">
-          <span className="text-[11px] text-[var(--muted)]">Solde actuel</span>
-          <div className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px] bg-[var(--bg-soft)] border border-[var(--border)]/80">
-            <span className="text-[15px]">⚡</span>
-            {loading ? (
-              <span className="text-[var(--muted)]">Chargement…</span>
-            ) : (
-              <span className="font-semibold text-[var(--ink)]">{credits} crédits</span>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {statusMessage && <p className="text-[12px] text-emerald-400">{statusMessage}</p>}
-      {error && <p className="text-[12px] text-red-400">{error}</p>}
-
-      {/* Packs de rechargement */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-          <div>
-            <h2 className="text-base font-semibold text-[var(--ink)]">
-              Recharger mes crédits
-            </h2>
-            <p className="text-[12px] text-[var(--muted)]">
-              Choisis un pack ci-dessous pour ajouter des crédits à ton compte.
-              Paiement sécurisé via Polar.
-            </p>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => {
-              const el = document.getElementById("credit-packs");
-              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-            }}
-            className="btn-primary text-[12px] px-3 py-1.5"
-          >
-            Ajouter du crédit
-          </button>
-        </div>
-
-        <div
-          id="credit-packs"
-          className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4 mt-2"
-        >
-          {CREDIT_PACKS.map((pack) => (
-            <div
-              key={pack.key}
-              className="card-soft border border-[var(--border)]/80 rounded-2xl p-3 sm:p-4 flex flex-col justify-between"
-            >
-              <div className="space-y-1">
-                <div className="flex items-center justify-between gap-2">
-                  <h3 className="text-[13px] font-semibold text-[var(--ink)]">
-                    {pack.label}
-                  </h3>
-                  <span className="inline-flex items-center rounded-full px-2 py-[2px] text-[11px] bg-[var(--bg)] border border-[var(--border)]/80">
-                    ⚡ {pack.credits} crédits
-                  </span>
-                </div>
-                <p className="text-[12px] text-[var(--muted)]">{pack.desc}</p>
-              </div>
-
-              <div className="mt-3 flex flex-col gap-1">
-                <button
-                  type="button"
-                  onClick={() => handleBuy(pack.key)}
-                  disabled={buyLoading === pack.key}
-                  className="btn-primary w-full text-[12px] flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
-                >
-                  {buyLoading === pack.key ? (
-                    <>
-                      <span className="loader" />
-                      <span>Ouverture du paiement…</span>
-                    </>
-                  ) : (
-                    <>
-                      <span>Recharger</span>
-                      <span className="text-[13px]">→</span>
-                    </>
-                  )}
-                </button>
-                <span className="text-[10px] text-[var(--muted)] text-center">
-                  Paiement unique, pas d’abonnement.
-                </span>
-              </div>
-            </div>
-          ))}
-        </div>
-
-        {buyError && <p className="text-[12px] text-red-400">{buyError}</p>}
-      </section>
-
-      {/* Explication d’usage */}
-      <section className="text-[11px] text-[var(--muted)] space-y-1">
-        <p>
-          1 crédit ≈ 1 action IA (analyse CV, génération de lettre, pitch, Q&A entretien…).
-        </p>
-        <p>
-          Ton solde est mis à jour automatiquement après chaque achat dès que le paiement est confirmé
-          (via le webhook Polar).
-        </p>
-      </section>
-
-      {/* 🔥 POPUP CHECKOUT POLAR EN IFRAME */}
-      {embedUrl && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div className="relative w-full max-w-lg h-[520px] sm:h-[580px] bg-[var(--bg)] border border-[var(--border)]/80 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
-            <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)]/70 bg-[var(--bg-soft)]/80">
-              <div className="flex flex-col">
-                <span className="text-[12px] font-semibold text-[var(--ink)]">
-                  Paiement sécurisé
-                </span>
-                <span className="text-[11px] text-[var(--muted)]">
-                  Transaction gérée par Polar (Stripe)
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={closeModal}
-                className="text-[11px] rounded-full border border-[var(--border)] px-2 py-1 hover:bg-[var(--bg)]"
-              >
-                ✕
-              </button>
-            </div>
-
-            <iframe
-              ref={iframeRef}
-              src={embedUrl}
-              onLoad={handleIframeLoad}
-              className="flex-1 w-full border-0"
-              title="Paiement Polar"
-              allow="payment *; publickey-credentials-get *"
-            />
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-````
-
 ## File: app/app/cv/page.tsx
 ````typescript
 "use client";
@@ -6939,1533 +6277,6 @@ export default function InterviewPage() {
       {/* ⚠️ InterviewChat contient déjà tout le layout (header, glass, etc.) */}
       <InterviewChat />
     </div>
-  );
-}
-````
-
-## File: app/app/lm/page.tsx
-````typescript
-// app/app/lm/page.tsx
-"use client";
-
-import { logUsage } from "@/lib/logUsage";
-import { useEffect, useMemo, useState, FormEvent } from "react";
-import { motion } from "framer-motion";
-import { auth, db } from "@/lib/firebase";
-import { onAuthStateChanged } from "firebase/auth";
-import { doc, getDoc, collection, addDoc, serverTimestamp } from "firebase/firestore";
-
-// ✅ PDF (génération locale, rendu identique à tes HTML pdfmake)
-import { makePdfColors } from "@/lib/pdf/colors";
-import { fitOnePage } from "@/lib/pdf/fitOnePage";
-import { mergePdfBlobs } from "@/lib/pdf/mergePdfs";
-import { downloadBlob } from "@/lib/pdf/pdfmakeClient";
-import { buildCvAtsPdf, type CvDocModel } from "@/lib/pdf/templates/cvAts";
-import { buildLmStyledPdf, type LmModel } from "@/lib/pdf/templates/letter";
-
-// --- TYPES ---
-
-type CvSkillsSection = { title: string; items: string[] };
-type CvSkills = { sections: CvSkillsSection[]; tools: string[] };
-
-type CvExperience = {
-  company: string;
-  role: string;
-  dates: string;
-  bullets: string[];
-  location?: string;
-};
-
-type CvEducation = {
-  school: string;
-  degree: string;
-  dates: string;
-  location?: string;
-};
-
-type CvProfile = {
-  fullName: string;
-  email: string;
-  phone: string;
-  linkedin: string;
-  profileSummary: string;
-
-  city?: string;
-  address?: string;
-
-  contractType: string;
-  contractTypeStandard?: string;
-  contractTypeFull?: string;
-
-  primaryDomain?: string;
-  secondaryDomains?: string[];
-  softSkills?: string[];
-
-  drivingLicense?: string;
-  vehicle?: string;
-
-  skills: CvSkills;
-  experiences: CvExperience[];
-  education: CvEducation[];
-  educationShort: string[];
-  certs: string;
-  langLine: string;
-  hobbies: string[];
-  updatedAt?: number;
-};
-
-type Lang = "fr" | "en";
-
-// 🔗 ENDPOINT (texte IA LM + pitch uniquement)
-const LETTER_AND_PITCH_URL =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
-
-// =============================
-// ✅ reCAPTCHA Enterprise (client)
-// =============================
-
-const RECAPTCHA_SITE_KEY = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY || "";
-let recaptchaLoadPromise: Promise<void> | null = null;
-
-function loadRecaptchaEnterprise(siteKey: string): Promise<void> {
-  if (typeof window === "undefined") {
-    return Promise.reject(new Error("reCAPTCHA: window indisponible (SSR)."));
-  }
-  if ((window as any).grecaptcha?.enterprise) return Promise.resolve();
-  if (recaptchaLoadPromise) return recaptchaLoadPromise;
-
-  recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
-    const existing = document.querySelector(
-      'script[data-recaptcha-enterprise="true"]'
-    ) as HTMLScriptElement | null;
-
-    if (existing) {
-      const t = window.setInterval(() => {
-        if ((window as any).grecaptcha?.enterprise) {
-          window.clearInterval(t);
-          resolve();
-        }
-      }, 50);
-
-      window.setTimeout(() => {
-        window.clearInterval(t);
-        if (!(window as any).grecaptcha?.enterprise) {
-          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
-        }
-      }, 6000);
-      return;
-    }
-
-    const s = document.createElement("script");
-    s.src = `https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(
-      siteKey
-    )}`;
-    s.async = true;
-    s.defer = true;
-    s.setAttribute("data-recaptcha-enterprise", "true");
-
-    s.onload = () => {
-      const t = window.setInterval(() => {
-        if ((window as any).grecaptcha?.enterprise) {
-          window.clearInterval(t);
-          resolve();
-        }
-      }, 50);
-
-      window.setTimeout(() => {
-        window.clearInterval(t);
-        if (!(window as any).grecaptcha?.enterprise) {
-          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
-        }
-      }, 6000);
-    };
-
-    s.onerror = () =>
-      reject(new Error("Impossible de charger reCAPTCHA Enterprise."));
-    document.head.appendChild(s);
-  });
-
-  return recaptchaLoadPromise;
-}
-
-async function getRecaptchaToken(action: string): Promise<string> {
-  if (!RECAPTCHA_SITE_KEY) {
-    throw new Error("reCAPTCHA: NEXT_PUBLIC_RECAPTCHA_SITE_KEY manquante.");
-  }
-
-  await loadRecaptchaEnterprise(RECAPTCHA_SITE_KEY);
-
-  const g = (window as any).grecaptcha;
-  if (!g?.enterprise?.ready || !g?.enterprise?.execute) {
-    throw new Error(
-      "reCAPTCHA Enterprise indisponible (grecaptcha.enterprise manquant)."
-    );
-  }
-
-  await new Promise<void>((resolve) => g.enterprise.ready(() => resolve()));
-  const token = await g.enterprise.execute(RECAPTCHA_SITE_KEY, { action });
-
-  if (!token || typeof token !== "string") {
-    throw new Error("reCAPTCHA: token vide.");
-  }
-  return token;
-}
-
-// =============================
-// ✅ Helpers (texte & PDF locaux)
-// =============================
-
-function safeText(v: any) {
-  return String(v ?? "").trim();
-}
-
-function buildContactLine(p: CvProfile) {
-  const parts: string[] = [];
-  if (p.city) parts.push(safeText(p.city));
-  if (p.phone) parts.push(safeText(p.phone));
-  if (p.email) parts.push(safeText(p.email));
-  if (p.linkedin) parts.push(safeText(p.linkedin));
-  return parts.filter(Boolean).join(" | ");
-}
-
-function categorizeSkills(profile: CvProfile) {
-  const cloud: string[] = [];
-  const sec: string[] = [];
-  const sys: string[] = [];
-  const auto: string[] = [];
-  const tools: string[] = [];
-  const soft: string[] = Array.isArray(profile.softSkills) ? profile.softSkills : [];
-
-  const sections = profile.skills?.sections || [];
-  for (const s of sections) {
-    const title = (s?.title || "").toLowerCase();
-    const items = (s?.items || []).filter(Boolean);
-
-    const pushAll = (arr: string[], vals: string[]) => vals.forEach((x) => arr.push(x));
-
-    if (title.includes("cloud") || title.includes("azure") || title.includes("aws") || title.includes("gcp")) {
-      pushAll(cloud, items);
-    } else if (title.includes("sécu") || title.includes("secu") || title.includes("security") || title.includes("cyber")) {
-      pushAll(sec, items);
-    } else if (
-      title.includes("réseau") ||
-      title.includes("reseau") ||
-      title.includes("system") ||
-      title.includes("système") ||
-      title.includes("sys")
-    ) {
-      pushAll(sys, items);
-    } else if (title.includes("autom") || title.includes("devops") || title.includes("ia") || title.includes("api")) {
-      pushAll(auto, items);
-    } else {
-      pushAll(tools, items);
-    }
-  }
-
-  const extraTools = Array.isArray(profile.skills?.tools) ? profile.skills.tools : [];
-  extraTools.forEach((t) => tools.push(t));
-
-  const uniq = (arr: string[]) => Array.from(new Set(arr.map((x) => safeText(x)).filter(Boolean)));
-
-  return {
-    cloud: uniq(cloud),
-    sec: uniq(sec),
-    sys: uniq(sys),
-    auto: uniq(auto),
-    tools: uniq(tools),
-    soft: uniq(soft),
-  };
-}
-
-function profileToCvDocModel(profile: CvProfile, params: { targetJob: string; contract: string }): CvDocModel {
-  const titleParts: string[] = [];
-  if (params.targetJob?.trim()) titleParts.push(params.targetJob.trim());
-  if (params.contract?.trim()) titleParts.push(params.contract.trim());
-  const title = titleParts.length ? titleParts.join(" — ") : (profile.contractType || "Candidature");
-
-  const skills = categorizeSkills(profile);
-
-  const xp = (profile.experiences || []).map((x) => ({
-    company: safeText(x.company),
-    city: safeText(x.location || ""),
-    role: safeText(x.role),
-    dates: safeText(x.dates),
-    bullets: Array.isArray(x.bullets) ? x.bullets.map(safeText).filter(Boolean) : [],
-  }));
-
-  const educationLines =
-    Array.isArray(profile.educationShort) && profile.educationShort.length
-      ? profile.educationShort.map(safeText).filter(Boolean)
-      : (profile.education || []).map((e) => {
-          const a = safeText(e.degree);
-          const b = safeText(e.school);
-          const c = safeText(e.dates);
-          const d = safeText(e.location || "");
-          return [a, b, c, d].filter(Boolean).join(" — ");
-        });
-
-  return {
-    name: safeText(profile.fullName) || safeText(profile.email) || "Candidat",
-    title,
-    contactLine: buildContactLine(profile),
-    profile: safeText(profile.profileSummary),
-    skills,
-    xp,
-    education: educationLines,
-    certs: safeText(profile.certs),
-    langLine: safeText(profile.langLine),
-    hobbies: Array.isArray(profile.hobbies) ? profile.hobbies.map(safeText).filter(Boolean) : [],
-  };
-}
-
-// --- Pour que l’IA écrive une VRAIE lettre (expériences, résultats, outils) ---
-function buildCandidateHighlights(profile: CvProfile) {
-  const topXp = (profile.experiences || []).slice(0, 3).map((xp, i) => {
-    const bullets = (xp.bullets || []).slice(0, 4).map((b) => `- ${b}`).join("\n");
-    return `EXP${i + 1}: ${xp.role} @ ${xp.company} (${xp.dates}${xp.location ? `, ${xp.location}` : ""})
-${bullets}`;
-  });
-
-  const skillLines = (profile.skills?.sections || [])
-    .slice(0, 4)
-    .map((s) => `${s.title}: ${(s.items || []).slice(0, 10).join(", ")}`);
-
-  const tools = (profile.skills?.tools || []).slice(0, 18);
-
-  return `
-CANDIDATE_NAME: ${profile.fullName}
-SUMMARY: ${profile.profileSummary}
-
-TOP_EXPERIENCES:
-${topXp.join("\n\n")}
-
-KEY_SKILLS:
-${skillLines.join("\n")}
-
-TOOLS:
-${tools.join(", ")}
-
-CERTS: ${profile.certs}
-LANGS: ${profile.langLine}
-`.trim();
-}
-
-function buildJobDescWithInstructions(args: {
-  jobDescription: string;
-  lang: Lang;
-  jobTitle: string;
-  companyName: string;
-  jobLink: string;
-  profile: CvProfile;
-}) {
-  const base = (args.jobDescription || "").trim();
-
-  const instrFR = `
----
-INSTRUCTIONS IMPORTANTES (à respecter):
-- Rédige une lettre de motivation PERSONNALISÉE et crédible.
-- Utilise explicitement 2 à 3 expériences ci-dessous (réalisations / responsabilités).
-- Mets en avant compétences + outils pertinents pour le poste.
-- Adapte le discours à l'entreprise "${args.companyName}" et au poste "${args.jobTitle}".
-- Ton: professionnel, concret, pas de blabla.
-- Longueur: 220 à 320 mots (≈ 1 page A4).
-- Structure: 3 à 4 paragraphes.
-- Termine par une phrase d’appel à entretien.
-- IMPORTANT: Retourne UNIQUEMENT le CORPS de la lettre (pas d’en-tête, pas d’adresse, pas de signature).
-
-OFFRE_URL: ${args.jobLink || "(non fournie)"}
-
-PROFIL (à utiliser):
-${buildCandidateHighlights(args.profile)}
-`.trim();
-
-  const instrEN = `
----
-IMPORTANT INSTRUCTIONS:
-- Write a REAL, tailored cover letter (credible, specific).
-- Explicitly use 2–3 experiences below (achievements/responsibilities).
-- Highlight relevant skills + tools for the role.
-- Adapt to company "${args.companyName}" and role "${args.jobTitle}".
-- Tone: professional, concrete, no fluff.
-- Length: 220–320 words (~1 A4 page).
-- Structure: 3–4 paragraphs.
-- End with a clear interview call-to-action.
-- IMPORTANT: Return ONLY the BODY (no header, no address, no signature).
-
-JOB_URL: ${args.jobLink || "(not provided)"}
-
-PROFILE (use it):
-${buildCandidateHighlights(args.profile)}
-`.trim();
-
-  const injected = args.lang === "fr" ? instrFR : instrEN;
-  if (!base) return injected;
-  return `${base}\n\n${injected}`;
-}
-
-function extractBodyFromLetterText(letterText: string, lang: Lang, fullName: string) {
-  const raw = safeText(letterText);
-  if (!raw) return "";
-
-  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  if (!lines.length) return raw;
-
-  const first = lines[0].toLowerCase();
-  const isGreeting =
-    (lang === "fr" && (first.startsWith("madame") || first.startsWith("bonjour"))) ||
-    (lang === "en" && (first.startsWith("dear") || first.startsWith("hello")));
-
-  if (isGreeting) lines.shift();
-
-  while (lines.length) {
-    const last = lines[lines.length - 1].toLowerCase();
-    if (
-      last.includes("cordialement") ||
-      last.includes("bien cordialement") ||
-      last.includes("salutations") ||
-      last.includes("sincerely") ||
-      last.includes("best regards") ||
-      last.includes("kind regards")
-    ) {
-      lines.pop();
-      continue;
-    }
-    if (fullName && last.includes(fullName.toLowerCase())) {
-      lines.pop();
-      continue;
-    }
-    break;
-  }
-
-  const body = lines.join("\n\n").trim();
-  return body || raw;
-}
-
-function buildLmModel(profile: CvProfile, lang: Lang, companyName: string, jobTitle: string, letterText: string): LmModel {
-  const name = safeText(profile.fullName) || "Candidat";
-  const contactLines: string[] = [];
-  if (profile.phone) contactLines.push(lang === "fr" ? `Téléphone : ${safeText(profile.phone)}` : `Phone: ${safeText(profile.phone)}`);
-  if (profile.email) contactLines.push(lang === "fr" ? `Email : ${safeText(profile.email)}` : `Email: ${safeText(profile.email)}`);
-  if (profile.linkedin) contactLines.push(lang === "fr" ? `LinkedIn : ${safeText(profile.linkedin)}` : `LinkedIn: ${safeText(profile.linkedin)}`);
-
-  const city = safeText(profile.city) || "Paris";
-  const dateStr =
-    lang === "fr"
-      ? new Date().toLocaleDateString("fr-FR")
-      : new Date().toLocaleDateString("en-GB");
-
-  const subject =
-    lang === "fr"
-      ? `Objet : Candidature – ${jobTitle || "poste"}`
-      : `Subject: Application – ${jobTitle || "role"}`;
-
-  const salutation = lang === "fr" ? "Madame, Monsieur," : "Dear Hiring Manager,";
-  const closing = lang === "fr" ? "Cordialement," : "Sincerely,";
-
-  const body = extractBodyFromLetterText(letterText, lang, name);
-
-  return {
-    lang,
-    name,
-    contactLines,
-    service: lang === "fr" ? "Service Recrutement" : "Recruitment Team",
-    companyName: safeText(companyName) || (lang === "fr" ? "Entreprise" : "Company"),
-    companyAddr: "",
-    city,
-    dateStr,
-    subject,
-    salutation,
-    body: body || safeText(letterText),
-    closing,
-    signature: name,
-  };
-}
-
-// =============================
-// PAGE
-// =============================
-
-export default function AssistanceCandidaturePage() {
-  // --- PROFIL CV IA ---
-  const [userId, setUserId] = useState<string | null>(null);
-  const [userEmail, setUserEmail] = useState<string | null>(null);
-  const [profile, setProfile] = useState<CvProfile | null>(null);
-  const [loadingProfile, setLoadingProfile] = useState(true);
-
-  // Bandeau global "IA en cours"
-  const [globalLoadingMessage, setGlobalLoadingMessage] = useState<string | null>(null);
-
-  useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (user) => {
-      if (!user) {
-        setUserId(null);
-        setUserEmail(null);
-        setProfile(null);
-        setLoadingProfile(false);
-        return;
-      }
-
-      setUserId(user.uid);
-      setUserEmail(user.email ?? null);
-
-      try {
-        const ref = doc(db, "profiles", user.uid);
-        const snap = await getDoc(ref);
-
-        if (snap.exists()) {
-          const data = snap.data() as any;
-
-          const loadedProfile: CvProfile = {
-            fullName: data.fullName || "",
-            email: data.email || "",
-            phone: data.phone || "",
-            linkedin: data.linkedin || "",
-            profileSummary: data.profileSummary || "",
-            city: data.city || "",
-            address: data.address || "",
-            contractType: data.contractType || data.contractTypeStandard || "",
-            contractTypeStandard: data.contractTypeStandard || "",
-            contractTypeFull: data.contractTypeFull || "",
-            primaryDomain: data.primaryDomain || "",
-            secondaryDomains: Array.isArray(data.secondaryDomains) ? data.secondaryDomains : [],
-            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
-            drivingLicense: data.drivingLicense || "",
-            vehicle: data.vehicle || "",
-            skills: {
-              sections: Array.isArray(data.skills?.sections) ? data.skills.sections : [],
-              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
-            },
-            experiences: Array.isArray(data.experiences) ? data.experiences : [],
-            education: Array.isArray(data.education) ? data.education : [],
-            educationShort: Array.isArray(data.educationShort) ? data.educationShort : [],
-            certs: data.certs || "",
-            langLine: data.langLine || "",
-            hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
-            updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : undefined,
-          };
-
-          setProfile(loadedProfile);
-        } else {
-          setProfile(null);
-        }
-      } catch (e) {
-        console.error("Erreur chargement profil Firestore (assistance):", e);
-      } finally {
-        setLoadingProfile(false);
-      }
-    });
-
-    return () => unsub();
-  }, []);
-
-  // --- ÉTATS CV IA ---
-  const [cvTargetJob, setCvTargetJob] = useState("");
-  const [cvTemplate, setCvTemplate] = useState("ats");
-  const [cvLang, setCvLang] = useState<Lang>("fr");
-  const [cvContract, setCvContract] = useState("CDI");
-  const [cvJobLink, setCvJobLink] = useState("");
-  const [cvJobDesc, setCvJobDesc] = useState("");
-  const [cvAutoCreate, setCvAutoCreate] = useState(true);
-
-  const [cvLoading, setCvLoading] = useState(false);
-  const [cvZipLoading, setCvZipLoading] = useState(false);
-  const [cvStatus, setCvStatus] = useState<string | null>(null);
-  const [cvError, setCvError] = useState<string | null>(null);
-
-  // ✅ Couleur PDF (rouge par défaut)
-  const [pdfBrand, setPdfBrand] = useState("#ef4444"); // 🔴 rouge
-
-  // --- ÉTATS LETTRE DE MOTIVATION ---
-  const [lmLang, setLmLang] = useState<Lang>("fr");
-  const [companyName, setCompanyName] = useState("");
-  const [jobTitle, setJobTitle] = useState("");
-  const [jobDescription, setJobDescription] = useState("");
-  const [jobLink, setJobLink] = useState("");
-  const [letterText, setLetterText] = useState("");
-  const [lmLoading, setLmLoading] = useState(false);
-  const [lmError, setLmError] = useState<string | null>(null);
-  const [letterCopied, setLetterCopied] = useState(false);
-  const [lmPdfLoading, setLmPdfLoading] = useState(false);
-  const [lmPdfError, setLmPdfError] = useState<string | null>(null);
-
-  // --- ÉTATS PITCH ---
-  const [pitchLang, setPitchLang] = useState<Lang>("fr");
-  const [pitchText, setPitchText] = useState("");
-  const [pitchLoading, setPitchLoading] = useState(false);
-  const [pitchError, setPitchError] = useState<string | null>(null);
-  const [pitchCopied, setPitchCopied] = useState(false);
-
-  // --- MAIL ---
-  const [recruiterName, setRecruiterName] = useState("");
-  const [emailPreview, setEmailPreview] = useState("");
-  const [subjectPreview, setSubjectPreview] = useState("");
-
-  // --- DERIVÉS ---
-  const visibilityLabel = userId ? "Associé à ton compte" : "Invité";
-
-  const miniHeadline =
-    profile?.profileSummary?.split(".")[0] ||
-    profile?.contractType ||
-    "Analyse ton CV PDF dans l’onglet « CV IA » pour activer l’assistant.";
-
-  const profileName = profile?.fullName || userEmail || "Profil non détecté";
-
-  const targetedJob = jobTitle || cvTargetJob || "Poste cible non renseigné";
-  const targetedCompany = companyName || "Entreprise non renseignée";
-
-  // --- Auto create /applications ---
-  type GenerationKind = "cv" | "cv_lm" | "lm" | "pitch";
-
-  const autoCreateApplication = async (kind: GenerationKind) => {
-    if (!cvAutoCreate) return;
-    if (!userId || !profile) return;
-
-    try {
-      const appsRef = collection(db, "applications");
-      await addDoc(appsRef, {
-        userId,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-        company: companyName || "",
-        jobTitle: jobTitle || cvTargetJob || "",
-        jobLink: jobLink || cvJobLink || "",
-        status: "draft",
-        source: "Assistant candidature IA",
-        hasCv: kind === "cv" || kind === "cv_lm",
-        hasLm: kind === "lm" || kind === "cv_lm",
-        hasPitch: kind === "pitch",
-        langCv: cvLang,
-        langLm: lmLang,
-        langPitch: pitchLang,
-      });
-    } catch (e) {
-      console.error("Erreur création entrée suivi de candidature :", e);
-    }
-  };
-
-  // =============================
-  // ✅ Génération IA (lettre / pitch)
-  // =============================
-
-  const generateCoverLetterText = async (lang: Lang): Promise<string> => {
-    if (!profile) throw new Error("Profil manquant.");
-    if (!jobTitle && !jobDescription) {
-      throw new Error("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
-    }
-
-    const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
-
-    // ✅ injection pour forcer une VRAIE lettre (expériences, outils, concret)
-    const enrichedJobDescription = buildJobDescWithInstructions({
-      jobDescription,
-      lang,
-      jobTitle,
-      companyName,
-      jobLink,
-      profile,
-    });
-
-    const resp = await fetch(LETTER_AND_PITCH_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        profile,
-        jobTitle,
-        companyName,
-        jobDescription: enrichedJobDescription,
-        lang,
-        recaptchaToken,
-      }),
-    });
-
-    const json = await resp.json().catch(() => null);
-    if (!resp.ok) {
-      const msg = (json && json.error) || "Erreur pendant la génération de la lettre de motivation.";
-      throw new Error(msg);
-    }
-
-    const coverLetter = typeof json.coverLetter === "string" ? json.coverLetter.trim() : "";
-    if (!coverLetter) throw new Error("Lettre vide renvoyée par l'API.");
-    return coverLetter;
-  };
-
-  // =============================
-  // ✅ PDF locaux (CV + LM)
-  // =============================
-
-  const colors = useMemo(() => makePdfColors(pdfBrand), [pdfBrand]);
-
-  const handleGenerateCv = async () => {
-    if (!profile) {
-      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
-      return;
-    }
-
-    setCvError(null);
-    setCvStatus(null);
-    setCvLoading(true);
-    setGlobalLoadingMessage("Mise en page du CV (1 page)…");
-
-    try {
-      if (cvTemplate !== "ats") {
-        setCvStatus("Note : génération locale disponible en ATS (sobre) pour le moment.");
-      }
-
-      const cvModel: CvDocModel = profileToCvDocModel(profile, {
-        targetJob: cvTargetJob,
-        contract: cvContract,
-      });
-
-      const { blob, bestScale } = await fitOnePage((scale) =>
-        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
-      );
-
-      downloadBlob(blob, "cv-ia.pdf");
-      setCvStatus(`CV généré (1 page) ✅ (scale=${bestScale.toFixed(2)})`);
-
-      await autoCreateApplication("cv");
-
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_document",
-          docType: "cv",
-          eventType: "generate",
-          tool: "clientPdfMakeCv",
-        });
-      }
-    } catch (err: any) {
-      console.error("Erreur génération CV locale:", err);
-      setCvError(err?.message || "Impossible de générer le CV pour le moment.");
-    } finally {
-      setCvLoading(false);
-      setGlobalLoadingMessage(null);
-    }
-  };
-
-  const handleGenerateCvLmPdf = async () => {
-    if (!profile) {
-      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
-      return;
-    }
-
-    setCvError(null);
-    setCvStatus(null);
-    setCvZipLoading(true);
-    setGlobalLoadingMessage("Mise en page CV + lettre (1 page + 1 page)…");
-
-    try {
-      // 1) CV
-      const cvModel: CvDocModel = profileToCvDocModel(profile, {
-        targetJob: cvTargetJob,
-        contract: cvContract,
-      });
-
-      const cvFit = await fitOnePage((scale) =>
-        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
-      );
-
-      // 2) Lettre : si pas encore générée -> IA
-      let cover = letterText?.trim();
-      if (!cover) {
-        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
-        cover = await generateCoverLetterText(lmLang);
-        setLetterText(cover);
-      }
-
-      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
-
-      const lmFit = await fitOnePage(
-        (scale) => buildLmStyledPdf(lmModel, colors, scale),
-        { min: 0.85, max: 1.6, iterations: 7, initial: 1.0 }
-      );
-
-      // 3) Fusion -> 2 pages
-      const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
-      downloadBlob(merged, "cv-lm-ia.pdf");
-
-      setCvStatus("CV (1 page) + LM (1 page) générés ✅ (PDF 2 pages)");
-      await autoCreateApplication("cv_lm");
-
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_document",
-          docType: "cv",
-          eventType: "generate",
-          tool: "clientPdfMakeCvLm",
-        });
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_document",
-          docType: "lm",
-          eventType: "generate",
-          tool: "clientPdfMakeCvLm",
-          creditsDelta: 0,
-        });
-      }
-    } catch (err: any) {
-      console.error("Erreur génération CV+LM locale:", err);
-      setCvError(err?.message || "Impossible de générer CV + LM pour le moment.");
-    } finally {
-      setCvZipLoading(false);
-      setGlobalLoadingMessage(null);
-    }
-  };
-
-  // --- ACTIONS LETTRE ---
-  const handleGenerateLetter = async (e?: FormEvent) => {
-    if (e) e.preventDefault();
-    if (!profile) {
-      setLmError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
-      return;
-    }
-    if (!jobTitle && !jobDescription) {
-      setLmError("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
-      return;
-    }
-
-    setLmError(null);
-    setLmPdfError(null);
-    setPitchError(null);
-    setLmLoading(true);
-    setLetterCopied(false);
-    setGlobalLoadingMessage("L’IA rédige ta lettre de motivation…");
-
-    try {
-      const coverLetter = await generateCoverLetterText(lmLang);
-      setLetterText(coverLetter);
-
-      await autoCreateApplication("lm");
-
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_document",
-          docType: "lm",
-          eventType: "generate",
-          tool: "generateLetterAndPitch",
-        });
-      }
-    } catch (err: any) {
-      console.error("Erreur generateLetter:", err);
-      setLmError(err?.message || "Impossible de générer la lettre de motivation pour le moment.");
-    } finally {
-      setLmLoading(false);
-      setGlobalLoadingMessage(null);
-    }
-  };
-
-  // ✅ PDF LM local (auto-génère si texte vide)
-  const handleDownloadLetterPdf = async () => {
-    if (!profile) {
-      setLmPdfError("Profil manquant.");
-      return;
-    }
-    if (!jobTitle && !jobDescription && !letterText) {
-      setLmPdfError("Renseigne au moins le poste ou colle un extrait d’offre, puis génère/télécharge.");
-      return;
-    }
-
-    setLmPdfError(null);
-    setLmPdfLoading(true);
-    setGlobalLoadingMessage("Mise en forme PDF (lettre 1 page)…");
-
-    try {
-      let cover = letterText?.trim();
-      if (!cover) {
-        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
-        cover = await generateCoverLetterText(lmLang);
-        setLetterText(cover);
-      }
-
-      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
-
-      const { blob } = await fitOnePage(
-        (scale) => buildLmStyledPdf(lmModel, colors, scale),
-        { min: 0.85, max: 1.6, iterations: 7, initial: 1.0 }
-      );
-
-      downloadBlob(blob, "lettre-motivation.pdf");
-
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "download_pdf",
-          docType: "other",
-          eventType: "lm_pdf_download",
-          tool: "clientPdfMakeLm",
-        });
-      }
-    } catch (err: any) {
-      console.error("Erreur LM PDF (local):", err);
-      setLmPdfError(err?.message || "Impossible de générer le PDF pour le moment.");
-    } finally {
-      setLmPdfLoading(false);
-      setGlobalLoadingMessage(null);
-    }
-  };
-
-  const handleCopyLetter = async () => {
-    if (!letterText) return;
-    try {
-      await navigator.clipboard.writeText(letterText);
-      setLetterCopied(true);
-      setTimeout(() => setLetterCopied(false), 1500);
-    } catch (e) {
-      console.error("Erreur copie LM:", e);
-    }
-  };
-
-  // --- PITCH ---
-  const handleGeneratePitch = async () => {
-    if (!profile) {
-      setPitchError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
-      return;
-    }
-
-    const effectiveJobTitle = jobTitle || cvTargetJob || "Candidature cible";
-    const effectiveDesc = jobDescription || cvJobDesc || "";
-
-    setPitchError(null);
-    setPitchLoading(true);
-    setPitchCopied(false);
-    setGlobalLoadingMessage("L’IA prépare ton pitch d’ascenseur…");
-
-    try {
-      const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
-
-      const resp = await fetch(LETTER_AND_PITCH_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          profile,
-          jobTitle: effectiveJobTitle,
-          companyName,
-          jobDescription: effectiveDesc,
-          lang: pitchLang,
-          recaptchaToken,
-        }),
-      });
-
-      const json = await resp.json().catch(() => null);
-
-      if (!resp.ok) {
-        const msg = (json && json.error) || "Erreur pendant la génération du pitch.";
-        throw new Error(msg);
-      }
-
-      const pitch = typeof json.pitch === "string" ? json.pitch.trim() : "";
-      if (!pitch) throw new Error("Pitch vide renvoyé par l'API.");
-
-      setPitchText(pitch);
-      await autoCreateApplication("pitch");
-
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_pitch",
-          docType: "other",
-          eventType: "generate",
-          tool: "generateLetterAndPitch",
-        });
-      }
-    } catch (err: any) {
-      console.error("Erreur generatePitch:", err);
-      setPitchError(err?.message || "Impossible de générer le pitch pour le moment.");
-    } finally {
-      setPitchLoading(false);
-      setGlobalLoadingMessage(null);
-    }
-  };
-
-  const handleCopyPitch = async () => {
-    if (!pitchText) return;
-    try {
-      await navigator.clipboard.writeText(pitchText);
-      setPitchCopied(true);
-      setTimeout(() => setPitchCopied(false), 1500);
-    } catch (e) {
-      console.error("Erreur copie pitch:", e);
-    }
-  };
-
-  // --- MAIL ---
-  const buildEmailContent = () => {
-    const name = profile?.fullName || "Je";
-    const subject = `Candidature – ${jobTitle || "poste"} – ${name}`;
-    const recruiter = recruiterName.trim() || "Madame, Monsieur";
-
-    const body = `Bonjour ${recruiter},
-
-Je me permets de vous adresser ma candidature pour le poste de ${jobTitle || "..."} au sein de ${
-      companyName || "votre entreprise"
-    }.
-
-Vous trouverez ci-joint mon CV ainsi que ma lettre de motivation.
-Mon profil correspond particulièrement à vos attentes sur ce poste, et je serais ravi(e) d'échanger avec vous pour en discuter de vive voix.
-
-Je reste bien entendu disponible pour tout complément d'information.
-
-Cordialement,
-
-${name}
-`;
-
-    setSubjectPreview(subject);
-    setEmailPreview(body);
-  };
-
-  const handleGenerateEmail = (e: FormEvent) => {
-    e.preventDefault();
-    buildEmailContent();
-  };
-
-  // --- RENDER ---
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.25 }}
-      className="max-w-3xl mx-auto px-3 sm:px-4 py-5 sm:py-6 space-y-4"
-    >
-      {/* Bandeau global IA */}
-      {globalLoadingMessage && (
-        <div className="mb-2 rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-1.5 text-[11px] flex items-center gap-2 text-[var(--muted)]">
-          <span className="inline-flex w-3 h-3 rounded-full border-2 border-[var(--brand)] border-t-transparent animate-spin" />
-          <span>{globalLoadingMessage}</span>
-        </div>
-      )}
-
-      {/* HEADER */}
-      <section className="space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="badge-muted flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-            <span className="text-[11px] uppercase tracking-wider text-[var(--muted)]">
-              Assistant de candidature IA
-            </span>
-          </p>
-          <div className="flex flex-wrap gap-2 text-[11px]">
-            <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
-              Profil IA :{" "}
-              <span className="ml-1 font-medium">
-                {loadingProfile ? "Chargement…" : profile ? "Détecté ✅" : "Non détecté"}
-              </span>
-            </span>
-            <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
-              Visibilité : <span className="ml-1 font-medium">{visibilityLabel}</span>
-            </span>
-          </div>
-        </div>
-
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="space-y-1">
-            <h1 className="text-lg sm:text-xl font-semibold">Prépare ta candidature avec ton CV IA</h1>
-            <p className="text-[12px] text-[var(--muted)] max-w-xl">
-              Génère un <strong>CV 1 page</strong>, une <strong>lettre de motivation</strong> (1 page), un{" "}
-              <strong>pitch</strong> et un <strong>mail</strong>.
-            </p>
-          </div>
-
-          <div className="w-full sm:w-[220px] rounded-2xl border border-[var(--border)] bg-[var(--bg-soft)] px-3 py-2.5 text-[11px]">
-            <p className="text-[var(--muted)] mb-1">Résumé du profil</p>
-            <p className="font-semibold text-[var(--ink)] leading-tight">{profileName}</p>
-            <p className="mt-0.5 text-[var(--muted)] line-clamp-2">{miniHeadline}</p>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap gap-1.5 text-[11px]">
-          {[
-            "Cible le poste",
-            "Génère CV & LM",
-            "Prépare ton pitch",
-            "Génère ton mail",
-          ].map((t, i) => (
-            <span
-              key={i}
-              className="inline-flex items-center gap-1 rounded-full bg-[var(--bg-soft)] border border-[var(--border)] px-2 py-[3px]"
-            >
-              <span className="w-4 h-4 rounded-full bg-[var(--brand)]/10 flex items-center justify-center text-[10px] text-[var(--brand)]">
-                {i + 1}
-              </span>
-              <span>{t}</span>
-            </span>
-          ))}
-        </div>
-      </section>
-
-      {/* ÉTAPE 1 : CV */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-              Étape 1
-            </span>
-            <div>
-              <h2 className="text-base sm:text-lg font-semibold text-[var(--ink)]">CV IA – 1 page A4</h2>
-              <p className="text-[11px] text-[var(--muted)]">
-                Génération locale (PDF) – rendu identique aux templates HTML.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div className="space-y-3 text-[13px]">
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Titre / objectif du CV</label>
-            <input
-              id="cvTargetJob"
-              type="text"
-              className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-              placeholder="Ex : Ingénieur Cybersécurité"
-              value={cvTargetJob}
-              onChange={(e) => setCvTargetJob(e.target.value)}
-            />
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Modèle</label>
-              <select
-                id="cvTemplate"
-                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
-                value={cvTemplate}
-                onChange={(e) => setCvTemplate(e.target.value)}
-              >
-                <option value="ats">ATS (sobre) ✅</option>
-                <option value="design">Design (CLOUD)</option>
-                <option value="magazine">Magazine</option>
-                <option value="classic">Classique</option>
-                <option value="modern">Moderne</option>
-                <option value="minimalist">Minimaliste</option>
-                <option value="academic">Académique</option>
-              </select>
-              {cvTemplate !== "ats" && (
-                <p className="mt-1 text-[10px] text-[var(--muted)]">
-                  Génération locale disponible en <strong>ATS</strong> pour l’instant.
-                </p>
-              )}
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Langue</label>
-              <select
-                id="cvLang"
-                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
-                value={cvLang}
-                onChange={(e) => setCvLang(e.target.value as Lang)}
-              >
-                <option value="fr">Français</option>
-                <option value="en">English</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Contrat visé</label>
-              <select
-                id="cvContract"
-                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
-                value={cvContract}
-                onChange={(e) => setCvContract(e.target.value)}
-              >
-                <option value="CDI">CDI</option>
-                <option value="CDD">CDD</option>
-                <option value="Alternance">Alternance</option>
-                <option value="Stage">Stage</option>
-                <option value="Freelance">Freelance</option>
-              </select>
-            </div>
-
-            {/* ✅ COULEUR PDF */}
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Couleur PDF (CV + LM)
-              </label>
-              <div className="flex items-center gap-2">
-                <input
-                  type="color"
-                  value={pdfBrand}
-                  onChange={(e) => setPdfBrand(e.target.value)}
-                  className="h-9 w-12 rounded-lg border border-[var(--border)] bg-[var(--bg-soft)]"
-                  aria-label="Couleur du PDF"
-                />
-                <input
-                  type="text"
-                  value={pdfBrand}
-                  onChange={(e) => setPdfBrand(e.target.value)}
-                  className="input flex-1 text-[var(--ink)] bg-[var(--bg)]"
-                  placeholder="#ef4444"
-                />
-              </div>
-              <p className="mt-1 text-[10px] text-[var(--muted)]">
-                Par défaut : <strong>rouge</strong> (#ef4444).
-              </p>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Lien de l&apos;offre (optionnel)
-              </label>
-              <input
-                id="cvJobLink"
-                type="url"
-                className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                placeholder="https://"
-                value={cvJobLink}
-                onChange={(e) => setCvJobLink(e.target.value)}
-              />
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
-                Extraits de l&apos;offre (optionnel)
-              </label>
-              <textarea
-                id="cvJD"
-                rows={3}
-                className="input textarea w-full text-[13px] text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                placeholder="Colle quelques missions / outils / mots-clés de l’offre."
-                value={cvJobDesc}
-                onChange={(e) => setCvJobDesc(e.target.value)}
-              />
-            </div>
-          </div>
-
-          <div className="pt-1">
-            <label className="flex items-center gap-2 cursor-pointer text-[12px]">
-              <input
-                id="autoCreateSwitch"
-                type="checkbox"
-                className="toggle-checkbox"
-                checked={cvAutoCreate}
-                onChange={(e) => setCvAutoCreate(e.target.checked)}
-              />
-              <span className="text-[var(--muted)]">
-                Créer automatiquement une entrée dans le <strong>Suivi 📌</strong> à chaque génération.
-              </span>
-            </label>
-          </div>
-        </div>
-
-        <div className="flex flex-col sm:flex-row gap-2 pt-2">
-          <button
-            id="generateCvBtn"
-            type="button"
-            onClick={handleGenerateCv}
-            disabled={cvLoading || !profile}
-            className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            <span>{cvLoading ? "Génération du CV..." : "Générer le CV (PDF) — 1 page"}</span>
-            <div id="cvBtnSpinner" className={`loader absolute inset-0 m-auto ${cvLoading ? "" : "hidden"}`} />
-          </button>
-
-          <button
-            id="generateCvLmPdfBtn"
-            type="button"
-            onClick={handleGenerateCvLmPdf}
-            disabled={cvZipLoading || !profile}
-            className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            <span>{cvZipLoading ? "Génération PDF..." : "CV + LM (PDF) — 2 pages"}</span>
-            <div id="cvLmZipBtnSpinner" className={`loader absolute inset-0 m-auto ${cvZipLoading ? "" : "hidden"}`} />
-          </button>
-        </div>
-
-        <div className="mt-2 p-2.5 rounded-md border border-dashed border-[var(--border)]/70 text-[11px] text-[var(--muted)]">
-          {cvStatus ? (
-            <p className="text-center text-emerald-400 text-[12px]">{cvStatus}</p>
-          ) : (
-            <p className="text-center">
-              Génération locale : téléchargement direct (CV 1 page, ou CV+LM 2 pages).
-            </p>
-          )}
-          {cvError && <p className="mt-1 text-center text-red-400 text-[12px]">{cvError}</p>}
-        </div>
-      </section>
-
-      {/* ÉTAPE 2 : LM */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
-          <span>
-            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
-          </span>
-          <span>
-            🏢 <span className="font-medium text-[var(--ink)]">{targetedCompany}</span>
-          </span>
-        </div>
-
-        <form onSubmit={handleGenerateLetter} className="space-y-3">
-          <div className="flex items-start justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-                Étape 2
-              </span>
-              <div>
-                <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Lettre de motivation IA</h3>
-                <p className="text-[11px] text-[var(--muted)]">
-                  La lettre est générée en s’appuyant sur <strong>tes expériences</strong> (et outils), puis exportée en PDF (1 page).
-                </p>
-              </div>
-            </div>
-            <select
-              id="lmLang"
-              className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
-              value={lmLang}
-              onChange={(e) => setLmLang(e.target.value as Lang)}
-            >
-              <option value="fr">FR</option>
-              <option value="en">EN</option>
-            </select>
-          </div>
-
-          <div className="space-y-3 text-[13px]">
-            <div className="grid sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
-                <input
-                  id="companyName"
-                  type="text"
-                  className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                  placeholder="Ex : IMOGATE"
-                  value={companyName}
-                  onChange={(e) => setCompanyName(e.target.value)}
-                />
-              </div>
-              <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
-                <input
-                  id="jobTitle"
-                  type="text"
-                  className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                  placeholder="Ex : Ingénieur Réseaux & Sécurité"
-                  value={jobTitle}
-                  onChange={(e) => setJobTitle(e.target.value)}
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Extraits de l&apos;offre (optionnel)</label>
-              <textarea
-                id="jobDescription"
-                rows={3}
-                className="input textarea w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                placeholder="Colle quelques missions / outils / contexte de l’offre."
-                value={jobDescription}
-                onChange={(e) => setJobDescription(e.target.value)}
-              />
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Lien de l&apos;offre (optionnel)</label>
-              <input
-                id="jobLink"
-                type="url"
-                className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                placeholder="https://"
-                value={jobLink}
-                onChange={(e) => setJobLink(e.target.value)}
-              />
-            </div>
-
-            {lmError && <p className="text-[11px] text-red-400">{lmError}</p>}
-
-            <div className="flex flex-col sm:flex-row gap-2 pt-1">
-              <button
-                id="generateCoverLetterBtn"
-                type="submit"
-                disabled={lmLoading || !profile}
-                className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                <span>{lmLoading ? "Génération de la LM..." : "Générer la lettre"}</span>
-                <div id="lmBtnSpinner" className={`loader absolute inset-0 m-auto ${lmLoading ? "" : "hidden"}`} />
-              </button>
-
-              <button
-                id="downloadLetterPdfBtn"
-                type="button"
-                onClick={handleDownloadLetterPdf}
-                disabled={lmPdfLoading || !profile}
-                className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                <span>{lmPdfLoading ? "Création du PDF..." : "Télécharger en PDF (1 page)"}</span>
-                <div className={`loader absolute inset-0 m-auto ${lmPdfLoading ? "" : "hidden"}`} />
-              </button>
-            </div>
-
-            <div className="flex flex-col sm:flex-row gap-2">
-              <button
-                id="copyLetterBtn"
-                type="button"
-                onClick={handleCopyLetter}
-                disabled={!letterText}
-                className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                <span>{letterCopied ? "Texte copié ✅" : "Copier le texte"}</span>
-              </button>
-            </div>
-
-            {lmPdfError && <p className="text-[11px] text-red-400">{lmPdfError}</p>}
-          </div>
-        </form>
-
-        <div className="mt-2 p-3 card-soft rounded-md border border-dashed border-[var(--brand)]/50">
-          <p className="text-[11px] text-[var(--muted)] mb-1 text-center">
-            Dernière lettre générée (tu peux l&apos;adapter avant envoi ou PDF).
-          </p>
-          <div className="letter-pre text-[13px] text-[var(--ink)] overflow-auto max-h-[220px] whitespace-pre-line">
-            {letterText ? (
-              <p>{letterText}</p>
-            ) : (
-              <p className="text-center text-[var(--muted)]">Lance une génération pour voir ici le texte de la LM IA.</p>
-            )}
-          </div>
-        </div>
-      </section>
-
-      {/* ÉTAPE 3 : PITCH */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3">
-        <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
-          <span>
-            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
-          </span>
-          <span>🧩 Utilise ce pitch pour mails, LinkedIn et entretiens.</span>
-        </div>
-
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-              Étape 3
-            </span>
-            <div>
-              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Pitch d&apos;ascenseur</h3>
-              <p className="text-[11px] text-[var(--muted)]">
-                Résumé percutant de 2–4 phrases pour te présenter en 30–40 secondes.
-              </p>
-            </div>
-          </div>
-          <select
-            id="pitchLang"
-            className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
-            value={pitchLang}
-            onChange={(e) => setPitchLang(e.target.value as Lang)}
-          >
-            <option value="fr">FR</option>
-            <option value="en">EN</option>
-          </select>
-        </div>
-
-        {pitchError && <p className="text-[11px] text-red-400">{pitchError}</p>}
-
-        <div className="flex flex-col sm:flex-row gap-2 pt-1">
-          <button
-            id="generatePitchBtn"
-            type="button"
-            onClick={handleGeneratePitch}
-            disabled={pitchLoading || !profile}
-            className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            <span>{pitchLoading ? "Génération du pitch..." : "Générer le pitch"}</span>
-            <div id="pitchBtnSpinner" className={`loader absolute inset-0 m-auto ${pitchLoading ? "" : "hidden"}`} />
-          </button>
-          <button
-            id="copyPitchBtn"
-            type="button"
-            onClick={handleCopyPitch}
-            disabled={!pitchText}
-            className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            <span>{pitchCopied ? "Pitch copié ✅" : "Copier le pitch"}</span>
-          </button>
-        </div>
-
-        <div className="mt-2 p-3 card-soft rounded-md text-[13px] text-[var(--ink)] whitespace-pre-line">
-          {pitchText ? (
-            <p>{pitchText}</p>
-          ) : (
-            <p className="text-center text-[11px] text-[var(--muted)]">
-              Après génération, ton pitch apparaîtra ici.
-            </p>
-          )}
-        </div>
-      </section>
-
-      {/* ÉTAPE 4 : MAIL */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-              Étape 4
-            </span>
-            <div>
-              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Mail de candidature</h3>
-              <p className="text-[11px] text-[var(--muted)] max-w-xl">
-                Génère un <strong>objet</strong> et un <strong>corps de mail</strong> à copier.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <form onSubmit={handleGenerateEmail} className="grid md:grid-cols-2 gap-4 text-sm mt-1">
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
-            <input
-              className="input w-full"
-              value={companyName}
-              onChange={(e) => setCompanyName(e.target.value)}
-              placeholder="Ex : IMOGATE"
-            />
-          </div>
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
-            <input
-              className="input w-full"
-              value={jobTitle}
-              onChange={(e) => setJobTitle(e.target.value)}
-              placeholder="Ex : Ingénieur Réseaux & Sécurité"
-            />
-          </div>
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom du recruteur (optionnel)</label>
-            <input
-              className="input w-full"
-              value={recruiterName}
-              onChange={(e) => setRecruiterName(e.target.value)}
-              placeholder="Ex : Mme Dupont"
-            />
-          </div>
-          <div className="md:col-span-2 flex justify-end">
-            <button type="submit" className="btn-primary min-w-[200px]">
-              Générer le mail
-            </button>
-          </div>
-        </form>
-
-        <div className="grid md:grid-cols-2 gap-4 mt-3 text-sm">
-          <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
-            <h4 className="font-semibold text-sm mb-2">Objet</h4>
-            <div className="text-xs text-[var(--muted)] whitespace-pre-line">
-              {subjectPreview || "L'objet généré apparaîtra ici."}
-            </div>
-          </div>
-          <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
-            <h4 className="font-semibold text-sm mb-2">Corps du mail</h4>
-            <div className="text-xs text-[var(--muted)] whitespace-pre-line max-h-64 overflow-auto">
-              {emailPreview || "Le texte du mail apparaîtra ici après génération."}
-            </div>
-          </div>
-        </div>
-
-        <p className="text-[10px] text-[var(--muted)] mt-3">
-          📌 Copie-colle l&apos;objet et le texte, puis joins le CV et la lettre PDF.
-        </p>
-      </section>
-    </motion.div>
   );
 }
 ````
@@ -10438,2921 +8249,6 @@ export default function UserAppLayout({ children }: { children: ReactNode }) {
         </div>
       </div>
     </div>
-  );
-}
-````
-
-## File: app/app/page.tsx
-````typescript
-"use client";
-
-import { useState, useEffect, useRef, ChangeEvent, FormEvent } from "react";
-import { motion } from "framer-motion";
-import { auth, db } from "@/lib/firebase";
-import { onAuthStateChanged } from "firebase/auth";
-import {
-  doc,
-  getDoc,
-  setDoc,
-  collection,
-  query,
-  where,
-  onSnapshot,
-} from "firebase/firestore";
-import Chart from "chart.js/auto";
-import { useAuth } from "@/context/AuthContext";
-import { useUserProfile } from "@/hooks/useUserProfile";
-import { consumeCredits } from "@/lib/credits";
-import { logUsage } from "@/lib/userTracking";
-
-// --- TYPES ---
-
-type CvSkillsSection = {
-  title: string;
-  items: string[];
-};
-
-type CvSkills = {
-  sections: CvSkillsSection[];
-  tools: string[];
-};
-
-type CvExperience = {
-  company: string;
-  role: string;
-  dates: string;
-  bullets: string[];
-  location?: string;
-};
-
-type CvEducation = {
-  school: string;
-  degree: string;
-  dates: string;
-  location?: string;
-};
-
-type CvProfile = {
-  fullName: string;
-  email: string;
-  phone: string;
-  linkedin: string;
-  profileSummary: string;
-
-  city?: string;
-  address?: string;
-
-  contractType: string;
-  contractTypeStandard?: string;
-  contractTypeFull?: string;
-
-  primaryDomain?: string;
-  secondaryDomains?: string[];
-  softSkills?: string[];
-
-  drivingLicense?: string;
-  vehicle?: string;
-
-  skills: CvSkills;
-  experiences: CvExperience[];
-  education: CvEducation[];
-  educationShort: string[];
-  certs: string;
-  langLine: string;
-  hobbies: string[];
-  updatedAt?: number;
-};
-
-type DashboardCounts = {
-  totalApps: number;
-  cvCount: number;
-  lmCount: number;
-};
-
-// 🔗 URL de ta Firebase Function d'extraction de profil
-const WORKER_URL =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/extractProfile";
-
-// --- HELPERS GÉNÉRAUX ---
-
-function getInitials(name?: string) {
-  if (!name) return "?";
-  const parts = name.trim().split(/\s+/);
-  if (parts.length === 0) return "?";
-  if (parts.length === 1) return (parts[0][0] || "?").toUpperCase();
-  return (
-    ((parts[0][0] || "") + (parts[parts.length - 1][0] || "")).toUpperCase()
-  );
-}
-
-function formatUpdatedAt(ts?: number) {
-  if (!ts) return "";
-  const d = new Date(ts);
-  return new Intl.DateTimeFormat("fr-FR", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(d);
-}
-
-function normalizeText(str: string): string {
-  return str
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
-}
-
-// 🌐 Drapeaux langues (robuste, ignore natif/bilingue/etc.)
-function getFlagEmoji(langPart: string): string {
-  if (!langPart) return "🌐";
-
-  const lower = langPart.toLowerCase();
-
-  // On enlève ce qu'il y a entre parenthèses (souvent le niveau)
-  let base = lower.replace(/\(.*?\)/g, " ").trim();
-
-  const levelWords = [
-    "natif",
-    "bilingue",
-    "courant",
-    "intermédiaire",
-    "intermediaire",
-    "débutant",
-    "debutant",
-    "langue maternelle",
-    "maternelle",
-    "maternel",
-    "c1",
-    "c2",
-    "b1",
-    "b2",
-    "a1",
-    "a2",
-  ];
-
-  levelWords.forEach((w) => {
-    base = base.replace(new RegExp("\\b" + w + "\\b", "g"), " ");
-  });
-
-  base = base.trim();
-  if (!base) base = lower;
-
-  if (base.match(/\bfrançais\b|\bfrancais\b|\bfrench\b/)) return "🇫🇷";
-  if (base.match(/\banglais\b|\benglish\b/)) return "🇬🇧";
-  if (base.match(/\bamericain\b|\bétats-unis\b|\busa\b|\bamerican\b/))
-    return "🇺🇸";
-
-  if (base.match(/\bespagnol\b|\bspanish\b/)) return "🇪🇸";
-  if (base.match(/\ballemand\b|\bgerman\b/)) return "🇩🇪";
-  if (base.match(/\bitalien\b|\bitalian\b/)) return "🇮🇹";
-  if (base.match(/\bportugais\b|\bportuguese\b/)) return "🇵🇹";
-  if (base.match(/\bnéerlandais\b|\bneerlandais\b|\bdutch\b/)) return "🇳🇱";
-
-  if (base.match(/\barabe\b|\barabic\b|\barab\b/)) return "🇸🇦";
-  if (base.match(/\bchinois\b|\bmandarin\b|\bchinese\b/)) return "🇨🇳";
-  if (base.match(/\brusse\b|\brussian\b/)) return "🇷🇺";
-  if (base.match(/\bjaponais\b|\bjapanese\b/)) return "🇯🇵";
-  if (base.match(/\bcoréen\b|\bcoreen\b|\bkorean\b/)) return "🇰🇷";
-  if (base.match(/\bhindi\b|\bhindou\b/)) return "🇮🇳";
-  if (base.match(/\bturc\b|\bturkish\b/)) return "🇹🇷";
-
-  return "🌐";
-}
-
-// 🌐 Parse le champ langLine en { flag, text }[]
-function parseLangLine(langLine: string): { flag: string; text: string }[] {
-  if (!langLine) return [];
-  const parts = langLine
-    .split("·")
-    .join("|")
-    .split(",")
-    .join("|")
-    .split("|")
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
-
-  return parts.map((part) => ({
-    flag: getFlagEmoji(part),
-    text: part,
-  }));
-}
-
-// 🎯 Emoji pour les hobbies
-function getHobbyEmoji(hobby: string): string {
-  const p = hobby.toLowerCase();
-  if (p.includes("football") || p.includes("foot")) return "⚽";
-  if (p.includes("basket") || p.includes("basketball")) return "🏀";
-  if (p.includes("sport") || p.includes("fitness") || p.includes("gym"))
-    return "💪";
-  if (p.includes("musique") || p.includes("guitare") || p.includes("piano"))
-    return "🎵";
-  if (p.includes("lecture") || p.includes("livre")) return "📚";
-  if (p.includes("cinéma") || p.includes("cinema") || p.includes("film"))
-    return "🎬";
-  if (p.includes("jeu vidéo") || p.includes("jeux vidéo") || p.includes("gaming"))
-    return "🎮";
-  if (p.includes("voyage") || p.includes("travel")) return "✈️";
-  if (p.includes("cuisine") || p.includes("cooking")) return "🍳";
-  if (p.includes("photo") || p.includes("photographie")) return "📸";
-  if (p.includes("dessin") || p.includes("peinture") || p.includes("art"))
-    return "🎨";
-  if (p.includes("randonnée") || p.includes("rando") || p.includes("hiking"))
-    return "🥾";
-  return "⭐";
-}
-
-// --- RADAR GÉNÉRIQUE (multi-métiers, robuste) ---
-
-type RadarAxisDef = {
-  id: string;
-  label: string;
-  keywords: string[];
-};
-
-const DOMAIN_AXES: RadarAxisDef[] = [
-  {
-    id: "finance",
-    label: "Finance & Contrôle",
-    keywords: [
-      "finance",
-      "financier",
-      "controle de gestion",
-      "contrôle de gestion",
-      "controle interne",
-      "contrôle interne",
-      "audit",
-      "conformite",
-      "conformité",
-      "risque",
-      "risques",
-      "reporting",
-      "budget",
-      "bilan",
-      "comptable",
-      "tresorerie",
-      "trésorerie",
-      "analyse financiere",
-      "analyse financière",
-      "cfa",
-      "ifrs",
-    ],
-  },
-  {
-    id: "it_dev",
-    label: "IT & Développement",
-    keywords: [
-      "developpement",
-      "développement",
-      "javascript",
-      "typescript",
-      "python",
-      "java",
-      "c++",
-      "c#",
-      "php",
-      "go",
-      "react",
-      "node",
-      "angular",
-      "vue",
-      "api",
-      "application",
-      "fullstack",
-      "frontend",
-      "backend",
-      "devops",
-      "git",
-      "docker",
-      "kubernetes",
-    ],
-  },
-  {
-    id: "cyber",
-    label: "Cybersécurité & Réseaux",
-    keywords: [
-      "cyber",
-      "cybersecurite",
-      "cybersécurité",
-      "pentest",
-      "penetration test",
-      "vulnerabilite",
-      "vulnérabilité",
-      "soc",
-      "firewall",
-      "pare feu",
-      "pare-feu",
-      "vpn",
-      "ids",
-      "ips",
-      "wireshark",
-      "nmap",
-      "kali",
-      "siem",
-      "owasp",
-    ],
-  },
-  {
-    id: "data",
-    label: "Data & Analytics",
-    keywords: [
-      "data",
-      "donnees",
-      "données",
-      "sql",
-      "power bi",
-      "tableau",
-      "statistique",
-      "statistiques",
-      "machine learning",
-      "intelligence artificielle",
-      "ia ",
-      "analyse de donnees",
-      "analyse de données",
-      "data analyst",
-      "data engineer",
-      "pandas",
-      "numpy",
-    ],
-  },
-  {
-    id: "marketing",
-    label: "Marketing & Communication",
-    keywords: [
-      "marketing",
-      "communication",
-      "social media",
-      "réseaux sociaux",
-      "reseaux sociaux",
-      "seo",
-      "sea",
-      "content",
-      "contenu",
-      "campagne",
-      "publicite",
-      "publicité",
-      "branding",
-      "influence",
-      "community manager",
-    ],
-  },
-  {
-    id: "sales",
-    label: "Commerce & Vente",
-    keywords: [
-      "commercial",
-      "vente",
-      "business developer",
-      "account manager",
-      "prospection",
-      "negociation",
-      "négociation",
-      "pipeline",
-      "portefeuille clients",
-      "chiffre d affaires",
-      "ca ",
-      "b2b",
-      "b2c",
-    ],
-  },
-  {
-    id: "hr",
-    label: "RH & Recrutement",
-    keywords: [
-      "ressources humaines",
-      "rh",
-      "recrutement",
-      "onboarding",
-      "formation",
-      "gestion du personnel",
-      "talent acquisition",
-      "people",
-      "paie",
-      "gestion des talents",
-    ],
-  },
-  {
-    id: "project",
-    label: "Gestion de projet",
-    keywords: [
-      "chef de projet",
-      "gestion de projet",
-      "project manager",
-      "planning",
-      "pilotage",
-      "agile",
-      "scrum",
-      "kanban",
-      "coordination",
-      "roadmap",
-      "livrable",
-      "livrables",
-      "planning",
-    ],
-  },
-  {
-    id: "ops",
-    label: "Opérations & Logistique",
-    keywords: [
-      "logistique",
-      "supply chain",
-      "transport",
-      "flux",
-      "optimisation des processus",
-      "lean",
-      "maintenance",
-      "production",
-      "magasinier",
-      "preparation de commandes",
-      "exploitation",
-    ],
-  },
-  {
-    id: "health",
-    label: "Santé & Social",
-    keywords: [
-      "infirmier",
-      "infirmière",
-      "aide soignant",
-      "aide-soignant",
-      "medecin",
-      "médecin",
-      "paramedical",
-      "paramédical",
-      "social",
-      "accompagnement",
-      "patients",
-      "soins",
-      "assistante sociale",
-      "assistant social",
-      "ehpad",
-    ],
-  },
-  {
-    id: "education",
-    label: "Éducation & Formation",
-    keywords: [
-      "enseignant",
-      "professeur",
-      "formateur",
-      "formatrice",
-      "pedagogie",
-      "pédagogie",
-      "cours",
-      "formation",
-      "apprentissage",
-      "eleves",
-      "élèves",
-      "etudiants",
-      "étudiants",
-      "éducation",
-    ],
-  },
-];
-
-const DOMAIN_CORE_KEYWORDS: Record<string, string[]> = {
-  finance: [
-    "comptable",
-    "controle de gestion",
-    "contrôle de gestion",
-    "controle interne",
-    "contrôle interne",
-    "audit",
-    "bilan",
-    "compte de resultat",
-    "compte de résultat",
-    "tresorerie",
-    "trésorerie",
-    "analyse financiere",
-    "analyse financière",
-    "cfa",
-    "ifrs",
-  ],
-  it_dev: [
-    "developpement",
-    "développement",
-    "javascript",
-    "typescript",
-    "python",
-    "java",
-    "c++",
-    "c#",
-    "php",
-    "react",
-    "node",
-    "angular",
-    "vue",
-    "fullstack",
-    "frontend",
-    "backend",
-    "devops",
-    "docker",
-    "kubernetes",
-  ],
-  cyber: [
-    "pentest",
-    "penetration test",
-    "wireshark",
-    "nmap",
-    "kali",
-    "ids",
-    "ips",
-    "soc",
-    "siem",
-    "owasp",
-    "firewall",
-    "pare feu",
-    "pare-feu",
-  ],
-  data: [
-    "data analyst",
-    "data engineer",
-    "power bi",
-    "tableau",
-    "sql",
-    "pandas",
-    "numpy",
-    "machine learning",
-    "intelligence artificielle",
-  ],
-  marketing: [
-    "seo",
-    "sea",
-    "community manager",
-    "social media",
-    "campagne",
-    "branding",
-    "communication digitale",
-  ],
-  sales: [
-    "business developer",
-    "account manager",
-    "commercial",
-    "prospection",
-    "negociation",
-    "négociation",
-    "pipeline",
-  ],
-  hr: [
-    "ressources humaines",
-    "rh",
-    "recrutement",
-    "talent acquisition",
-    "gestion de la paie",
-    "gestion du personnel",
-  ],
-  project: [
-    "chef de projet",
-    "project manager",
-    "scrum master",
-    "agile",
-    "gestion de projet",
-  ],
-  ops: [
-    "supply chain",
-    "logistique",
-    "exploitation",
-    "maintenance",
-    "production",
-  ],
-  health: [
-    "infirmier",
-    "infirmière",
-    "medecin",
-    "médecin",
-    "aide soignant",
-    "aide-soignant",
-    "soins",
-    "patients",
-  ],
-  education: [
-    "enseignant",
-    "professeur",
-    "formateur",
-    "formatrice",
-    "pedagogie",
-    "pédagogie",
-    "eleves",
-    "élèves",
-    "etudiants",
-    "étudiants",
-  ],
-};
-
-const SOFT_SKILLS_KEYWORDS = [
-  "communication",
-  "travail en equipe",
-  "travail en équipe",
-  "collaboration",
-  "autonome",
-  "autonomie",
-  "rigoureux",
-  "rigoureuse",
-  "organise",
-  "organisé",
-  "organisee",
-  "organisée",
-  "adaptabilite",
-  "adaptabilité",
-  "gestion du stress",
-  "leadership",
-  "esprit d analyse",
-  "esprit d'analyse",
-  "empathie",
-  "relationnel",
-];
-
-function countHits(keywords: string[], text: string): number {
-  let hits = 0;
-  for (const k of keywords) {
-    const normK = normalizeText(k);
-    if (text.includes(normK)) hits++;
-  }
-  return hits;
-}
-
-function scaleScore(hits: number): number {
-  if (hits <= 0) return 3;
-  if (hits === 1) return 5;
-  if (hits === 2) return 7;
-  if (hits === 3) return 9;
-  return 10;
-}
-
-// 🔎 construit les données du radar à partir du profil (générique multi-métiers)
-function buildRadarData(profile: CvProfile | null) {
-  const defaultLabels = [
-    "Analyse / Résolution",
-    "Organisation & Processus",
-    "Outils & Tech",
-    "Apprentissage",
-    "Soft skills",
-  ];
-
-  if (!profile) {
-    return { labels: defaultLabels, data: [3, 3, 3, 3, 3] };
-  }
-
-  const rawText =
-    JSON.stringify(profile.skills.sections || "") +
-    JSON.stringify(profile.skills.tools || "") +
-    JSON.stringify(profile.experiences || "") +
-    JSON.stringify(profile.education || "") +
-    (profile.profileSummary || "") +
-    (profile.contractType || "") +
-    (profile.certs || "") +
-    (profile.langLine || "");
-
-  const lower = normalizeText(rawText);
-
-  const aiDomainIds: string[] = [];
-  if (profile.primaryDomain && profile.primaryDomain !== "autre") {
-    aiDomainIds.push(profile.primaryDomain);
-  }
-  if (Array.isArray(profile.secondaryDomains)) {
-    for (const d of profile.secondaryDomains) {
-      if (d && d !== "autre" && !aiDomainIds.includes(d)) {
-        aiDomainIds.push(d);
-      }
-    }
-  }
-
-  let relevant: {
-    axis: RadarAxisDef;
-    totalHits: number;
-    coreHits: number;
-    score: number;
-  }[] = [];
-
-  if (aiDomainIds.length > 0) {
-    relevant = aiDomainIds
-      .map((id) => {
-        const axis = DOMAIN_AXES.find((a) => a.id === id);
-        if (!axis) return null;
-
-        const totalHits = countHits(axis.keywords, lower);
-        const coreKeywords = DOMAIN_CORE_KEYWORDS[axis.id] || axis.keywords;
-        const coreHits = countHits(coreKeywords, lower);
-
-        const rawHits = Math.max(totalHits, coreHits);
-        const score = scaleScore(rawHits);
-
-        return { axis, totalHits, coreHits, score };
-      })
-      .filter(
-        (
-          x
-        ): x is {
-          axis: RadarAxisDef;
-          totalHits: number;
-          coreHits: number;
-          score: number;
-        } => !!x
-      );
-  } else {
-    const domainScores = DOMAIN_AXES.map((axis) => {
-      const totalHits = countHits(axis.keywords, lower);
-      const coreKeywords = DOMAIN_CORE_KEYWORDS[axis.id] || axis.keywords;
-      const coreHits = countHits(coreKeywords, lower);
-
-      const isRelevant = coreHits > 0 && totalHits > 0;
-      const score = isRelevant ? scaleScore(totalHits) : 0;
-
-      return { axis, totalHits, coreHits, isRelevant, score };
-    });
-
-    relevant = domainScores
-      .filter((d) => d.isRelevant)
-      .sort((a, b) => b.totalHits - a.totalHits)
-      .slice(0, 4);
-  }
-
-  let softHits = countHits(SOFT_SKILLS_KEYWORDS, lower);
-  const softSkillsCount = Array.isArray(profile.softSkills)
-    ? profile.softSkills.length
-    : 0;
-
-  if (softSkillsCount > 0) {
-    softHits += Math.min(4, Math.floor(softSkillsCount / 2));
-  }
-
-  const softScore = scaleScore(softHits);
-
-  if (!relevant.length) {
-    const generic = [
-      scaleScore(countHits(["analyse", "diagnostic"], lower)),
-      scaleScore(countHits(["processus", "organisation"], lower)),
-      scaleScore(countHits(["outil", "logiciel", "technique"], lower)),
-      scaleScore(countHits(["apprentissage", "formation", "veille"], lower)),
-    ];
-    return {
-      labels: defaultLabels,
-      data: [...generic, softScore],
-    };
-  }
-
-  const labels = relevant.map((r) => r.axis.label).concat("Soft skills");
-  const data = relevant.map((r) => r.score).concat(softScore);
-
-  console.debug(
-    "[Radar IA] Domaines retenus :",
-    relevant.map((r) => ({
-      id: r.axis.id,
-      label: r.axis.label,
-      hits: r.totalHits,
-      score: r.score,
-    })),
-    "SoftSkillsCount:",
-    softSkillsCount,
-    "SoftScore:",
-    softScore
-  );
-
-  return { labels, data };
-}
-
-// Items pour la navigation rapide
-const navItems = [
-  { id: "infos-personnelles", label: "Infos & CV" },
-  { id: "competences", label: "Compétences & Outils" },
-  { id: "experience", label: "Expérience" },
-  { id: "formation", label: "Formation & Certifs" },
-  { id: "langues", label: "Langues" },
-  { id: "hobbies", label: "Centres d'intérêt" },
-];
-
-type ActiveModal =
-  | "infos"
-  | "skills"
-  | "experience"
-  | "education"
-  | "languages"
-  | "hobbies"
-  | null;
-
-type ExperienceDraft = {
-  company: string;
-  role: string;
-  dates: string;
-  bulletsText: string;
-};
-
-type EducationDraft = {
-  school: string;
-  degree: string;
-  dates: string;
-  location: string;
-};
-
-type LanguageDraft = {
-  language: string;
-  level: string;
-};
-
-const LANGUAGE_OPTIONS = [
-  "Français",
-  "Anglais",
-  "Espagnol",
-  "Allemand",
-  "Italien",
-  "Portugais",
-  "Néerlandais",
-  "Arabe",
-  "Russe",
-  "Chinois (Mandarin)",
-  "Japonais",
-  "Coréen",
-  "Hindi",
-  "Turc",
-];
-
-const LANGUAGE_LEVEL_OPTIONS = [
-  "Natif / Bilingue (C2)",
-  "Courant (C1)",
-  "Intermédiaire (B2)",
-  "Opérationnel (B1)",
-  "Débutant (A2 - A1)",
-];
-
-const CERTIFICATION_OPTIONS = [
-  "TOEIC",
-  "TOEFL",
-  "IELTS",
-  "CCNA",
-  "CCNP",
-  "CompTIA Security+",
-  "CompTIA Network+",
-  "AWS Cloud Practitioner",
-  "AWS Solutions Architect Associate",
-  "Azure AZ-900",
-  "Azure AZ-104",
-  "Azure AZ-500",
-  "Azure SC-900",
-  "Azure MS-900",
-  "Google Cloud Digital Leader",
-  "PMI PMP",
-  "Prince2 Foundation",
-  "Prince2 Practitioner",
-  "ITIL Foundation",
-  "CFA Niveau 1",
-  "AMF",
-  "Tosa Excel",
-];
-
-const HOBBY_OPTIONS = [
-  "Voyage",
-  "Lecture",
-  "Musique",
-  "Piano",
-  "Guitare",
-  "Sport (Football)",
-  "Sport (Basketball)",
-  "Fitness / Musculation",
-  "Course à pied",
-  "Randonnée",
-  "Natation",
-  "Cinéma",
-  "Séries",
-  "Jeux vidéo",
-  "Photographie",
-  "Cuisine",
-  "Pâtisserie",
-  "Dessin",
-  "Peinture",
-  "Art digital",
-  "Bénévolat",
-  "Entrepreneuriat",
-  "Technologie / veille tech",
-  "Échecs",
-  "Podcasts",
-];
-
-const CONTRACT_TYPE_OPTIONS = [
-  "CDI",
-  "CDD",
-  "Intérim",
-  "Alternance",
-  "Stage",
-  "Freelance",
-  "Temps plein",
-  "Temps partiel",
-  "Indépendant",
-  "Contrat pro",
-];
-
-// --- COMPOSANT PRINCIPAL ---
-
-export default function DashboardPage() {
-  const [file, setFile] = useState<File | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [profile, setProfile] = useState<CvProfile | null>(null);
-
-  const radarCanvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  const [userId, setUserId] = useState<string | null>(null);
-  const [userEmail, setUserEmail] = useState<string | null>(null);
-  const [loadingProfileFromDb, setLoadingProfileFromDb] =
-    useState<boolean>(true);
-
-  const [dashboardCounts, setDashboardCounts] = useState<DashboardCounts>({
-    totalApps: 0,
-    cvCount: 0,
-    lmCount: 0,
-  });
-  const [loadingCounts, setLoadingCounts] = useState<boolean>(true);
-
-  // --- ÉTATS MODALES ---
-
-  const [activeModal, setActiveModal] = useState<ActiveModal>(null);
-
-  const [infosDraft, setInfosDraft] = useState({
-    fullName: "",
-    email: "",
-    phone: "",
-    linkedin: "",
-    contractType: "",
-    profileSummary: "",
-    drivingLicense: "",
-    vehicle: "",
-    address: "",
-  });
-
-  const [skillsSectionsText, setSkillsSectionsText] = useState("");
-  const [skillsToolsText, setSkillsToolsText] = useState("");
-
-  const [experiencesDraft, setExperiencesDraft] = useState<ExperienceDraft[]>(
-    []
-  );
-
-  const [educationDrafts, setEducationDrafts] = useState<EducationDraft[]>([]);
-  const [certsList, setCertsList] = useState<string[]>([]);
-  const [certInput, setCertInput] = useState("");
-
-  const [languagesDraft, setLanguagesDraft] = useState<LanguageDraft[]>([]);
-  const [hobbiesList, setHobbiesList] = useState<string[]>([]);
-  const [hobbyInput, setHobbyInput] = useState("");
-
-  const { user } = useAuth();
-  const { profile: accountProfile, loading: loadingAccountProfile } =
-    useUserProfile();
-  const remainingCredits = accountProfile?.credits ?? 0;
-  const isBlocked = accountProfile?.blocked === true;
-
-  // 🔐 Auth + chargement du profil Firestore + stats candidatures
-  useEffect(() => {
-    let unsubApps: (() => void) | null = null;
-
-    const unsubAuth = onAuthStateChanged(auth, async (user) => {
-      if (unsubApps) {
-        unsubApps();
-        unsubApps = null;
-      }
-
-      if (!user) {
-        setUserId(null);
-        setUserEmail(null);
-        setProfile(null);
-        setLoadingProfileFromDb(false);
-        setDashboardCounts({ totalApps: 0, cvCount: 0, lmCount: 0 });
-        setLoadingCounts(false);
-        return;
-      }
-
-      setUserId(user.uid);
-      setUserEmail(user.email ?? null);
-
-      // --- Chargement du profil
-      try {
-        const ref = doc(db, "profiles", user.uid);
-        const snap = await getDoc(ref);
-        if (snap.exists()) {
-          const data = snap.data() as any;
-
-          const loadedProfile: CvProfile = {
-            fullName: data.fullName || "",
-            email: data.email || "",
-            phone: data.phone || "",
-            linkedin: data.linkedin || "",
-            profileSummary: data.profileSummary || "",
-            city: data.city || "",
-            address: data.address || "",
-            contractType: data.contractType || data.contractTypeStandard || "",
-            contractTypeStandard: data.contractTypeStandard || "",
-            contractTypeFull: data.contractTypeFull || "",
-            primaryDomain: data.primaryDomain || "",
-            secondaryDomains: Array.isArray(data.secondaryDomains)
-              ? data.secondaryDomains
-              : [],
-            softSkills: Array.isArray(data.softSkills)
-              ? data.softSkills
-              : [],
-            drivingLicense: data.drivingLicense || "",
-            vehicle: data.vehicle || "",
-            skills: {
-              sections: Array.isArray(data.skills?.sections)
-                ? data.skills.sections
-                : [],
-              tools: Array.isArray(data.skills?.tools)
-                ? data.skills.tools
-                : [],
-            },
-            experiences: Array.isArray(data.experiences)
-              ? data.experiences
-              : [],
-            education: Array.isArray(data.education)
-              ? data.education
-              : [],
-            educationShort: Array.isArray(data.educationShort)
-              ? data.educationShort
-              : [],
-            certs: data.certs || "",
-            langLine: data.langLine || "",
-            hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
-            updatedAt:
-              typeof data.updatedAt === "number" ? data.updatedAt : undefined,
-          };
-
-          setProfile(loadedProfile);
-        } else {
-          setProfile(null);
-        }
-      } catch (e) {
-        console.error("Erreur chargement profil Firestore:", e);
-      } finally {
-        setLoadingProfileFromDb(false);
-      }
-
-      // --- Stats candidatures (CV générés, LM générées, candidatures suivies)
-      setLoadingCounts(true);
-
-      const q = query(
-        collection(db, "applications"),
-        where("userId", "==", user.uid)
-      );
-
-      unsubApps = onSnapshot(
-        q,
-        (snap) => {
-          let totalApps = 0;
-          let cvCount = 0;
-          let lmCount = 0;
-
-          snap.docs.forEach((docSnap) => {
-            const data = docSnap.data() as any;
-            totalApps++;
-            if (data.hasCv) cvCount++;
-            if (data.hasLm) lmCount++;
-          });
-
-          setDashboardCounts({ totalApps, cvCount, lmCount });
-          setLoadingCounts(false);
-        },
-        (err) => {
-          console.error("Erreur chargement stats dashboard:", err);
-          setLoadingCounts(false);
-        }
-      );
-    });
-
-    return () => {
-      if (unsubApps) {
-        unsubApps();
-      }
-      unsubAuth();
-    };
-  }, []);
-
-  // 💾 sauvegarde du profil en base (Firestore)
-  const saveProfileToDb = async (p: CvProfile) => {
-    if (!userId) return;
-    const ref = doc(db, "profiles", userId);
-    const payload = {
-      ...p,
-      ownerUid: userId,
-      ownerEmail: userEmail ?? null,
-      updatedAt: Date.now(),
-    };
-    await setDoc(ref, payload, { merge: true });
-  };
-
-  // 🎯 Radar Chart
-  useEffect(() => {
-    if (!radarCanvasRef.current || !profile) return;
-
-    const ctx = radarCanvasRef.current.getContext("2d");
-    if (!ctx) return;
-
-    const existingChart = Chart.getChart(ctx as any);
-    if (existingChart) {
-      existingChart.destroy();
-    }
-
-    const { labels, data } = buildRadarData(profile);
-
-    const chartInstance = new Chart(ctx, {
-      type: "radar",
-      data: {
-        labels,
-        datasets: [
-          {
-            label: "Niveau estimé",
-            data,
-            backgroundColor: "rgba(56, 189, 248, 0.25)",
-            borderColor: "rgba(56, 189, 248, 0.9)",
-            borderWidth: 2,
-            pointBackgroundColor: "rgba(56, 189, 248, 1)",
-            pointRadius: 3,
-          },
-        ],
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        scales: {
-          r: {
-            beginAtZero: true,
-            min: 0,
-            max: 10,
-            ticks: {
-              stepSize: 2,
-              showLabelBackdrop: false,
-              display: false,
-            },
-            grid: {
-              color: "rgba(148, 163, 184, 0.35)",
-            },
-            angleLines: {
-              color: "rgba(148, 163, 184, 0.35)",
-            },
-            pointLabels: {
-              font: { size: 11 },
-              color: "#e5e7eb",
-            },
-          },
-        },
-        plugins: {
-          legend: {
-            display: false,
-          },
-        },
-      },
-    });
-
-    return () => {
-      chartInstance.destroy();
-    };
-  }, [profile]);
-
-  // --- UPLOAD CV ---
-
-  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
-    setError(null);
-    const f = e.target.files?.[0];
-    if (!f) return;
-
-    if (!f.type.includes("pdf")) {
-      setError("Merci d'importer un CV au format PDF.");
-      return;
-    }
-
-    setFile(f);
-  };
-
-  const fileToBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onerror = () =>
-        reject(new Error("Impossible de lire le fichier."));
-      reader.onload = () => {
-        const result = reader.result as string;
-        const base64 = result.split(",")[1];
-        if (!base64) {
-          reject(new Error("Encodage base64 invalide."));
-        } else {
-          resolve(base64);
-        }
-      };
-      reader.readAsDataURL(file);
-    });
-  };
-
-  const handleUpload = async () => {
-    if (!file) {
-      setError("Choisis d'abord un CV au format PDF.");
-      return;
-    }
-
-    if (!user) {
-      setError("Tu dois être connecté pour analyser ton CV.");
-      return;
-    }
-
-    if (loadingAccountProfile) {
-      setError(
-        "Ton profil utilisateur est en cours de chargement, réessaie dans un instant."
-      );
-      return;
-    }
-
-    if (isBlocked) {
-      setError(
-        "Ton compte est bloqué. Contacte l'administrateur pour en savoir plus."
-      );
-      return;
-    }
-
-    const cost = 1; // 💰 coût d'une analyse de CV
-    if (remainingCredits < cost) {
-      setError(
-        "Tu n'as plus assez de crédits pour analyser un CV. Contacte l'administrateur."
-      );
-      return;
-    }
-
-    setError(null);
-    setUploading(true);
-
-    try {
-      // 1) Consommation des crédits (transaction Firestore)
-      await consumeCredits(user.uid, cost);
-
-      // 2) Log d'usage
-      await logUsage(user, "cv_analyze", {
-        fileName: file.name,
-        fileSize: file.size,
-        feature: "dashboard-cv-upload",
-      });
-
-      // 3) Appel de la Cloud Function d'extraction
-      const base64Pdf = await fileToBase64(file);
-
-      const res = await fetch(WORKER_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ base64Pdf }),
-      });
-
-      const json = await res.json().catch(() => null);
-
-      if (!res.ok) {
-        const msg = (json && json.error) || "Erreur pendant l'analyse du CV.";
-        throw new Error(msg);
-      }
-
-      const now = Date.now();
-      const rawProfile = json?.profile ?? json;
-
-      const receivedProfile: CvProfile = {
-        fullName: rawProfile.fullName || "",
-        email: rawProfile.email || "",
-        phone: rawProfile.phone || "",
-        linkedin: rawProfile.linkedin || "",
-        profileSummary: rawProfile.profileSummary || "",
-        city: rawProfile.city || "",
-        address: rawProfile.address || "",
-        contractType:
-          rawProfile.contractType || rawProfile.contractTypeStandard || "",
-        contractTypeStandard: rawProfile.contractTypeStandard || "",
-        contractTypeFull: rawProfile.contractTypeFull || "",
-        primaryDomain: rawProfile.primaryDomain || "",
-        secondaryDomains: Array.isArray(rawProfile.secondaryDomains)
-          ? rawProfile.secondaryDomains
-          : [],
-        softSkills: Array.isArray(rawProfile.softSkills)
-          ? rawProfile.softSkills
-          : [],
-        drivingLicense: rawProfile.drivingLicense || "",
-        vehicle: rawProfile.vehicle || "",
-        skills: {
-          sections: Array.isArray(rawProfile.skills?.sections)
-            ? rawProfile.skills.sections
-            : [],
-          tools: Array.isArray(rawProfile.skills?.tools)
-            ? rawProfile.skills.tools
-            : [],
-        },
-        experiences: Array.isArray(rawProfile.experiences)
-          ? rawProfile.experiences
-          : [],
-        education: Array.isArray(rawProfile.education)
-          ? rawProfile.education
-          : [],
-        educationShort: Array.isArray(rawProfile.educationShort)
-          ? rawProfile.educationShort
-          : [],
-        certs: rawProfile.certs || "",
-        langLine: rawProfile.langLine || "",
-        hobbies: Array.isArray(rawProfile.hobbies)
-          ? rawProfile.hobbies
-          : [],
-        updatedAt: now,
-      };
-
-      setProfile(receivedProfile);
-
-      if (userId) {
-        await saveProfileToDb(receivedProfile);
-      }
-    } catch (err: any) {
-      console.error(err);
-      if (err instanceof Error) {
-        if (err.message === "NOT_ENOUGH_CREDITS") {
-          setError(
-            "Tu n'as plus assez de crédits pour analyser un CV. Contacte l'administrateur."
-          );
-        } else if (err.message === "USER_BLOCKED") {
-          setError(
-            "Ton compte est bloqué. Contacte l'administrateur pour en savoir plus."
-          );
-        } else if (err.message === "USER_DOC_NOT_FOUND") {
-          setError(
-            "Profil utilisateur introuvable dans la base. Contacte l'administrateur."
-          );
-        } else {
-          setError(
-            err.message || "Impossible d'analyser ton CV pour le moment."
-          );
-        }
-      } else {
-        setError("Impossible d'analyser ton CV pour le moment.");
-      }
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  // --- MODALES : OUVERTURE ---
-
-  const openInfosModal = () => {
-    if (!profile) return;
-    setInfosDraft({
-      fullName: profile.fullName,
-      email: profile.email || userEmail || "",
-      phone: profile.phone || "",
-      linkedin: profile.linkedin || "",
-      contractType:
-        profile.contractType || profile.contractTypeStandard || "",
-      profileSummary: profile.profileSummary || "",
-      drivingLicense: profile.drivingLicense || "",
-      vehicle: profile.vehicle || "",
-      address: profile.address || profile.city || "",
-    });
-    setActiveModal("infos");
-  };
-
-  const openSkillsModal = () => {
-    if (!profile) return;
-    const sectionsText = (profile.skills.sections || [])
-      .map((sec) => `${sec.title}: ${sec.items.join(", ")}`)
-      .join("\n");
-    const toolsText = (profile.skills.tools || []).join(", ");
-
-    setSkillsSectionsText(sectionsText);
-    setSkillsToolsText(toolsText);
-    setActiveModal("skills");
-  };
-
-  const openExperienceModal = () => {
-    if (!profile) return;
-    const drafts: ExperienceDraft[] =
-      profile.experiences?.map((exp) => ({
-        company: exp.company || "",
-        role: exp.role || "",
-        dates: exp.dates || "",
-        bulletsText: (exp.bullets || []).join("\n"),
-      })) || [];
-
-    if (drafts.length === 0) {
-      drafts.push({ company: "", role: "", dates: "", bulletsText: "" });
-    }
-
-    setExperiencesDraft(drafts);
-    setActiveModal("experience");
-  };
-
-  const addExperienceDraft = () => {
-    setExperiencesDraft((prev) => [
-      ...prev,
-      { company: "", role: "", dates: "", bulletsText: "" },
-    ]);
-  };
-
-  const updateExperienceDraft = (
-    index: number,
-    field: keyof ExperienceDraft,
-    value: string
-  ) => {
-    setExperiencesDraft((prev) =>
-      prev.map((exp, i) =>
-        i === index
-          ? {
-              ...exp,
-              [field]: value,
-            }
-          : exp
-      )
-    );
-  };
-
-  const openEducationModal = () => {
-    if (!profile) return;
-
-    const drafts: EducationDraft[] =
-      Array.isArray(profile.education) && profile.education.length > 0
-        ? profile.education.map((edu) => ({
-            school: edu.school || "",
-            degree: edu.degree || "",
-            dates: edu.dates || "",
-            location: (edu as any).location || "",
-          }))
-        : [
-            {
-              school: "",
-              degree: "",
-              dates: "",
-              location: "",
-            },
-          ];
-
-    setEducationDrafts(drafts);
-
-    const list =
-      profile.certs
-        ?.split(/[,\n]/)
-        .map((c: string) => c.trim())
-        .filter((c: string) => c.length > 0) || [];
-    setCertsList(list);
-    setCertInput("");
-
-    setActiveModal("education");
-  };
-
-  const addEducationDraft = () => {
-    setEducationDrafts((prev) => [
-      ...prev,
-      { school: "", degree: "", dates: "", location: "" },
-    ]);
-  };
-
-  const updateEducationDraft = (
-    index: number,
-    field: keyof EducationDraft,
-    value: string
-  ) => {
-    setEducationDrafts((prev) =>
-      prev.map((edu, i) =>
-        i === index
-          ? {
-              ...edu,
-              [field]: value,
-            }
-          : edu
-      )
-    );
-  };
-
-  const openLanguagesModal = () => {
-    if (!profile) return;
-
-    const parsed = parseLangLine(profile.langLine || "");
-    let drafts: LanguageDraft[] = [];
-
-    if (parsed.length > 0) {
-      drafts = parsed.map((p) => {
-        const txt = p.text;
-        const match = txt.match(/^(.*?)\s*\((.*)\)$/);
-        if (match) {
-          return {
-            language: match[1].trim(),
-            level: match[2].trim(),
-          };
-        }
-        return {
-          language: txt,
-          level: "",
-        };
-      });
-    }
-
-    if (drafts.length === 0) {
-      drafts = [{ language: "", level: "" }];
-    }
-
-    setLanguagesDraft(drafts);
-    setActiveModal("languages");
-  };
-
-  const openHobbiesModal = () => {
-    if (!profile) return;
-    setHobbiesList(profile.hobbies || []);
-    setHobbyInput("");
-    setActiveModal("hobbies");
-  };
-
-  // --- MODALES : SAUVEGARDE ---
-
-  const handleModalSave = async (e?: FormEvent) => {
-    if (e) e.preventDefault();
-    if (!profile || !activeModal) {
-      setActiveModal(null);
-      return;
-    }
-
-    let updated: CvProfile = { ...profile };
-
-    if (activeModal === "infos") {
-      updated = {
-        ...profile,
-        fullName: infosDraft.fullName.trim(),
-        email: infosDraft.email.trim(),
-        phone: infosDraft.phone.trim(),
-        linkedin: infosDraft.linkedin.trim(),
-        contractType: infosDraft.contractType.trim(),
-        profileSummary: infosDraft.profileSummary.trim(),
-        drivingLicense: infosDraft.drivingLicense.trim(),
-        vehicle: infosDraft.vehicle.trim(),
-        address: infosDraft.address.trim(),
-        city:
-          infosDraft.address.trim().split(",")[0].trim() ||
-          profile.city ||
-          "",
-      };
-    }
-
-    if (activeModal === "skills") {
-      const sections: CvSkillsSection[] = skillsSectionsText
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean)
-        .map((line) => {
-          const [titlePart, itemsPart] = line.split(":");
-          const title = (titlePart || "Compétences").trim();
-          const items = itemsPart
-            ? itemsPart
-                .split(",")
-                .map((s) => s.trim())
-                .filter(Boolean)
-            : [];
-          return { title, items };
-        });
-
-      const tools = skillsToolsText
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean);
-
-      updated = {
-        ...profile,
-        skills: {
-          sections,
-          tools,
-        },
-      };
-    }
-
-    if (activeModal === "experience") {
-      const experiences: CvExperience[] = experiencesDraft
-        .map((d) => ({
-          company: d.company.trim(),
-          role: d.role.trim(),
-          dates: d.dates.trim(),
-          bullets: d.bulletsText
-            .split("\n")
-            .map((b) => b.trim())
-            .filter(Boolean),
-        }))
-        .filter(
-          (exp) =>
-            exp.company || exp.role || exp.dates || exp.bullets.length > 0
-        );
-
-      updated = {
-        ...profile,
-        experiences,
-      };
-    }
-
-    if (activeModal === "education") {
-      const education: CvEducation[] = educationDrafts
-        .map((d) => ({
-          school: d.school.trim(),
-          degree: d.degree.trim(),
-          dates: d.dates.trim(),
-          location: d.location.trim(),
-        }))
-        .filter(
-          (e) => e.school || e.degree || e.dates || (e.location ?? "").length
-        );
-
-      const educationShort = education.map((e) => {
-        const parts: string[] = [];
-        if (e.dates) parts.push(e.dates);
-        let main = "";
-        if (e.degree && e.school) main = `${e.degree} – ${e.school}`;
-        else if (e.degree) main = e.degree;
-        else if (e.school) main = e.school;
-        if (main) parts.push(main);
-        if (e.location) {
-          if (parts.length > 1) {
-            parts[parts.length - 1] = `${parts[parts.length - 1]} (${e.location})`;
-          } else {
-            parts.push(`(${e.location})`);
-          }
-        }
-        return parts.join(" · ");
-      });
-
-      const certsJoined = certsList.join(", ");
-
-      updated = {
-        ...profile,
-        education,
-        educationShort,
-        certs: certsJoined,
-      };
-    }
-
-    if (activeModal === "languages") {
-      const cleaned = languagesDraft
-        .map((l) => ({
-          language: l.language.trim(),
-          level: l.level.trim(),
-        }))
-        .filter((l) => l.language.length > 0);
-
-      const langLine = cleaned
-        .map((l) =>
-          l.level ? `${l.language} (${l.level})` : `${l.language}`
-        )
-        .join(" · ");
-
-      updated = {
-        ...profile,
-        langLine,
-      };
-    }
-
-    if (activeModal === "hobbies") {
-      const hobbies = hobbiesList
-        .map((h) => h.trim())
-        .filter((h) => h.length > 0);
-      updated = {
-        ...profile,
-        hobbies,
-      };
-    }
-
-    setProfile(updated);
-    if (userId) {
-      await saveProfileToDb(updated);
-    }
-    setActiveModal(null);
-  };
-
-  const handleModalCancel = () => {
-    setActiveModal(null);
-  };
-
-  const headline =
-    profile?.profileSummary?.split(".")[0] ||
-    (profile?.contractType
-      ? profile.contractType
-      : "Profil en cours de configuration");
-
-  const updatedLabel = profile?.updatedAt
-    ? `Profil mis à jour le ${formatUpdatedAt(profile.updatedAt)}`
-    : "Profil non encore enregistré";
-
-  const langDisplay = parseLangLine(profile?.langLine || "");
-  const visibilityLabel = userId ? "Associé à ton compte" : "Invité";
-
-  // --- RENDER ---
-
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.25 }}
-      className="max-w-6xl mx-auto px-3 sm:px-4 py-5 sm:py-6 space-y-5"
-    >
-      {/* 1. VUE D'ENSEMBLE + STATS */}
-      <section className="space-y-4">
-        <div>
-          <p className="badge-muted mb-2 flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-            <span className="text-[11px] uppercase tracking-wider text-[var(--muted)]">
-              Vue d&apos;ensemble
-            </span>
-          </p>
-          <h1 className="text-xl sm:text-2xl font-semibold">
-            Ton tableau de bord de candidatures
-          </h1>
-          <p className="text-xs sm:text-sm text-[var(--muted)] mt-1 max-w-xl">
-            Accède rapidement à ton CV IA et à toutes les infos qui serviront à
-            générer ton CV, tes lettres de motivation et ton pitch.
-          </p>
-        </div>
-
-        {/* STATS CARDS */}
-        <div className="grid gap-3 md:grid-cols-4">
-          {/* Crédits */}
-          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
-            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-              Crédits restants
-            </p>
-            <p className="text-2xl font-semibold">
-              {loadingAccountProfile ? "…" : remainingCredits}
-            </p>
-            <p className="text-[11px] text-[var(--muted)]">
-              Utilisés pour analyser ton CV et générer des contenus.
-            </p>
-          </div>
-
-          {/* CV générés */}
-          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
-            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-              CV générés
-            </p>
-            <p className="text-2xl font-semibold">
-              {loadingCounts ? "…" : dashboardCounts.cvCount}
-            </p>
-            <p className="text-[11px] text-[var(--muted)]">
-              Nombre de candidatures où un <strong>CV IA</strong> est associé
-              (coché ou généré).
-            </p>
-          </div>
-
-          {/* LM IA générées */}
-          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
-            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-              LM IA générées
-            </p>
-            <p className="text-2xl font-semibold">
-              {loadingCounts ? "…" : dashboardCounts.lmCount}
-            </p>
-            <p className="text-[11px] text-[var(--muted)]">
-              Nombre de candidatures avec une <strong>lettre IA</strong>{" "}
-              associée.
-            </p>
-          </div>
-
-          {/* Candidatures suivies */}
-          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
-            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-              Candidatures suivies
-            </p>
-            <p className="text-2xl font-semibold">
-              {loadingCounts ? "…" : dashboardCounts.totalApps}
-            </p>
-            <p className="text-[11px] text-[var(--muted)]">
-              Total de lignes dans ton{" "}
-              <strong>tracker de candidatures</strong>.
-            </p>
-          </div>
-        </div>
-      </section>
-
-      {/* 2. HEADER PROFIL + MON CV + RADAR */}
-      <header
-        id="infos-personnelles"
-        className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 flex flex-col lg:flex-row gap-4 md:items-stretch"
-      >
-        {/* Colonne gauche : identité, résumé, CV, infos clés */}
-        <div className="flex flex-col flex-1 gap-3">
-          {/* Identité */}
-          <div className="flex items-center gap-3 sm:gap-4">
-            <div className="flex h-14 w-14 sm:h-16 sm:w-16 items-center justify-center rounded-full bg-[var(--bg-soft)] border border-[var(--border)] text-base sm:text-lg font-semibold">
-              {getInitials(profile?.fullName || userEmail || "")}
-            </div>
-            <div className="space-y-1">
-              <div className="flex flex-wrap items-center gap-1.5">
-                <h2 className="text-base sm:text-lg font-semibold">
-                  {profile?.fullName || "Ton profil candidat"}
-                </h2>
-                {userEmail && (
-                  <span className="rounded-full border border-[var(--border)] px-2 py-[2px] text-[10px] text-[var(--muted)]">
-                    Connecté·e en tant que{" "}
-                    <span className="font-medium text-[11px] text-white">
-                      {userEmail}
-                    </span>
-                  </span>
-                )}
-              </div>
-              <p className="text-[12px] text-[var(--muted)] line-clamp-2">
-                {headline}
-              </p>
-              {(profile?.address || profile?.city) && (
-                <p className="text-[11px] text-[var(--muted)]">
-                  {profile.address || profile.city}
-                </p>
-              )}
-              <p className="text-[11px] text-[var(--muted)]">{updatedLabel}</p>
-            </div>
-          </div>
-
-          {/* Mon CV */}
-          <section className="rounded-xl border border-[var(--border)]/80 bg-[var(--bg-soft)] p-3 sm:p-3.5 flex flex-col md:flex-row gap-3 md:items-center">
-            <div className="flex-1 space-y-1">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="inline-flex items-center rounded-full border border-[var(--border)] bg-[var(--bg)] px-2 py-[2px] text-[11px]">
-                  Mon CV
-                </span>
-                <p className="text-[11px] text-[var(--muted)]">
-                  {profile
-                    ? "Ton CV a été analysé et ton profil est sauvegardé."
-                    : "Aucun CV analysé pour le moment."}
-                </p>
-              </div>
-              {loadingProfileFromDb && (
-                <p className="text-[11px] text-[var(--muted)]">
-                  Chargement de ton profil sauvegardé...
-                </p>
-              )}
-            </div>
-
-            <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center md:ml-auto">
-              <label className="flex-1 cursor-pointer">
-                <div className="w-full rounded-lg border border-dashed border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 text-[12px] text-[var(--muted)] hover:border-[var(--brand)]/80 hover:bg-[var(--bg-soft)] transition-colors">
-                  {file ? (
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="truncate">{file.name}</span>
-                      <span className="text-[11px] text-[var(--muted)]">
-                        {(file.size / 1024 / 1024).toFixed(2)} Mo
-                      </span>
-                    </div>
-                  ) : (
-                    <span>Choisir un CV (PDF)</span>
-                  )}
-                </div>
-                <input
-                  type="file"
-                  accept="application/pdf"
-                  className="hidden"
-                  onChange={handleFileChange}
-                />
-              </label>
-
-              <button
-                type="button"
-                onClick={handleUpload}
-                disabled={
-                  uploading ||
-                  !file ||
-                  loadingAccountProfile ||
-                  isBlocked ||
-                  remainingCredits <= 0
-                }
-                className="sm:w-[160px] inline-flex items-center justify-center rounded-lg bg-[var(--brand)] hover:bg-[var(--brandDark)] disabled:opacity-60 disabled:cursor-not-allowed text-[13px] font-medium text-white px-3 py-2 transition-colors"
-              >
-                {uploading
-                  ? "Analyse en cours..."
-                  : isBlocked
-                  ? "Compte bloqué"
-                  : remainingCredits <= 0
-                  ? "Plus de crédits"
-                  : "Analyser / Mettre à jour"}
-              </button>
-            </div>
-          </section>
-
-          {/* Informations clés */}
-          {profile && (
-            <div className="rounded-xl border border-[var(--border)]/60 bg-[var(--bg-soft)] p-3 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <p className="text-[11px] text-[var(--muted)] font-medium">
-                  Informations clés
-                </p>
-                <button
-                  type="button"
-                  onClick={openInfosModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2 text-[12px]">
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">Email</p>
-                  <p className="font-medium">
-                    {profile.email || userEmail || "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">Téléphone</p>
-                  <p className="font-medium">{profile.phone || "—"}</p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">LinkedIn</p>
-                  <p className="font-medium break-all">
-                    {profile.linkedin || "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">Adresse</p>
-                  <p className="font-medium line-clamp-2">
-                    {profile.address || profile.city || "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">
-                    Contrat recherché
-                  </p>
-                  <p className="font-medium line-clamp-2">
-                    {profile.contractType || "Non renseigné"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">
-                    Permis de conduire
-                  </p>
-                  <p className="font-medium">
-                    {profile.drivingLicense || "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">Véhicule</p>
-                  <p className="font-medium">{profile.vehicle || "—"}</p>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {error && (
-            <div className="mt-1 w-full rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-[11px] text-red-100">
-              {error}
-            </div>
-          )}
-
-          {/* Visibilité */}
-          <div className="text-[11px] text-[var(--muted)]">
-            Visibilité :{" "}
-            <span className="font-medium text-[var(--text)]">
-              {visibilityLabel}
-            </span>
-          </div>
-        </div>
-
-        {/* Colonne droite : RADAR */}
-        <div className="md:w-[320px] lg:w-[360px] flex-shrink-0">
-          <div className="rounded-2xl bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-3 sm:p-4 h-full flex flex-col">
-            <p className="text-[11px] text-[var(--muted)] mb-2">
-              Radar de compétences estimé
-            </p>
-            <div className="relative flex-1 min-h-[210px]">
-              <canvas
-                id="skillsRadarChart"
-                ref={radarCanvasRef}
-                className="w-full h-full"
-              />
-            </div>
-          </div>
-        </div>
-      </header>
-
-      {/* 3. CONTENU PRINCIPAL : NAV GAUCHE + SECTIONS */}
-      <div className="lg:grid lg:grid-cols-[220px,1fr] gap-4 sm:gap-5">
-        {/* Sidebar navigation */}
-        <aside className="mb-3 lg:mb-0">
-          <motion.nav
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.35 }}
-            className="glass border border-[var(--border)]/80 rounded-2xl py-3 text-[12px] sticky top-20 lg:top-24"
-          >
-            <p className="px-3 pb-1 text-[11px] text-[var(--muted)]">
-              Navigation rapide
-            </p>
-            <ul className="space-y-0.5">
-              {navItems.map((item, idx) => (
-                <motion.li
-                  key={item.id}
-                  initial={{ opacity: 0, x: -8 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: 0.1 + idx * 0.05 }}
-                >
-                  <a
-                    href={`#${item.id}`}
-                    className="flex items-center justify-between px-3 py-2 hover:bg-[var(--bg-soft)] text-[12px] rounded-md transition-colors"
-                  >
-                    <span>{item.label}</span>
-                    <motion.span
-                      whileHover={{ x: 2 }}
-                      className="text-[10px] text-[var(--muted)]"
-                    >
-                      ↗
-                    </motion.span>
-                  </a>
-                </motion.li>
-              ))}
-            </ul>
-          </motion.nav>
-        </aside>
-
-        {/* Main content */}
-        <main className="space-y-4 sm:space-y-5">
-          {/* Compétences */}
-          {profile?.skills && (
-            <section
-              id="competences"
-              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4"
-            >
-              <div className="flex items-center justify-between gap-2 mb-1">
-                <h2 className="text-sm sm:text-base font-semibold">
-                  Compétences &amp; Outils
-                </h2>
-                <button
-                  type="button"
-                  onClick={openSkillsModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
-              </div>
-
-              {profile.skills.sections?.length > 0 && (
-                <div className="space-y-4">
-                  {profile.skills.sections.map((section, idx) => (
-                    <div key={idx} className="space-y-1">
-                      <p className="text-[11px] uppercase tracking-wide text-[var(--muted)]">
-                        {section.title}
-                      </p>
-                      <div className="flex flex-wrap gap-2 text-[12px]">
-                        {section.items.map((s, i) => (
-                          <span key={i} className="badge">
-                            {s}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {profile.skills.tools?.length > 0 && (
-                <div className="space-y-1 pt-2 border-t border-[var(--border)]/80">
-                  <p className="text-[11px] uppercase tracking-wide text-[var(--muted)]">
-                    Outils / logiciels
-                  </p>
-                  <div className="flex flex-wrap gap-2 text-[12px]">
-                    {profile.skills.tools.map((tool, idx) => (
-                      <span key={idx} className="badge">
-                        {tool}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </section>
-          )}
-
-          {/* Expérience */}
-          {profile?.experiences?.length ? (
-            <section
-              id="experience"
-              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5"
-            >
-              <div className="flex items-center justify-between gap-2 mb-2">
-                <h2 className="text-sm sm:text-base font-semibold">
-                  Expériences principales
-                </h2>
-                <button
-                  type="button"
-                  onClick={openExperienceModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
-              </div>
-
-              <ul className="space-y-3 text-[12px]">
-                {profile.experiences.map((exp, idx) => (
-                  <li
-                    key={idx}
-                    className="rounded-lg bg-[var(--bg-soft)] border border-[var(--border)]/70 px-3 py-3"
-                  >
-                    <p className="font-medium">
-                      {exp.role || "Poste"} · {exp.company || "Entreprise"}
-                    </p>
-                    <p className="text-[11px] text-[var(--muted)]">
-                      {exp.dates || ""}
-                    </p>
-                    {exp.bullets?.length > 0 && (
-                      <ul className="mt-1 list-disc list-inside space-y-0.5">
-                        {exp.bullets.map((b, i) => (
-                          <li key={i}>{b}</li>
-                        ))}
-                      </ul>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            </section>
-          ) : null}
-
-          {/* Formation & certifs */}
-          {profile && (profile.educationShort?.length || profile.certs) && (
-            <section
-              id="formation"
-              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4"
-            >
-              <div className="flex items-center justify-between gap-2 mb-2">
-                <h2 className="text-sm sm:text-base font-semibold">
-                  Formation &amp; Certifications
-                </h2>
-                <button
-                  type="button"
-                  onClick={openEducationModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
-              </div>
-
-              {profile?.educationShort?.length ? (
-                <div>
-                  <ul className="space-y-1.5 text-[12px]">
-                    {profile.educationShort.map((line, idx) => (
-                      <li key={idx}>{line}</li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
-
-              {profile?.certs && (
-                <div>
-                  <p className="text-[11px] text-[var(--muted)] mb-1">
-                    Certifications
-                  </p>
-                  <p className="text-[12px]">{profile.certs}</p>
-                </div>
-              )}
-            </section>
-          )}
-
-          {/* Langues */}
-          {profile && (
-            <section
-              id="langues"
-              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3"
-            >
-              <div className="flex items-center justify-between gap-2 mb-1">
-                <h2 className="text-sm sm:text-base font-semibold">
-                  Langues
-                </h2>
-                <button
-                  type="button"
-                  onClick={openLanguagesModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
-              </div>
-              {langDisplay.length > 0 ? (
-                <div className="flex flex-wrap gap-x-6 gap-y-3 text-[13px]">
-                  {langDisplay.map((lang, idx) => (
-                    <div key={idx} className="flex items-center gap-2">
-                      <span className="text-2xl">{lang.flag}</span>
-                      <span className="font-medium text-[var(--text)]">
-                        {lang.text}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-[12px] text-[var(--muted)]">
-                  Aucune langue renseignée pour le moment.
-                </p>
-              )}
-            </section>
-          )}
-
-          {/* Hobbies */}
-          {profile && (
-            <section
-              id="hobbies"
-              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5"
-            >
-              <div className="flex items-center justify-between gap-2 mb-2">
-                <h2 className="text-sm sm:text-base font-semibold">
-                  Centres d&apos;intérêt
-                </h2>
-                <button
-                  type="button"
-                  onClick={openHobbiesModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
-              </div>
-              {profile.hobbies?.length ? (
-                <div className="flex flex-wrap gap-2 text-[12px]">
-                  {profile.hobbies.map((hobby) => (
-                    <span
-                      key={hobby}
-                      className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-[3px]"
-                    >
-                      <span>{getHobbyEmoji(hobby)}</span>
-                      <span>{hobby}</span>
-                    </span>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-[12px] text-[var(--muted)]">
-                  Aucun centre d&apos;intérêt renseigné pour le moment.
-                </p>
-              )}
-            </section>
-          )}
-        </main>
-      </div>
-
-      {/* Message si aucun profil */}
-      {!profile && !loadingProfileFromDb && (
-        <div className="text-center p-10 glass border border-[var(--border)]/80 rounded-2xl">
-          <h3 className="text-lg font-semibold mb-2">
-            Aucun profil enregistré ou analysé
-          </h3>
-          <p className="text-[13px] text-[var(--muted)]">
-            Veuille uploader un CV PDF dans le header ci-dessus pour initialiser
-            ton profil candidat IA.
-          </p>
-        </div>
-      )}
-
-      {/* --- MODALE GÉNÉRIQUE D'ÉDITION --- */}
-      {activeModal && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 px-3">
-          <motion.form
-            onSubmit={handleModalSave}
-            initial={{ opacity: 0, y: 16, scale: 0.97 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 16, scale: 0.97 }}
-            className="w-full max-w-lg rounded-2xl bg-[var(--bg)] border border-[var(--border)] shadow-xl p-4 sm:p-5 space-y-4"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <h3 className="text-sm sm:text-base font-semibold">
-                {activeModal === "infos" && "Modifier tes informations clés"}
-                {activeModal === "skills" &&
-                  "Modifier tes compétences & outils"}
-                {activeModal === "experience" &&
-                  "Modifier tes expériences principales"}
-                {activeModal === "education" &&
-                  "Modifier ta formation & tes certifications"}
-                {activeModal === "languages" && "Modifier tes langues"}
-                {activeModal === "hobbies" &&
-                  "Modifier tes centres d’intérêt"}
-              </h3>
-              <button
-                type="button"
-                onClick={handleModalCancel}
-                className="rounded-full px-2 py-1 text-[11px] text-[var(--muted)] hover:bg-[var(--bg-soft)]"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="space-y-3 max-h-[60vh] overflow-auto pr-1">
-              {/* INFOS */}
-              {activeModal === "infos" && (
-                <>
-                  <div className="grid sm:grid-cols-2 gap-3 text-[12px]">
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Nom complet
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.fullName}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            fullName: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Email
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.email}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            email: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Téléphone
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.phone}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            phone: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        LinkedIn
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.linkedin}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            linkedin: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Permis (ex : Permis B)
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.drivingLicense}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            drivingLicense: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Véhicule (ex : Véhiculé)
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.vehicle}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            vehicle: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div className="sm:col-span-2">
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Adresse (ville, code postal, etc.)
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        placeholder="Ex : 12 rue Exemple, 75000 Paris"
-                        value={infosDraft.address}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            address: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                  </div>
-                  <div className="text-[12px]">
-                    <label className="text-[11px] text-[var(--muted)]">
-                      Contrat recherché
-                    </label>
-                    <input
-                      list="contract-type-options"
-                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                      placeholder="Ex : CDI, Alternance, Stage, Freelance..."
-                      value={infosDraft.contractType}
-                      onChange={(e) =>
-                        setInfosDraft((p) => ({
-                          ...p,
-                          contractType: e.target.value,
-                        }))
-                      }
-                    />
-                    <datalist id="contract-type-options">
-                      {CONTRACT_TYPE_OPTIONS.map((c) => (
-                        <option key={c} value={c} />
-                      ))}
-                    </datalist>
-                  </div>
-                  <div className="text-[12px]">
-                    <label className="text-[11px] text-[var(--muted)]">
-                      Résumé de profil / Pitch
-                    </label>
-                    <textarea
-                      rows={4}
-                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
-                      value={infosDraft.profileSummary}
-                      onChange={(e) =>
-                        setInfosDraft((p) => ({
-                          ...p,
-                          profileSummary: e.target.value,
-                        }))
-                      }
-                    />
-                  </div>
-                </>
-              )}
-
-              {/* COMPÉTENCES */}
-              {activeModal === "skills" && (
-                <>
-                  <div className="text-[12px] space-y-1">
-                    <label className="text-[11px] text-[var(--muted)]">
-                      Sections de compétences
-                    </label>
-                    <p className="text-[11px] text-[var(--muted)]">
-                      Format conseillé : une ligne par section. Exemple :
-                      <br />
-                      <span className="italic">
-                        &quot;Compétences analytiques : Analyse financière,
-                        Reporting, Budget&quot;
-                      </span>
-                    </p>
-                    <textarea
-                      rows={5}
-                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
-                      value={skillsSectionsText}
-                      onChange={(e) => setSkillsSectionsText(e.target.value)}
-                    />
-                  </div>
-                  <div className="text-[12px] space-y-1">
-                    <label className="text-[11px] text-[var(--muted)]">
-                      Outils / logiciels (séparés par des virgules)
-                    </label>
-                    <textarea
-                      rows={2}
-                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
-                      value={skillsToolsText}
-                      onChange={(e) => setSkillsToolsText(e.target.value)}
-                    />
-                  </div>
-                </>
-              )}
-
-              {/* EXPÉRIENCE */}
-              {activeModal === "experience" && (
-                <div className="space-y-3 text-[12px]">
-                  {experiencesDraft.map((exp, idx) => (
-                    <div
-                      key={idx}
-                      className="rounded-lg border border-[var(--border)]/70 bg-[var(--bg-soft)] p-3 space-y-2"
-                    >
-                      <div className="grid sm:grid-cols-2 gap-2">
-                        <div>
-                          <label className="text-[11px] text-[var(--muted)]">
-                            Poste
-                          </label>
-                          <input
-                            className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                            value={exp.role}
-                            onChange={(e) =>
-                              updateExperienceDraft(
-                                idx,
-                                "role",
-                                e.target.value
-                              )
-                            }
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-[var(--muted)]">
-                            Entreprise
-                          </label>
-                          <input
-                            className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                            value={exp.company}
-                            onChange={(e) =>
-                              updateExperienceDraft(
-                                idx,
-                                "company",
-                                e.target.value
-                              )
-                            }
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-[var(--muted)]">
-                            Dates
-                          </label>
-                          <input
-                            className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                            value={exp.dates}
-                            onChange={(e) =>
-                              updateExperienceDraft(
-                                idx,
-                                "dates",
-                                e.target.value
-                              )
-                            }
-                          />
-                        </div>
-                      </div>
-                      <div>
-                        <label className="text-[11px] text-[var(--muted)]">
-                          Missions / Réalisations (une par ligne)
-                        </label>
-                        <textarea
-                          rows={3}
-                          className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
-                          value={exp.bulletsText}
-                          onChange={(e) =>
-                            updateExperienceDraft(
-                              idx,
-                              "bulletsText",
-                              e.target.value
-                            )
-                          }
-                        />
-                      </div>
-                    </div>
-                  ))}
-
-                  <button
-                    type="button"
-                    onClick={addExperienceDraft}
-                    className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                  >
-                    <span className="text-[14px]">＋</span>
-                    <span>Ajouter une expérience</span>
-                  </button>
-                </div>
-              )}
-
-              {/* FORMATION & CERTIFS */}
-              {activeModal === "education" && (
-                <>
-                  <div className="space-y-3 text-[12px]">
-                    {educationDrafts.map((edu, idx) => (
-                      <div
-                        key={idx}
-                        className="rounded-lg border border-[var(--border)]/70 bg-[var(--bg-soft)] p-3 space-y-2"
-                      >
-                        <div className="grid sm:grid-cols-2 gap-2">
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              Diplôme
-                            </label>
-                            <input
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              value={edu.degree}
-                              onChange={(e) =>
-                                updateEducationDraft(
-                                  idx,
-                                  "degree",
-                                  e.target.value
-                                )
-                              }
-                            />
-                          </div>
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              École / Université
-                            </label>
-                            <input
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              value={edu.school}
-                              onChange={(e) =>
-                                updateEducationDraft(
-                                  idx,
-                                  "school",
-                                  e.target.value
-                                )
-                              }
-                            />
-                          </div>
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              Lieu (optionnel)
-                            </label>
-                            <input
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              value={edu.location}
-                              onChange={(e) =>
-                                updateEducationDraft(
-                                  idx,
-                                  "location",
-                                  e.target.value
-                                )
-                              }
-                            />
-                          </div>
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              Dates
-                            </label>
-                            <input
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              placeholder="Ex : 2022–2024"
-                              value={edu.dates}
-                              onChange={(e) =>
-                                updateEducationDraft(
-                                  idx,
-                                  "dates",
-                                  e.target.value
-                                )
-                              }
-                            />
-                          </div>
-                        </div>
-                        {educationDrafts.length > 1 && (
-                          <div className="flex justify-end">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setEducationDrafts((prev) =>
-                                  prev.filter((_, i) => i !== idx)
-                                )
-                              }
-                              className="text-[11px] text-[var(--muted)] hover:text-red-400"
-                            >
-                              Supprimer cette formation
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    ))}
-
-                    <button
-                      type="button"
-                      onClick={addEducationDraft}
-                      className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                    >
-                      <span className="text-[14px]">＋</span>
-                      <span>Ajouter une formation</span>
-                    </button>
-                  </div>
-
-                  {/* Certifications */}
-                  <div className="text-[12px] space-y-2 pt-3">
-                    <label className="text-[11px] text-[var(--muted)]">
-                      Certifications (avec auto-complétion)
-                    </label>
-                    <div className="flex gap-2">
-                      <input
-                        list="certification-options"
-                        className="flex-1 rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        placeholder="Ex : Tosa Excel, Azure AZ-900..."
-                        value={certInput}
-                        onChange={(e) => setCertInput(e.target.value)}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const val = certInput.trim();
-                          if (!val) return;
-                          if (!certsList.includes(val)) {
-                            setCertsList((prev) => [...prev, val]);
-                          }
-                          setCertInput("");
-                        }}
-                        className="rounded-md bg-[var(--brand)] hover:bg-[var(--brandDark)] px-3 py-1.5 text-[12px] text-white"
-                      >
-                        Ajouter
-                      </button>
-                      <datalist id="certification-options">
-                        {CERTIFICATION_OPTIONS.map((c) => (
-                          <option key={c} value={c} />
-                        ))}
-                      </datalist>
-                    </div>
-
-                    {certsList.length > 0 && (
-                      <div className="flex flex-wrap gap-2 mt-1">
-                        {certsList.map((cert) => (
-                          <span
-                            key={cert}
-                            className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-[2px] text-[11px]"
-                          >
-                            {cert}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setCertsList((prev) =>
-                                  prev.filter((c) => c !== cert)
-                                )
-                              }
-                              className="text-[10px] text-[var(--muted)] hover:text-red-400"
-                            >
-                              ✕
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-
-              {/* LANGUES */}
-              {activeModal === "languages" && (
-                <div className="text-[12px] space-y-3">
-                  <p className="text-[11px] text-[var(--muted)]">
-                    Ajoute tes langues avec leur niveau. Tu peux choisir dans la
-                    liste ou taper manuellement.
-                  </p>
-                  {languagesDraft.map((lang, idx) => {
-                    const flag =
-                      lang.language.trim() !== ""
-                        ? getFlagEmoji(lang.language)
-                        : "🌐";
-                    return (
-                      <div
-                        key={idx}
-                        className="flex items-center gap-2 rounded-lg border border-[var(--border)]/70 bg-[var(--bg-soft)] px-2.5 py-2"
-                      >
-                        <span className="text-xl w-7 text-center">{flag}</span>
-                        <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              Langue
-                            </label>
-                            <input
-                              list="language-options"
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              value={lang.language}
-                              onChange={(e) =>
-                                setLanguagesDraft((prev) =>
-                                  prev.map((l, i) =>
-                                    i === idx
-                                      ? { ...l, language: e.target.value }
-                                      : l
-                                  )
-                                )
-                              }
-                            />
-                          </div>
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              Niveau
-                            </label>
-                            <select
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              value={lang.level}
-                              onChange={(e) =>
-                                setLanguagesDraft((prev) =>
-                                  prev.map((l, i) =>
-                                    i === idx
-                                      ? { ...l, level: e.target.value }
-                                      : l
-                                  )
-                                )
-                              }
-                            >
-                              <option value="">Sélectionner un niveau</option>
-                              {LANGUAGE_LEVEL_OPTIONS.map((lvl) => (
-                                <option key={lvl} value={lvl}>
-                                  {lvl}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        </div>
-                        {languagesDraft.length > 1 && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setLanguagesDraft((prev) =>
-                                prev.filter((_, i) => i !== idx)
-                              )
-                            }
-                            className="ml-1 text-[11px] text-[var(--muted)] hover:text-red-400"
-                          >
-                            ✕
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
-
-                  <datalist id="language-options">
-                    {LANGUAGE_OPTIONS.map((l) => (
-                      <option key={l} value={l} />
-                    ))}
-                  </datalist>
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setLanguagesDraft((prev) => [
-                        ...prev,
-                        { language: "", level: "" },
-                      ])
-                    }
-                    className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                  >
-                    <span className="text-[14px]">＋</span>
-                    <span>Ajouter une langue</span>
-                  </button>
-                </div>
-              )}
-
-              {/* HOBBIES */}
-              {activeModal === "hobbies" && (
-                <div className="text-[12px] space-y-2">
-                  <label className="text-[11px] text-[var(--muted)]">
-                    Centres d&apos;intérêt (avec auto-complétion)
-                  </label>
-                  <div className="flex gap-2">
-                    <input
-                      list="hobby-options"
-                      className="flex-1 rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                      placeholder="Ex : Voyage, Football, Lecture..."
-                      value={hobbyInput}
-                      onChange={(e) => setHobbyInput(e.target.value)}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const val = hobbyInput.trim();
-                        if (!val) return;
-                        if (!hobbiesList.includes(val)) {
-                          setHobbiesList((prev) => [...prev, val]);
-                        }
-                        setHobbyInput("");
-                      }}
-                      className="rounded-md bg-[var(--brand)] hover:bg-[var(--brandDark)] px-3 py-1.5 text-[12px] text-white"
-                    >
-                      Ajouter
-                    </button>
-                    <datalist id="hobby-options">
-                      {HOBBY_OPTIONS.map((h) => (
-                        <option key={h} value={h} />
-                      ))}
-                    </datalist>
-                  </div>
-
-                  {hobbiesList.length > 0 ? (
-                    <div className="flex flex-wrap gap-2 mt-2">
-                      {hobbiesList.map((hobby) => (
-                        <span
-                          key={hobby}
-                          className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-[2px] text-[11px]"
-                        >
-                          <span>{getHobbyEmoji(hobby)}</span>
-                          <span>{hobby}</span>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setHobbiesList((prev) =>
-                                prev.filter((h) => h !== hobby)
-                              )
-                            }
-                            className="text-[10px] text-[var(--muted)] hover:text-red-400"
-                          >
-                            ✕
-                          </button>
-                        </span>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-[11px] text-[var(--muted)] mt-1">
-                      Aucun centre d&apos;intérêt ajouté pour le moment.
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={handleModalCancel}
-                className="inline-flex items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[12px] text-[var(--muted)] hover:bg-[var(--bg)] transition-colors"
-              >
-                Annuler
-              </button>
-              <button
-                type="submit"
-                className="inline-flex items-center justify-center rounded-lg bg-[var(--brand)] hover:bg-[var(--brandDark)] px-3 py-1.5 text-[12px] font-medium text-white transition-colors"
-              >
-                Enregistrer
-              </button>
-            </div>
-          </motion.form>
-        </div>
-      )}
-    </motion.div>
   );
 }
 ````
@@ -15606,6 +10502,9976 @@ body {
 }
 ````
 
+## File: app/not-found.tsx
+````typescript
+"use client";
+
+import Link from "next/link";
+import { useAuth } from "@/context/AuthContext";
+
+export default function NotFound() {
+  const { user } = useAuth();
+
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center bg-[var(--bg)] text-[var(--ink)] px-4">
+      <div className="glass max-w-md w-full p-6 border border-[var(--border)]/80 text-center">
+        <h1 className="text-xl font-semibold mb-2">Page introuvable</h1>
+        <p className="text-sm text-[var(--muted)] mb-4">
+          Le lien que tu as suivi est invalide ou cette page n&apos;existe pas.
+        </p>
+        <div className="flex flex-wrap gap-3 justify-center">
+          <Link href="/" className="btn-secondary text-xs sm:text-sm">
+            Retour à l&apos;accueil
+          </Link>
+          {user && (
+            <Link href="/app" className="btn-primary text-xs sm:text-sm">
+              Aller au dashboard
+            </Link>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+````
+
+## File: components/layout/AppLayout.tsx
+````typescript
+"use client";
+
+import { ReactNode, useEffect, useState } from "react";
+import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
+import { useAuth } from "@/context/AuthContext";
+import { db } from "@/lib/firebase";
+import { doc, onSnapshot } from "firebase/firestore";
+
+const navLinks = [
+  { href: "/app", label: "Profil CV IA", icon: "📄" },
+  { href: "/app/lm", label: "Assistant candidature", icon: "✨" },
+  { href: "/app/tracker", label: "Suivi candidatures", icon: "📊" },
+  { href: "/app/interview", label: "Préparer entretien", icon: "🎤" },
+  { href: "/app/apply", label: "Postuler", icon: "📨" },
+  { href: "/app/history", label: "Historique IA", icon: "🕒" },
+  { href: "/app/credits", label: "Crédits", icon: "⚡" },
+];
+
+export default function UserAppLayout({ children }: { children: ReactNode }) {
+  const { user, loading, logout } = useAuth();
+  const router = useRouter();
+  const pathname = usePathname();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // ✅ flag pour être sûr qu'on est côté client
+  const [clientReady, setClientReady] = useState(false);
+  useEffect(() => {
+    setClientReady(true);
+  }, []);
+
+  // ✅ Crédits utilisateur (Firestorm)
+  const [credits, setCredits] = useState<number | null>(null);
+
+  // 🔒 Protection des routes /app : login + email vérifié
+  useEffect(() => {
+    if (!clientReady) return;
+    if (loading) return;
+
+    if (!user) {
+      router.replace("/login");
+      return;
+    }
+
+    if (!user.emailVerified) {
+      router.replace("/auth/verify-email");
+      return;
+    }
+  }, [clientReady, user, loading, router]);
+
+  // 🛡 Surveillance du doc user : blocage + crédits
+  useEffect(() => {
+    if (!clientReady) return;
+    if (!user) return;
+
+    const ref = doc(db, "users", user.uid);
+
+    const unsub = onSnapshot(
+      ref,
+      (snap) => {
+        const data = snap.data() as any | undefined;
+
+        // blocage
+        if (data?.blocked) {
+          logout()
+            .catch((e) =>
+              console.error("Erreur déconnexion après blocage :", e)
+            )
+            .finally(() => {
+              router.replace("/login?blocked=1");
+            });
+          return;
+        }
+
+        // crédits
+        if (typeof data?.credits === "number") {
+          setCredits(data.credits);
+        } else {
+          setCredits(0);
+        }
+      },
+      (err) => {
+        console.error("Erreur surveillance utilisateur :", err);
+      }
+    );
+
+    return () => {
+      unsub();
+    };
+  }, [clientReady, user, logout, router]);
+
+  // ferme le menu mobile au changement de page
+  useEffect(() => {
+    setSidebarOpen(false);
+  }, [pathname]);
+
+  // ⚠️ Tant qu'on n'est pas prêt ou pas autorisé → on ne rend PAS le dashboard
+  if (!clientReady || loading || !user || !user.emailVerified) {
+    return null;
+  }
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+      router.replace("/login");
+    } catch (e) {
+      console.error("Erreur déconnexion :", e);
+    }
+  };
+
+  const currentNav = navLinks.find(
+    (link) =>
+      pathname === link.href || pathname.startsWith(link.href + "/")
+  );
+  const pageTitle = currentNav?.label ?? "Espace candidat";
+
+  const CreditsBadge =
+    credits === null ? null : (
+      <div className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--ink)]">
+        <span className="text-[13px]">⚡</span>
+        <span>
+          <span className="font-semibold">{credits}</span> crédits
+        </span>
+      </div>
+    );
+
+  return (
+    <div className="min-h-screen flex bg-[var(--bg)] text-[var(--ink)]">
+      {/* SIDEBAR DESKTOP */}
+      <aside className="hidden md:flex w-60 shrink-0 flex-col border-r border-[var(--border)] bg-[var(--bg-soft)]/60">
+        <div className="flex items-center gap-2 px-3 py-4 border-b border-[var(--border)]/70">
+          <Link href="/app" className="flex items-center gap-2">
+            <div className="w-9 h-9 rounded-2xl bg-[var(--brand)]/10 border border-[var(--brand)]/40 flex items-center justify-center text-lg">
+              ⚡
+            </div>
+            <div className="flex flex-col">
+              <span className="text-xs font-semibold">
+                Assistant Candidature IA
+              </span>
+              <span className="text-[10px] text-[var(--muted)]">
+                Espace candidat
+              </span>
+            </div>
+          </Link>
+        </div>
+
+        <nav className="flex-1 px-2 py-3 space-y-1 text-[13px] overflow-y-auto">
+          {navLinks.map((link) => {
+            const active =
+              pathname === link.href ||
+              pathname.startsWith(link.href + "/");
+            return (
+              <Link
+                key={link.href}
+                href={link.href}
+                className={[
+                  "flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors border border-transparent",
+                  active
+                    ? "bg-[var(--bg)] text-[var(--ink)] border-[var(--brand)]/60"
+                    : "text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)]",
+                ].join(" ")}
+              >
+                <span className="w-5 text-center text-[13px]">
+                  {link.icon}
+                </span>
+                <span>{link.label}</span>
+              </Link>
+            );
+          })}
+        </nav>
+
+        <div className="border-t border-[var(--border)]/70 px-3 py-3 text-[11px] flex flex-col gap-2">
+          {/* Badge crédits dans le bas de la sidebar */}
+          {CreditsBadge}
+
+          {user?.email && (
+            <p className="text-[var(--muted)]">
+              Connecté·e :{" "}
+              <span className="font-medium text-[var(--ink)]">
+                {user.email}
+              </span>
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="w-full text-[11px] rounded-full border border-[var(--border)] px-3 py-1.5 bg-[var(--bg)] hover:border-red-500 hover:text-red-300 transition-colors"
+          >
+            Se déconnecter
+          </button>
+        </div>
+      </aside>
+
+      {/* COLONNE CONTENU */}
+      <div className="flex-1 flex flex-col relative">
+        <div className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.16),_transparent_55%),radial-gradient(circle_at_bottom,_rgba(94,234,212,0.12),_transparent_55%)]" />
+
+        {/* TOPBAR */}
+        <header className="sticky top-0 z-30 border-b border-[var(--border)]/80 bg-[var(--bg)]/95 backdrop-blur">
+          <div className="flex items-center justify-between gap-3 px-3 sm:px-6 py-3">
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                aria-label="Ouvrir la navigation"
+                onClick={() => setSidebarOpen(true)}
+                className="md:hidden rounded-full p-2 bg-[var(--bg-soft)] border border-[var(--border)]/80 shadow-sm focus:outline-none focus:ring-2 focus:ring-[var(--brand)]/60"
+              >
+                <div className={`menu-icon1 ${sidebarOpen ? "is-open" : ""}`}>
+                  <div className="menu-icon1_line-top"></div>
+                  <div className="menu-icon1_line-middle">
+                    <div className="menu-icon1_line-middle-inner"></div>
+                  </div>
+                  <div className="menu-icon1_line-bottom"></div>
+                </div>
+              </button>
+
+              <div className="flex flex-col">
+                <span className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted)]">
+                  Tableau de bord
+                </span>
+                <span className="text-sm font-semibold">{pageTitle}</span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              {/* Badge crédits visible dans la topbar */}
+              {CreditsBadge}
+
+              {user?.email && (
+                <span className="hidden sm:inline text-[11px] text-[var(--muted)]">
+                  {user.email}
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="text-[11px] rounded-full border border-[var(--border)] px-3 py-1.5 bg-[var(--bg-soft)] hover:border-red-500 hover:text-red-300 transition-colors"
+              >
+                Se déconnecter
+              </button>
+            </div>
+          </div>
+        </header>
+
+        <main className="flex-1 overflow-y-auto">
+          <div className="px-3 sm:px-6 lg:px-8 py-4 lg:py-6">
+            <div className="max-w-6xl mx-auto space-y-4">{children}</div>
+          </div>
+        </main>
+      </div>
+
+      {/* MENU MOBILE (DRAWER) */}
+      <div
+        className={`fixed inset-0 z-40 md:hidden transition ${
+          sidebarOpen ? "pointer-events-auto" : "pointer-events-none"
+        }`}
+      >
+        <div
+          className={`absolute inset-0 bg-black/50 transition-opacity ${
+            sidebarOpen ? "opacity-100" : "opacity-0"
+          }`}
+          onClick={() => setSidebarOpen(false)}
+        />
+
+        <div
+          className={`absolute left-0 top-0 h-full w-64 bg-[var(--bg)] border-r border-[var(--border)] shadow-xl transform transition-transform ${
+            sidebarOpen ? "translate-x-0" : "-translate-x-full"
+          }`}
+        >
+          <div className="flex items-center justify-between px-3 py-3 border-b border-[var(--border)]/80">
+            <div className="flex items-center gap-2">
+              <div className="menu-icon1">
+                <div className="menu-icon1_line-top"></div>
+                <div className="menu-icon1_line-middle">
+                  <div className="menu-icon1_line-middle-inner"></div>
+                </div>
+                <div className="menu-icon1_line-bottom"></div>
+              </div>
+              <div className="flex flex-col">
+                <span className="text-xs font-semibold">Menu</span>
+                <span className="text-[10px] text-[var(--muted)]">
+                  Navigation
+                </span>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(false)}
+              className="text-[11px] rounded-full border border-[var(--border)] px-2 py-1 hover:bg-[var(--bg-soft)]"
+            >
+              ✕
+            </button>
+          </div>
+
+          <nav className="px-2 py-3 flex flex-col gap-1 text-[13px] overflow-y-auto">
+            {navLinks.map((link) => {
+              const active =
+                pathname === link.href ||
+                pathname.startsWith(link.href + "/");
+              return (
+                <Link
+                  key={link.href}
+                  href={link.href}
+                  className={[
+                    "flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors border border-transparent",
+                    active
+                      ? "bg-[var(--bg)] text-[var(--ink)] border-[var(--brand)]/60"
+                      : "text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)]",
+                  ].join(" ")}
+                >
+                  <span className="w-5 text-center text-[13px]">
+                    {link.icon}
+                  </span>
+                  <span>{link.label}</span>
+                </Link>
+              );
+            })}
+          </nav>
+
+          <div className="border-t border-[var(--border)]/70 px-3 py-3 text-[11px] space-y-2">
+            {/* Badge crédits aussi dans le menu mobile */}
+            {CreditsBadge}
+
+            {user?.email && (
+              <p className="mb-1 text-[var(--muted)]">
+                Connecté·e :{" "}
+                <span className="font-medium text-[var(--ink)]">
+                  {user.email}
+                </span>
+              </p>
+            )}
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="w-full text-[11px] rounded-full border border-[var(--border)] px-3 py-1.5 bg-[var(--bg)] hover:border-red-500 hover:text-red-300 transition-colors"
+            >
+              Se déconnecter
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+````
+
+## File: components/user/CreditsBadge.tsx
+````typescript
+"use client";
+
+import { useUserCredits } from "@/hooks/useUserCredits";
+
+export function CreditsBadge() {
+  const { credits, loading } = useUserCredits();
+
+  return (
+    <div className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--ink)]">
+      <span className="text-[13px]">⚡</span>
+      {loading ? (
+        <span className="opacity-70">Chargement…</span>
+      ) : (
+        <span>
+          <span className="font-semibold">{credits}</span> crédits
+        </span>
+      )}
+    </div>
+  );
+}
+````
+
+## File: components/ActivityTracker.tsx
+````typescript
+// components/ActivityTracker.tsx
+"use client";
+
+import { useEffect } from "react";
+import { useAuth } from "@/context/AuthContext";
+import { updateLastActive } from "@/lib/userTracking";
+
+/**
+ * Composant invisible qui met à jour lastActiveAt
+ * toutes les 60 secondes tant que l'utilisateur est connecté.
+ * On en profite pour envoyer:
+ *  - la page actuelle (path)
+ *  - le device (iPhone / iPad / macOS / etc.)
+ *  - l’IP + pays + ville (via userTracking)
+ */
+export default function ActivityTracker() {
+  const { user } = useAuth();
+
+  useEffect(() => {
+    if (!user) return;
+
+    let cancelled = false;
+
+    const tick = () => {
+      if (!user || cancelled) return;
+
+      const path =
+        typeof window !== "undefined"
+          ? window.location.pathname + window.location.search
+          : undefined;
+
+      updateLastActive(user, {
+        path,
+        action: "heartbeat",
+      });
+    };
+
+    // première mise à jour immédiate
+    tick();
+    const id = setInterval(tick, 60_000); // toutes les 60 secondes
+
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [user]);
+
+  return null;
+}
+````
+
+## File: components/AOSProvider.tsx
+````typescript
+"use client";
+
+import { useEffect } from "react";
+import AOS from "aos";
+import "aos/dist/aos.css";
+
+export default function AOSProvider({ children }: { children: React.ReactNode }) {
+  useEffect(() => {
+    AOS.init({
+      duration: 1000, // durée des animations
+      once: true,     // n’anime qu’une seule fois
+      easing: "ease-out-cubic",
+      offset: 60
+    });
+  }, []);
+
+  return <>{children}</>;
+}
+````
+
+## File: components/BlockedOverlay.tsx
+````typescript
+// components/BlockedOverlay.tsx
+"use client";
+
+import { useAuth } from "@/context/AuthContext";
+import { useUserProfile } from "@/hooks/useUserProfile";
+
+/**
+ * Affiche un overlay pleine page si le user est marqué "blocked" dans Firestore.
+ * Résultat : impossible de cliquer / utiliser l'app.
+ */
+export default function BlockedOverlay() {
+  const { user } = useAuth();
+  const { profile, loading } = useUserProfile();
+
+  // pas connecté ou encore en chargement -> pas d'overlay
+  if (!user || loading) return null;
+
+  if (!profile?.blocked) return null;
+
+  return (
+    <div className="fixed inset-0 z-[9999] bg-black/80 backdrop-blur-sm flex items-center justify-center px-4">
+      <div className="max-w-md w-full glass border border-red-500/40 rounded-2xl p-6 text-center">
+        <h2 className="text-lg font-semibold mb-2 text-red-100">
+          Accès bloqué
+        </h2>
+        <p className="text-xs text-[var(--muted)] mb-4">
+          Ton compte a été temporairement bloqué par l&apos;administration.
+          Tu ne peux plus utiliser l&apos;assistant tant que le blocage est
+          actif.
+        </p>
+        <p className="text-[11px] text-[var(--muted)] mb-4">
+          Si tu penses qu&apos;il s&apos;agit d&apos;une erreur, contacte le
+          support ou l&apos;administrateur.
+        </p>
+        <p className="text-[10px] text-[var(--muted)]/70">
+          ID utilisateur :{" "}
+          <span className="font-mono">
+            {profile.id.slice(0, 8)}…
+          </span>
+        </p>
+      </div>
+    </div>
+  );
+}
+````
+
+## File: components/BuyCreditsButtons.tsx
+````typescript
+// src/components/BuyCreditsButtons.tsx
+"use client";
+
+import { useState } from "react";
+
+type CreditPackId = "10" | "20" | "30";
+
+interface BuyCreditsButtonsProps {
+  user: {
+    id: string;
+    email: string;
+  };
+}
+
+export function BuyCreditsButtons({ user }: BuyCreditsButtonsProps) {
+  const [loadingPack, setLoadingPack] = useState<CreditPackId | null>(null);
+
+  const handleBuy = async (packId: CreditPackId) => {
+    try {
+      setLoadingPack(packId);
+
+      const res = await fetch("/api/polar/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          packId,
+          email: user.email,
+          userId: user.id,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!data.ok || !data.url) {
+        console.error("Erreur réponse API Polar:", data);
+        alert("Erreur lors de la création du paiement.");
+        return;
+      }
+
+      // Redirection vers la page de paiement Polar
+      window.location.href = data.url;
+    } catch (error) {
+      console.error("Erreur handleBuy:", error);
+      alert("Une erreur est survenue.");
+    } finally {
+      setLoadingPack(null);
+    }
+  };
+
+  const isLoading = (pack: CreditPackId) => loadingPack === pack;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <button onClick={() => handleBuy("10")} disabled={isLoading("10")}>
+        {isLoading("10") ? "Redirection..." : "Acheter 10 crédits"}
+      </button>
+      <button onClick={() => handleBuy("20")} disabled={isLoading("20")}>
+        {isLoading("20") ? "Redirection..." : "Acheter 20 crédits"}
+      </button>
+      <button onClick={() => handleBuy("30")} disabled={isLoading("30")}>
+        {isLoading("30") ? "Redirection..." : "Acheter 30 crédits"}
+      </button>
+    </div>
+  );
+}
+````
+
+## File: components/LandingFeatures.tsx
+````typescript
+"use client";
+
+import { motion } from "framer-motion";
+
+const features = [
+  {
+    title: "CV IA optimisé",
+    desc: "Importe ton CV PDF, laisse Gemini en extraire le profil et génère un CV optimisé."
+  },
+  {
+    title: "Lettres sur-mesure",
+    desc: "Colle une offre, obtiens une lettre adaptée à ton profil et à l'entreprise ciblée."
+  },
+  {
+    title: "Suivi simplifié",
+    desc: "Garde une trace de toutes tes candidatures avec un tracker clair et visuel."
+  }
+];
+
+export default function LandingFeatures() {
+  return (
+    <section className="px-4 sm:px-8 pb-6">
+      <div className="max-w-6xl mx-auto grid gap-3 md:grid-cols-3">
+        {features.map((f, idx) => (
+          <motion.div
+            key={f.title}
+            initial={{ opacity: 0, y: 8 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, amount: 0.4 }}
+            transition={{ duration: 0.2, delay: idx * 0.05 }}
+            className="glass p-4 text-sm"
+          >
+            <h3 className="text-sm font-semibold mb-1">{f.title}</h3>
+            <p className="text-xs text-[var(--muted)]">{f.desc}</p>
+          </motion.div>
+        ))}
+      </div>
+    </section>
+  );
+}
+````
+
+## File: components/LandingHero.tsx
+````typescript
+"use client";
+
+import { motion } from "framer-motion";
+import Link from "next/link";
+
+export default function LandingHero() {
+  return (
+    <section className="px-4 sm:px-8 pt-8 pb-6">
+      <div className="max-w-6xl mx-auto flex flex-col gap-6 md:flex-row md:items-center">
+        <motion.div
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.25 }}
+          className="flex-1"
+        >
+          <p className="badge-muted mb-3">
+            <span className="w-1 h-1 rounded-full bg-emerald-400" />
+            <span>IA appliquée aux candidatures</span>
+          </p>
+          <h1 className="text-2xl sm:text-3xl md:text-4xl font-semibold leading-tight mb-3">
+            Ton bureau de candidature, piloté par l&apos;IA.
+          </h1>
+          <p className="text-sm sm:text-base text-[var(--muted)] max-w-xl mb-4">
+            Importe ton CV, génère des lettres de motivation ciblées, prépare ton pitch oral
+            et suis toutes tes candidatures depuis un seul espace, pensé pour les profils tech
+            et cybersécurité.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Link href="/signup" className="btn-primary text-xs sm:text-sm">
+              Essayer gratuitement
+            </Link>
+            <Link href="/login" className="btn-secondary text-xs sm:text-sm">
+              Se connecter
+            </Link>
+          </div>
+        </motion.div>
+
+        <motion.div
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.25, delay: 0.05 }}
+          className="flex-1"
+        >
+          <div className="glass p-4 text-xs text-[var(--muted)]">
+            <p className="mb-2 text-[11px] uppercase tracking-[0.18em]">
+              Aperçu temps réel
+            </p>
+            <p>
+              Un tableau de bord unique pour ton CV, tes LM, ton pitch et ton suivi de
+              candidatures. Design inspiré de ton interface actuelle, en Next.js + Tailwind CSS
+              + Framer Motion.
+            </p>
+          </div>
+        </motion.div>
+      </div>
+    </section>
+  );
+}
+````
+
+## File: components/LandingStack.tsx
+````typescript
+"use client";
+
+import { motion } from "framer-motion";
+import Link from "next/link";
+
+export default function LandingStack() {
+  return (
+    <section className="px-4 sm:px-8 pb-10">
+      <div className="max-w-6xl mx-auto glass p-4 sm:p-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
+          <div>
+            <p className="badge-muted mb-1">
+              <span>Stack technique</span>
+            </p>
+            <h2 className="text-sm sm:text-base font-semibold">
+              Une stack moderne pour une expérience fluide
+            </h2>
+          </div>
+          <Link href="/tech" className="text-[11px] text-[var(--brand)] underline">
+            Voir les détails techniques
+          </Link>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-3 text-xs sm:text-sm">
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.2 }}
+          >
+            <p className="font-semibold mb-1">Frontend · React / Next.js</p>
+            <p className="text-[var(--muted)]">
+              Framework JavaScript moderne pour construire une interface rapide,
+              SEO-friendly et bien routée.
+            </p>
+          </motion.div>
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.2, delay: 0.05 }}
+          >
+            <p className="font-semibold mb-1">Styling · Tailwind CSS</p>
+            <p className="text-[var(--muted)]">
+              Un framework utilitaire qui permet de décliner ton design sombre actuel
+              dans une grille cohérente et responsive.
+            </p>
+          </motion.div>
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.2, delay: 0.1 }}
+          >
+            <p className="font-semibold mb-1">Animations · Framer Motion</p>
+            <p className="text-[var(--muted)]">
+              Des transitions douces et maîtrisées pour donner vie aux cartes,
+              modales et panneaux comme dans ton design original.
+            </p>
+          </motion.div>
+        </div>
+      </div>
+    </section>
+  );
+}
+````
+
+## File: components/PaymentHeader.jsx
+````javascript
+"use client";
+
+import { useEffect } from "react";
+
+export default function PaymentHeader({ onClose, autoCloseMs = 0 }) {
+  useEffect(() => {
+    if (!autoCloseMs) return;
+    const t = setTimeout(() => onClose?.(), autoCloseMs);
+    return () => clearTimeout(t);
+  }, [autoCloseMs, onClose]);
+
+  return (
+    <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)]/70 bg-[var(--bg-soft)]/80">
+      <div className="flex flex-col">
+        <span className="text-[12px] font-semibold text-[var(--ink)]">
+          Paiement sécurisé
+        </span>
+        <span className="text-[11px] text-[var(--muted)]">
+          Transaction gérée par Polar (Stripe)
+        </span>
+      </div>
+
+      <button
+        type="button"
+        onClick={onClose}
+        className="text-[11px] rounded-full border border-[var(--border)] px-2 py-1 hover:bg-[var(--bg)]"
+        aria-label="Fermer"
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+````
+
+## File: components/PolarCheckoutModal.jsx
+````javascript
+"use client";
+
+import { useEffect } from "react";
+import PaymentHeader from "./PaymentHeader";
+
+export default function PolarCheckoutModal({ open, url, onClose, onDone }) {
+  useEffect(() => {
+    if (!open) return;
+
+    function handleMessage(e) {
+      // On accepte uniquement les messages venant de NOTRE domaine
+      if (e.origin !== window.location.origin) return;
+
+      const data = e.data;
+      if (!data || typeof data !== "object") return;
+      if (data.type !== "POLAR_CHECKOUT_DONE") return;
+
+      onDone?.(data.status);
+      onClose?.();
+    }
+
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, [open, onClose, onDone]);
+
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div className="w-full max-w-3xl overflow-hidden rounded-2xl bg-white shadow-xl">
+        <PaymentHeader onClose={onClose} />
+
+        <div className="h-[80vh] bg-white">
+          {url ? (
+            <iframe
+              title="Polar checkout"
+              src={url}
+              className="h-full w-full"
+              allow="payment *"
+            />
+          ) : (
+            <div className="p-4 text-sm">Chargement…</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+````
+
+## File: components/SidebarUser.tsx
+````typescript
+"use client";
+
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { useState } from "react";
+
+type AppLink = {
+  href: string;
+  label: string;
+  icon?: string;
+};
+
+// Liens principaux
+const MAIN_LINKS: AppLink[] = [
+  { href: "/app", label: "Profil CV IA", icon: "📄" },
+  { href: "/app/lm", label: "Assistant candidature", icon: "✨" },
+  { href: "/app/tracker", label: "Suivi candidatures", icon: "📊" },
+  { href: "/app/interview", label: "Préparer entretien", icon: "🎤" },
+  { href: "/app/apply", label: "Postuler", icon: "📨" },
+  { href: "/app/history", label: "Historique IA", icon: "🕒" },
+  { href: "/app/credits", label: "Crédits", icon: "⚡" },
+];
+
+const SETTINGS_LINK: AppLink = {
+  href: "/app/settings",
+  label: "Paramètres",
+  icon: "⚙️",
+};
+
+export default function SidebarUser() {
+  const pathname = usePathname();
+
+  // Desktop collapse
+  const [collapsed, setCollapsed] = useState(false);
+
+  // Mobile sidebar
+  const [mobileOpen, setMobileOpen] = useState(false);
+
+  const baseItem =
+    "flex items-center gap-2 rounded-lg px-2 py-1.5 text-[11px] transition-colors";
+
+  const isLinkActive = (href: string) =>
+    pathname === href || pathname.startsWith(href + "/");
+
+  return (
+    <>
+      {/* === BOUTON HAMBURGER MOBILE === */}
+      <button
+        className="menu-icon1 md:hidden fixed top-3 left-3 z-50"
+        onClick={() => setMobileOpen((o) => !o)}
+      >
+        <div className="menu-icon1_line-top"></div>
+        <div className="menu-icon1_line-middle">
+          <div className="menu-icon1_line-middle-inner"></div>
+        </div>
+        <div className="menu-icon1_line-bottom"></div>
+      </button>
+
+      {/* === OVERLAY MOBILE (clic pour fermer) === */}
+      {mobileOpen && (
+        <div
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40 md:hidden"
+          onClick={() => setMobileOpen(false)}
+        ></div>
+      )}
+
+      {/* === SIDEBAR === */}
+      <aside
+        className={`
+          bg-[var(--bg-soft)]
+          border-r border-[var(--border)]/80
+          h-screen
+          flex flex-col
+          sticky top-0
+          z-50
+          transition-all duration-300
+
+          md:w-[210px] md:relative md:translate-x-0
+          ${collapsed ? "md:w-[60px]" : "md:w-[210px]"}
+          
+          /* Mobile offcanvas */
+          fixed top-0 left-0 w-[230px]
+          md:static
+          ${mobileOpen ? "translate-x-0" : "-translate-x-full"}
+        `}
+      >
+        {/* Header Desktop (bouton collapse) */}
+        <div className="hidden md:flex items-center justify-start px-2 py-3 border-b border-[var(--border)]/70">
+          <button
+            type="button"
+            onClick={() => setCollapsed((c) => !c)}
+            aria-label={collapsed ? "Déplier navigation" : "Replier navigation"}
+            className="menu-icon1 inline-flex items-center justify-center w-7 h-7 rounded-lg border border-[var(--border)] bg-[var(--bg)] text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)] text-[11px]"
+          >
+            {collapsed ? "»" : "«"}
+          </button>
+        </div>
+
+        {/* Mobile : petit espace en haut */}
+        <div className="md:hidden h-[60px]"></div>
+
+        {/* Liens */}
+        <nav className="flex-1 px-2 py-3 flex flex-col gap-1 overflow-y-auto">
+          {MAIN_LINKS.map((link) => {
+            const active = isLinkActive(link.href);
+            return (
+              <Link
+                key={link.href}
+                href={link.href}
+                onClick={() => setMobileOpen(false)} // fermer sidebar mobile
+                className={
+                  active
+                    ? `${baseItem} bg-[var(--bg)] text-[var(--ink)] border border-[var(--brand)]/60`
+                    : `${baseItem} text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg)]`
+                }
+              >
+                <span className="w-5 text-center text-[12px]">
+                  {link.icon ?? "•"}
+                </span>
+                {!collapsed && <span>{link.label}</span>}
+              </Link>
+            );
+          })}
+        </nav>
+
+        {/* Paramètres */}
+        <div className="px-2 py-3 border-t border-[var(--border)]/70">
+          <Link
+            href={SETTINGS_LINK.href}
+            onClick={() => setMobileOpen(false)}
+            className={
+              isLinkActive(SETTINGS_LINK.href)
+                ? `${baseItem} bg-[var(--bg)] text-[var(--ink)] border border-[var(--brand)]/60`
+                : `${baseItem} text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg)]`
+            }
+          >
+            <span className="w-5 text-center text-[12px]">
+              {SETTINGS_LINK.icon}
+            </span>
+            {!collapsed && <span>{SETTINGS_LINK.label}</span>}
+          </Link>
+        </div>
+      </aside>
+    </>
+  );
+}
+````
+
+## File: components/TopbarUser.tsx
+````typescript
+"use client";
+
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/context/AuthContext";
+
+export default function TopbarUser() {
+  const router = useRouter();
+  const { user, logout } = useAuth();
+
+  const handleLogout = async () => {
+    try {
+      await logout(); // ou ton signOut(auth) dans le contexte
+      router.push("/login");
+    } catch (err) {
+      console.error("Erreur déconnexion :", err);
+    }
+  };
+
+  // On privilégie le displayName (Prénom Nom)
+  const displayName =
+    user?.displayName ||
+    (user?.email ? user.email.split("@")[0] : "Utilisateur");
+
+  return (
+    <header className="sticky top-0 z-30 bg-[var(--bg)]/90 backdrop-blur-xl border-b border-[var(--border)]/70">
+      <div className="max-w-6xl mx-auto px-4 sm:px-8 h-14 flex items-center justify-between gap-4">
+        {/* Logo + mini titre à gauche */}
+        <Link href="/app" className="flex items-center gap-2 shrink-0">
+          <div className="w-8 h-8 rounded-2xl bg-gradient-to-br from-[var(--brand)] to-[var(--brandDark)] shadow-lg shadow-[var(--brand)]/30 flex items-center justify-center text-[11px] font-semibold">
+            AI
+          </div>
+          <div className="hidden sm:flex flex-col leading-tight">
+            <span className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)]">
+              Assistant candidatures
+            </span>
+            <span className="text-xs font-medium">Espace connecté</span>
+          </div>
+        </Link>
+
+        {/* À droite : connecté en tant que + bouton déconnexion */}
+        <div className="flex items-center gap-3 ml-auto">
+          {user && (
+            <div className="flex flex-col items-end leading-tight text-[10px] sm:text-[11px]">
+              <span className="text-[var(--muted)] hidden sm:inline">
+                Connecté·e en tant que
+              </span>
+              <span className="text-[var(--ink)] font-medium max-w-[160px] truncate">
+                {displayName}
+              </span>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="inline-flex items-center justify-center text-[11px] sm:text-[12px] px-3 py-1.5 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] hover:bg-[var(--bg)] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+          >
+            Se déconnecter
+          </button>
+        </div>
+      </div>
+    </header>
+  );
+}
+````
+
+## File: context/AuthContext.tsx
+````typescript
+"use client";
+
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  type ReactNode,
+} from "react";
+import {
+  onIdTokenChanged,
+  signOut,
+  type User,
+  getIdTokenResult,
+} from "firebase/auth";
+import { auth, db } from "@/lib/firebase";
+import { doc, getDoc } from "firebase/firestore";
+
+type AuthContextType = {
+  user: User | null;
+  loading: boolean;
+  isAdmin: boolean;
+  blocked: boolean;
+  logout: () => Promise<void>;
+};
+
+const AuthContext = createContext<AuthContextType>({
+  user: null,
+  loading: true,
+  isAdmin: false,
+  blocked: false,
+  logout: async () => {},
+});
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [blocked, setBlocked] = useState(false);
+
+  useEffect(() => {
+    const unsub = onIdTokenChanged(auth, async (firebaseUser) => {
+      setLoading(true);
+
+      // Déconnecté
+      if (!firebaseUser) {
+        setUser(null);
+        setIsAdmin(false);
+        // IMPORTANT: on ne force pas blocked=false ici,
+        // comme ça si un compte vient d’être rejeté car bloqué,
+        // la page /login peut garder le message.
+        setLoading(false);
+        return;
+      }
+
+      // 1) ✅ Vérif Firestore AVANT d’exposer user
+      try {
+        const ref = doc(db, "users", firebaseUser.uid);
+        const snap = await getDoc(ref);
+        const data = snap.data() as any | undefined;
+
+        if (data?.blocked) {
+          // 🔒 Compte bloqué : on rejette la session AVANT toute redirection / rendu /app
+          setBlocked(true);
+          setUser(null);
+          setIsAdmin(false);
+          setLoading(false);
+
+          try {
+            await signOut(auth);
+          } catch (e) {
+            console.error("Erreur signOut (blocked):", e);
+          }
+          return;
+        }
+
+        // Compte OK → on reset blocked
+        setBlocked(false);
+      } catch (e) {
+        // 🔐 Par sécurité + pour éviter le flash,
+        // si la vérif Firestore plante, on refuse la session.
+        console.error("Erreur vérification blocked:", e);
+
+        setBlocked(true);
+        setUser(null);
+        setIsAdmin(false);
+        setLoading(false);
+
+        try {
+          await signOut(auth);
+        } catch (err) {
+          console.error("Erreur signOut (firestore check failed):", err);
+        }
+        return;
+      }
+
+      // 2) ✅ Admin claims (après validation blocked)
+      try {
+        const tokenResult = await getIdTokenResult(firebaseUser, true);
+        const claims = tokenResult.claims || {};
+        const adminFlag =
+          claims.isAdmin === true || claims.email === "aakane0105@gmail.com";
+        setIsAdmin(adminFlag);
+      } catch (e) {
+        console.error("Erreur récupération des custom claims:", e);
+        setIsAdmin(false);
+      }
+
+      // 3) ✅ On expose user seulement maintenant
+      setUser(firebaseUser);
+      setLoading(false);
+    });
+
+    return () => unsub();
+  }, []);
+
+  const logout = async () => {
+    // logout volontaire => on efface le statut blocked UI
+    setBlocked(false);
+    await signOut(auth);
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, loading, isAdmin, blocked, logout }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  return useContext(AuthContext);
+}
+````
+
+## File: context/CreditsContext.tsx
+````typescript
+"use client";
+
+import { createContext, useContext, useEffect, useState } from "react";
+import { useAuth } from "@/context/AuthContext";
+// TODO: brancher Firestore pour écouter les crédits en temps réel
+
+interface CreditsContextValue {
+  credits: number | null;
+}
+
+const CreditsContext = createContext<CreditsContextValue>({
+  credits: null
+});
+
+export function CreditsProvider({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  const [credits, setCredits] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!user) {
+      setCredits(null);
+      return;
+    }
+    // TODO: écouter doc Firestore "users/{uid}" et lire le champ credits
+  }, [user]);
+
+  return (
+    <CreditsContext.Provider value={{ credits }}>
+      {children}
+    </CreditsContext.Provider>
+  );
+}
+
+export const useCredits = () => useContext(CreditsContext);
+````
+
+## File: context/LangContext.tsx
+````typescript
+"use client";
+
+import { createContext, useContext, useEffect, useState } from "react";
+
+type LangCode =
+  | "fr"
+  | "en"
+  | "es"
+  | "de"
+  | "pt"
+  | "it"
+  | "ru"
+  | "zh"
+  | "ar"
+  | "ja";
+
+type LangContextValue = {
+  lang: LangCode;
+  setLang: (l: LangCode) => void;
+};
+
+const LangContext = createContext<LangContextValue | undefined>(undefined);
+
+export function LangProvider({ children }: { children: React.ReactNode }) {
+  const [lang, setLangState] = useState<LangCode>("fr");
+
+  useEffect(() => {
+    // 1) récupérer la langue du localStorage si dispo
+    const stored = typeof window !== "undefined"
+      ? (localStorage.getItem("lang") as LangCode | null)
+      : null;
+    if (stored) {
+      setLangState(stored);
+      return;
+    }
+
+    // 2) sinon essayer de détecter la langue du navigateur
+    if (typeof window !== "undefined") {
+      const navLang = window.navigator.language.slice(0, 2).toLowerCase();
+      const supported: LangCode[] = [
+        "fr",
+        "en",
+        "es",
+        "de",
+        "pt",
+        "it",
+        "ru",
+        "zh",
+        "ar",
+        "ja",
+      ];
+      if (supported.includes(navLang as LangCode)) {
+        setLangState(navLang as LangCode);
+        localStorage.setItem("lang", navLang);
+      }
+    }
+  }, []);
+
+  const setLang = (l: LangCode) => {
+    setLangState(l);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("lang", l);
+    }
+  };
+
+  return (
+    <LangContext.Provider value={{ lang, setLang }}>
+      {children}
+    </LangContext.Provider>
+  );
+}
+
+export function useLang() {
+  const ctx = useContext(LangContext);
+  if (!ctx) {
+    throw new Error("useLang must be used inside LangProvider");
+  }
+  return ctx;
+}
+````
+
+## File: functions/recaptcha-interview.js
+````javascript
+"use strict";
+
+const functions = require("firebase-functions");
+const admin = require("firebase-admin");
+const { RecaptchaEnterpriseServiceClient } = require("@google-cloud/recaptcha-enterprise");
+
+// Init Admin
+if (!admin.apps.length) admin.initializeApp();
+
+const recaptchaClient = new RecaptchaEnterpriseServiceClient();
+
+/* ============================
+   CORS (Hosting + localhost)
+   ============================ */
+function setCors(req, res) {
+  const origin = req.headers.origin || "";
+  const allowed = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://assistant-ia-v4.web.app",
+    "https://assistant-ia-v4.firebaseapp.com",
+  ];
+
+  if (allowed.includes(origin)) {
+    res.set("Access-Control-Allow-Origin", origin);
+  } else {
+    // (Option) tu peux mettre ton domaine custom ici si tu en as un
+    // res.set("Access-Control-Allow-Origin", "https://tondomaine.com");
+  }
+
+  res.set("Vary", "Origin");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+/* ============================
+   reCAPTCHA config
+   ============================ */
+function getRecaptchaConfig() {
+  const cfg = (functions.config && functions.config() && functions.config().recaptcha) || {};
+  const projectId = cfg.project_id || process.env.RECAPTCHA_PROJECT_ID || "";
+  const siteKey = cfg.site_key || process.env.RECAPTCHA_SITE_KEY || "";
+  const thresholdRaw = cfg.threshold || process.env.RECAPTCHA_THRESHOLD || "0.5";
+
+  const threshold = Number(thresholdRaw);
+  return {
+    projectId,
+    siteKey,
+    threshold: Number.isFinite(threshold) ? threshold : 0.5,
+  };
+}
+
+function getClientIp(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf.trim()) return xf.split(",")[0].trim();
+  return (
+    req.ip ||
+    (req.connection && req.connection.remoteAddress) ||
+    (req.socket && req.socket.remoteAddress) ||
+    ""
+  );
+}
+
+function normalizeAction(action) {
+  return String(action || "").trim().toLowerCase();
+}
+
+/**
+ * Vérifie un token reCAPTCHA Enterprise
+ */
+async function verifyRecaptchaToken({ token, expectedAction, req }) {
+  const { projectId, siteKey, threshold } = getRecaptchaConfig();
+
+  // Si pas configuré, on ne bloque pas (mais on log)
+  if (!projectId || !siteKey) {
+    console.warn("[recaptcha] NOT CONFIGURED -> bypass (projectId/siteKey missing)");
+    return { ok: true, bypass: true, score: null, threshold };
+  }
+
+  if (!token) return { ok: false, reason: "missing_token" };
+
+  const userIp = getClientIp(req);
+  const userAgent = String(req.headers["user-agent"] || "");
+
+  const parent = `projects/${projectId}`;
+
+  const [assessment] = await recaptchaClient.createAssessment({
+    parent,
+    assessment: {
+      event: {
+        token,
+        siteKey,
+        expectedAction: expectedAction || undefined,
+        userAgent: userAgent || undefined,
+        userIpAddress: userIp || undefined,
+      },
+    },
+  });
+
+  const tokenProps = assessment && assessment.tokenProperties;
+  if (!tokenProps || tokenProps.valid !== true) {
+    return {
+      ok: false,
+      reason: "invalid_token",
+      invalidReason: tokenProps ? tokenProps.invalidReason : null,
+    };
+  }
+
+  // Action check (reCAPTCHA est case-sensitive)
+  if (expectedAction && tokenProps.action && String(tokenProps.action) !== String(expectedAction)) {
+    return {
+      ok: false,
+      reason: "action_mismatch",
+      expected: expectedAction,
+      got: tokenProps.action,
+    };
+  }
+
+  const score =
+    assessment &&
+    assessment.riskAnalysis &&
+    typeof assessment.riskAnalysis.score === "number"
+      ? assessment.riskAnalysis.score
+      : null;
+
+  if (typeof score === "number" && score < threshold) {
+    return { ok: false, reason: "low_score", score, threshold };
+  }
+
+  return { ok: true, score, threshold };
+}
+
+/* ============================
+   1) Endpoint public: /recaptchaVerify
+   ============================ */
+exports.recaptchaVerify = functions
+  .region("europe-west1")
+  .https.onRequest(async (req, res) => {
+    setCors(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    if (req.method !== "POST") {
+      return res.status(405).json({ ok: false, reason: "method_not_allowed" });
+    }
+    if (!req.is("application/json")) {
+      return res.status(400).json({ ok: false, reason: "invalid_content_type" });
+    }
+
+    try {
+      const { token, action } = req.body || {};
+      const expectedAction = normalizeAction(action);
+
+      if (!token || !expectedAction) {
+        return res.status(400).json({ ok: false, reason: "missing_token_or_action" });
+      }
+
+      const r = await verifyRecaptchaToken({ token, expectedAction, req });
+
+      if (!r.ok) {
+        return res.status(401).json({ ok: false, reason: r.reason, details: r });
+      }
+
+      return res.status(200).json({ ok: true, score: r.score ?? null });
+    } catch (e) {
+      console.error("recaptchaVerify error:", e);
+      return res.status(500).json({ ok: false, reason: "server_error" });
+    }
+  });
+
+/* ============================
+   2) Cloud Function: interview (protégée par reCAPTCHA)
+   ============================ */
+exports.interview = functions
+  .region("europe-west1")
+  .https.onRequest(async (req, res) => {
+    setCors(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "method_not_allowed" });
+    }
+    if (!req.is("application/json")) {
+      return res.status(400).json({ error: "invalid_content_type" });
+    }
+
+    try {
+      const body = req.body || {};
+
+      // ✅ on accepte plusieurs noms côté front
+      const token =
+        body.recaptchaToken ||
+        body.token ||
+        (body.recaptcha && body.recaptcha.token) ||
+        null;
+
+      // ✅ action: on force une convention stable
+      // IMPORTANT : le front doit générer un token avec CETTE action
+      const expectedAction = normalizeAction(body.recaptchaAction || body.actionName || "interview");
+
+      if (!token) {
+        return res.status(403).json({
+          error: "reCAPTCHA failed",
+          details: "token_missing_or_invalid",
+          expectedAction,
+        });
+      }
+
+      const r = await verifyRecaptchaToken({ token, expectedAction, req });
+      if (!r.ok) {
+        return res.status(403).json({
+          error: "reCAPTCHA failed",
+          details: r.reason,
+          score: r.score ?? null,
+          expectedAction,
+          extra: r,
+        });
+      }
+
+      // ✅ Ici, tu continues TON code interview (Gemini / sessions / credits etc.)
+      // Pour que ça compile direct, je renvoie juste un OK:
+      // Remplace cette partie par ton handler actuel (start/answer) si tu l’as déjà ici.
+
+      return res.status(200).json({ ok: true, message: "interview OK", score: r.score ?? null });
+    } catch (e) {
+      console.error("interview error:", e);
+      return res.status(500).json({ error: "internal_error" });
+    }
+  });
+````
+
+## File: hooks/useAdminGuard.ts
+````typescript
+// src/hooks/useAdminGuard.ts
+"use client";
+
+import { useEffect } from "react";
+import { useRouter, usePathname } from "next/navigation";
+import type { User } from "firebase/auth";
+import { useAuth } from "@/context/AuthContext";
+
+// 👉 Emails qui sont admin "hardcodés" en plus du custom claim isAdmin
+const ADMIN_EMAILS = ["aakane0105@gmail.com"];
+
+export type UseAdminGuardResult = {
+  loading: boolean;
+  isAdmin: boolean;
+  user: User | null;
+};
+
+export function useAdminGuard(): UseAdminGuardResult {
+  const { user, loading, isAdmin: isAdminFromContext } = useAuth();
+  const router = useRouter();
+  const pathname = usePathname();
+
+  // fallback : si jamais le claim n'est pas encore set, mais que l'email est dans la whitelist
+  const email = (user?.email || "").toLowerCase();
+  const hasAdminEmail = ADMIN_EMAILS.includes(email);
+
+  const isAdmin = isAdminFromContext || hasAdminEmail;
+
+  useEffect(() => {
+    if (loading) return;
+
+    const onAdminRoute = pathname?.startsWith("/admin");
+
+    // Pas connecté et route /admin → renvoie vers /admin/login
+    if (!user && onAdminRoute) {
+      router.push("/admin/login");
+      return;
+    }
+
+    // Connecté mais pas admin et route /admin (hors /admin/login) → renvoie vers /
+    if (
+      user &&
+      !isAdmin &&
+      onAdminRoute &&
+      pathname !== "/admin/login"
+    ) {
+      router.push("/");
+    }
+  }, [user, loading, isAdmin, pathname, router]);
+
+  return { loading, isAdmin, user };
+}
+````
+
+## File: hooks/useRechargeHistory.ts
+````typescript
+"use client";
+
+import { useEffect, useState } from "react";
+import { collection, limit, onSnapshot, orderBy, query, Timestamp } from "firebase/firestore";
+import { db } from "@/lib/firebase";
+import { useAuth } from "@/context/AuthContext";
+
+export type RechargeHistoryItem = {
+  id: string;
+  provider?: string;
+  orderId?: string | null;
+  checkoutId?: string | null;
+
+  creditsAdded?: number;
+
+  // si Polar renvoie des montants en cents (souvent), on stocke tel quel et on affiche /100
+  amount?: number | null;
+  currency?: string | null;
+
+  status?: string | null;
+  eventType?: string | null;
+
+  productIds?: string[];
+  priceIds?: string[];
+
+  createdAt?: number; // ms
+};
+
+function toMillis(v: unknown): number | undefined {
+  if (!v) return undefined;
+  if (typeof v === "number") return v;
+  if (v instanceof Date) return v.getTime();
+  if (typeof v === "object" && (v as any).toMillis) return (v as Timestamp).toMillis();
+  return undefined;
+}
+
+export function useRechargeHistory(maxItems = 30) {
+  const { user } = useAuth();
+  const [items, setItems] = useState<RechargeHistoryItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!user?.uid) {
+      setItems([]);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
+    setLoading(true);
+
+    const q = query(
+      collection(db, "users", user.uid, "rechargeHistory"),
+      orderBy("createdAt", "desc"),
+      limit(maxItems)
+    );
+
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const list = snap.docs.map((d) => {
+          const data = d.data() as any;
+          return {
+            id: d.id,
+            ...data,
+            createdAt: toMillis(data.createdAt),
+          } as RechargeHistoryItem;
+        });
+        setItems(list);
+        setLoading(false);
+      },
+      (e) => {
+        console.error("useRechargeHistory:", e);
+        setError(e?.message || "Erreur chargement historique");
+        setLoading(false);
+      }
+    );
+
+    return () => unsub();
+  }, [user?.uid, maxItems]);
+
+  return { items, loading, error };
+}
+````
+
+## File: hooks/useUserCredits.ts
+````typescript
+"use client";
+
+import { useEffect, useState } from "react";
+import { doc, onSnapshot } from "firebase/firestore";
+import { db } from "@/lib/firebase";
+import { useAuth } from "@/context/AuthContext";
+
+type CreditsState = {
+  credits: number;
+  loading: boolean;
+  error: string | null;
+};
+
+export function useUserCredits(): CreditsState {
+  const { user } = useAuth();
+  const [credits, setCredits] = useState<number>(0);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    // reset à chaque changement d'user
+    setError(null);
+
+    if (!user?.uid) {
+      setCredits(0);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+
+    const ref = doc(db, "users", user.uid);
+
+    const unsub = onSnapshot(
+      ref,
+      (snap) => {
+        const data = snap.exists() ? (snap.data() as any) : {};
+        const value = typeof data?.credits === "number" ? data.credits : 0;
+
+        setCredits(value);
+        setLoading(false);
+      },
+      (err) => {
+        console.error("Erreur Firestore (credits):", err);
+        setError("Impossible de charger les crédits.");
+        setLoading(false);
+      }
+    );
+
+    return () => unsub();
+  }, [user?.uid]);
+
+  return { credits, loading, error };
+}
+````
+
+## File: hooks/useUserProfile.ts
+````typescript
+"use client";
+
+import { useEffect, useState } from "react";
+import { doc, onSnapshot } from "firebase/firestore";
+import { db } from "@/lib/firebase";
+import { useAuth } from "@/context/AuthContext";
+
+export interface UserProfile {
+  id: string;
+  email?: string | null;
+  displayName?: string | null;
+  credits?: number;
+  blocked?: boolean;
+  ip?: string | null;
+  city?: string | null;
+  country?: string | null;
+  emailVerified?: boolean;
+  lastLoginAt?: Date | null;
+  lastActiveAt?: Date | null;
+}
+
+export function useUserProfile() {
+  const { user } = useAuth();
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!user) {
+      setProfile(null);
+      setLoading(false);
+      return;
+    }
+
+    const ref = doc(db, "users", user.uid);
+
+    const unsub = onSnapshot(
+      ref,
+      (snap) => {
+        if (!snap.exists()) {
+          setProfile({
+            id: user.uid,
+            email: user.email ?? null,
+            displayName: user.displayName ?? null,
+          });
+          setLoading(false);
+          return;
+        }
+
+        const data = snap.data() as any;
+
+        const lastLoginAt =
+          data.lastLoginAt?.toDate?.() &&
+          typeof data.lastLoginAt.toDate === "function"
+            ? data.lastLoginAt.toDate()
+            : null;
+
+        const lastActiveAt =
+          data.lastActiveAt?.toDate?.() &&
+          typeof data.lastActiveAt.toDate === "function"
+            ? data.lastActiveAt.toDate()
+            : null;
+
+        const profile: UserProfile = {
+          id: snap.id,
+          email: data.email ?? user.email ?? null,
+          displayName: data.displayName ?? user.displayName ?? null,
+          credits:
+            typeof data.credits === "number"
+              ? data.credits
+              : data.credits
+              ? Number(data.credits)
+              : undefined,
+          blocked: data.blocked === true,
+          ip: data.ip ?? null,
+          city: data.city ?? null,
+          country: data.country ?? null,
+          emailVerified:
+            typeof data.emailVerified === "boolean"
+              ? data.emailVerified
+              : user.emailVerified ?? false,
+          lastLoginAt,
+          lastActiveAt,
+        };
+
+        setProfile(profile);
+        setLoading(false);
+      },
+      (error) => {
+        console.error("Erreur onSnapshot user profile:", error);
+        setProfile(null);
+        setLoading(false);
+      }
+    );
+
+    return () => unsub();
+  }, [user]);
+
+  return { profile, loading };
+}
+````
+
+## File: lib/pdf/templates/cvAts.ts
+````typescript
+// src/lib/pdf/templates/cvAts.ts
+import type { PdfColors } from "../colors";
+
+export type CvDocModel = {
+  name: string;
+  title: string;
+  contactLine: string;
+  profile: string;
+
+  skills: {
+    cloud?: string[];
+    sec?: string[];
+    sys?: string[];
+    auto?: string[];
+    tools?: string[];
+    soft?: string[];
+  };
+
+  xp: Array<{
+    company: string;
+    city?: string;
+    role: string;
+    dates: string;
+    bullets: string[];
+  }>;
+
+  education: string[];
+  certs?: string;
+  langLine?: string;
+  hobbies?: string[];
+};
+
+function stripMd(s: string) {
+  return String(s || "")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+    .replace(/`(.*?)`/g, "$1")
+    .replace(/\[(.*?)\]\(.*?\)/g, "$1")
+    .trim();
+}
+
+function cleanBullet(s: string) {
+  return stripMd(s).replace(/^[•\-–]\s*/, "").trim();
+}
+
+function smartCompactProfile(profile: string, est: number) {
+  const p = stripMd(profile);
+  // petit “compact” si beaucoup de contenu (même idée que ton HTML auto) :contentReference[oaicite:3]{index=3}
+  if (est > 3600 && p.length > 420) return p.slice(0, 420).replace(/\s+\S*$/, "…");
+  if (est > 3000 && p.length > 480) return p.slice(0, 480).replace(/\s+\S*$/, "…");
+  return p;
+}
+
+// CV A4 1 page — style auto/compact/expanded + scale (zoom global)
+export function buildCvAtsPdf(
+  cv: CvDocModel,
+  lang: "fr" | "en",
+  colors: PdfColors,
+  styleMode: "auto" | "compact" | "expanded" = "auto",
+  scale = 1
+) {
+  const est =
+    (cv.profile?.length || 0) +
+    (cv.certs?.length || 0) +
+    (cv.langLine?.length || 0) +
+    (cv.hobbies || []).join(" ").length +
+    (cv.education || []).join(" ").length +
+    (cv.xp || [])
+      .map((x) => (x.role || "") + (x.company || "") + (x.city || "") + (x.dates || "") + (x.bullets || []).join(" "))
+      .join(" ").length +
+    Object.values(cv.skills || {})
+      .flat()
+      .join(" ").length;
+
+  let fontSize: number, headSize: number, titleSize: number, lineH: number, margins: number[];
+
+  if (styleMode === "compact") {
+    fontSize = 9.0; headSize = 18.0; titleSize = 11.8; lineH = 1.04; margins = [16, 12, 16, 12];
+  } else if (styleMode === "expanded") {
+    fontSize = 11.4; headSize = 22.5; titleSize = 15.2; lineH = 1.26; margins = [30, 26, 30, 28];
+  } else {
+    if (est < 1900) { fontSize = 11.4; headSize = 22.5; titleSize = 15.2; lineH = 1.26; margins = [30, 26, 30, 28]; }
+    else if (est < 2200) { fontSize = 11.1; headSize = 22.0; titleSize = 14.8; lineH = 1.22; margins = [28, 24, 28, 26]; }
+    else if (est < 2600) { fontSize = 10.8; headSize = 21.2; titleSize = 14.4; lineH = 1.18; margins = [26, 22, 26, 24]; }
+    else if (est < 3000) { fontSize = 10.5; headSize = 20.6; titleSize = 14.0; lineH = 1.15; margins = [24, 20, 24, 22]; }
+    else if (est < 3400) { fontSize = 10.1; headSize = 19.8; titleSize = 13.4; lineH = 1.12; margins = [22, 18, 22, 18]; }
+    else if (est < 3800) { fontSize = 9.8; headSize = 19.2; titleSize = 12.8; lineH = 1.08; margins = [20, 16, 20, 16]; }
+    else if (est < 4300) { fontSize = 9.4; headSize = 18.6; titleSize = 12.4; lineH = 1.06; margins = [18, 14, 18, 14]; }
+    else { fontSize = 9.0; headSize = 18.0; titleSize = 11.8; lineH = 1.04; margins = [16, 12, 16, 12]; }
+  }
+
+  // zoom global
+  fontSize = +(fontSize * scale).toFixed(2);
+  headSize = +(headSize * scale).toFixed(2);
+  titleSize = +(titleSize * scale).toFixed(2);
+  lineH = +(1 + (lineH - 1) * (0.8 + 0.2 * scale)).toFixed(3);
+  margins = margins.map((m) => Math.max(12, Math.round(m * (0.95 + 0.05 * scale))));
+
+  const profileText = smartCompactProfile(cv.profile, est);
+
+  const H = (t: string) => ({
+    text: t,
+    color: colors.brand,
+    bold: true,
+    fontSize: Math.max(10.6, fontSize + 0.6),
+    margin: [0, 6, 0, 3],
+  });
+
+  const thin = {
+    canvas: [{ type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 0.7, lineColor: colors.border }],
+    margin: [0, 2, 0, 6],
+  };
+
+  const s = cv.skills || {};
+  const skillsGrid = {
+    columns: [
+      {
+        width: "*",
+        stack: [
+          { text: lang === "fr" ? "Architecture & Cloud" : "Architecture & Cloud", bold: true, color: colors.muted, margin: [0, 0, 0, 1] },
+          { text: (s.cloud || []).join(", "), alignment: "justify" },
+
+          { text: lang === "fr" ? "Cybersécurité" : "Cybersecurity", bold: true, color: colors.muted, margin: [0, 5, 0, 1] },
+          { text: (s.sec || []).join(", "), alignment: "justify" },
+
+          { text: lang === "fr" ? "Soft skills" : "Soft skills", bold: true, color: colors.muted, margin: [0, 5, 0, 1] },
+          { text: (s.soft || []).join(", "), alignment: "justify" },
+        ],
+      },
+      {
+        width: "*",
+        stack: [
+          { text: lang === "fr" ? "Systèmes & Réseaux" : "Systems & Networks", bold: true, color: colors.muted, margin: [0, 0, 0, 1] },
+          { text: (s.sys || []).join(", "), alignment: "justify" },
+
+          { text: lang === "fr" ? "Automatisation & Outils (IA/API)" : "Automation & Tools (AI/API)", bold: true, color: colors.muted, margin: [0, 5, 0, 1] },
+          { text: ([...(s.auto || []), ...(s.tools || [])]).join(", "), alignment: "justify" },
+        ],
+      },
+    ],
+    columnGap: 14,
+  };
+
+  function xpBlock(x: CvDocModel["xp"][number]) {
+    const header = {
+      text: `${x.company}${x.city ? " — " + x.city : ""} — ${x.role} | ${x.dates}`,
+      margin: [0, 0.5, 0, 1],
+      bold: true,
+    };
+    const bullets = (x.bullets || []).map((b) => ({
+      text: `- ${cleanBullet(b)}`,
+      margin: [0, 0, 0, 0.4],
+      alignment: "justify",
+    }));
+    return [header, ...bullets];
+  }
+
+  const content: any[] = [
+    { text: cv.name, fontSize: headSize, bold: true, alignment: "center", margin: [0, 0, 0, 0] },
+    { text: cv.title, fontSize: titleSize, color: colors.brand, bold: true, alignment: "center", margin: [0, 1, 0, 3] },
+    { text: stripMd(cv.contactLine), bold: true, margin: [0, 0, 0, 4], alignment: "center" },
+    thin,
+
+    H(lang === "fr" ? "Profil" : "Profile"),
+    { text: profileText, margin: [0, 0, 0, 2], alignment: "justify" },
+
+    H(lang === "fr" ? "Compétences clés" : "Key Skills"),
+    skillsGrid,
+
+    H(lang === "fr" ? "Expériences professionnelles" : "Professional Experience"),
+    ...(cv.xp || []).flatMap(xpBlock),
+
+    H(lang === "fr" ? "Formation" : "Education"),
+    { ul: (cv.education || []).map((e) => stripMd(e)), margin: [0, 0, 0, 1] },
+
+    H(lang === "fr" ? "Certifications" : "Certifications"),
+    { text: stripMd(cv.certs || ""), margin: [0, 0, 0, 1], alignment: "justify" },
+
+    H(lang === "fr" ? "Langues" : "Languages"),
+    { text: stripMd(cv.langLine || "") },
+  ];
+
+  if (Array.isArray(cv.hobbies) && cv.hobbies.length) {
+    content.push(H(lang === "fr" ? "Centres d’intérêt / Hobbies" : "Interests"));
+    content.push({ text: cv.hobbies.join(" • "), margin: [0, 0, 0, 1] });
+  }
+
+  return {
+    pageSize: "A4",
+    pageMargins: margins,
+    defaultStyle: { font: "Roboto", fontSize, lineHeight: lineH, color: colors.ink },
+    content,
+  };
+}
+````
+
+## File: lib/pdf/templates/letter.ts
+````typescript
+// lib/pdf/templates/letter.ts
+import type { PdfColors } from "../colors";
+export type { PdfColors } from "../colors";
+
+export type LmModel = {
+  lang: "fr" | "en";
+  name: string;
+  contactLines: string[];
+  service: string;
+  companyName: string;
+  companyAddr?: string;
+  city: string;
+  dateStr: string;
+  subject: string;
+  salutation: string;
+  body: string; // corps uniquement
+  closing: string;
+  signature: string;
+};
+
+function splitParas(text: string) {
+  return (text || "")
+    .replace(/\n{3,}/g, "\n\n")
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
+
+const DEFAULT_COLORS: PdfColors = {
+  brand: "#2563eb",
+  brandDark: "#1e40af",
+  ink: "#0f172a",
+  muted: "#475569",
+  border: "#e2e8f0",
+  bgSoft: "#f1f5f9",
+  hair: "#cbd5e1",
+};
+
+export function buildLmStyledPdf(lm: LmModel, colors: PdfColors, scale = 1) {
+  const bodyParas = splitParas(lm.body);
+
+  const baseFs = 10.5 * scale;
+  const nameFs = 12 * scale;
+
+  const brandColor = colors.brand || DEFAULT_COLORS.brand;
+  const mutedColor = colors.muted || DEFAULT_COLORS.muted;
+  const hairColor = colors.hair || DEFAULT_COLORS.hair;
+  const inkColor = colors.ink || DEFAULT_COLORS.ink;
+
+  const rightStack: any[] = [
+    { text: lm.service, color: mutedColor },
+    { text: lm.companyName, bold: true, color: mutedColor },
+    ...(lm.companyAddr ? lm.companyAddr.split(/\n+/).map((l) => ({ text: l })) : []),
+  ];
+
+  const hair = {
+    canvas: [
+      {
+        type: "line",
+        x1: 0,
+        y1: 0,
+        x2: 515,
+        y2: 0,
+        lineWidth: 1,
+        lineColor: hairColor,
+      },
+    ],
+    margin: [0, 6, 0, 10],
+  };
+
+  const dateLine =
+    lm.lang === "en" ? `At ${lm.city}, ${lm.dateStr}` : `À ${lm.city}, le ${lm.dateStr}`;
+
+  return {
+    pageSize: "A4",
+    pageMargins: [40, 36, 40, 36],
+    defaultStyle: {
+      font: "Roboto",
+      fontSize: baseFs,
+      lineHeight: 1.24,
+      color: inkColor,
+    },
+    content: [
+      // barre brand
+      {
+        canvas: [
+          { type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 3, lineColor: brandColor },
+        ],
+        margin: [0, 0, 0, 10],
+      },
+
+      // header 2 colonnes
+      {
+        columns: [
+          {
+            width: "*",
+            stack: [
+              { text: lm.name, bold: true, fontSize: nameFs, color: mutedColor },
+              ...(lm.contactLines || []).map((t) => ({ text: t })),
+            ],
+          },
+          {
+            width: "auto",
+            alignment: "right",
+            stack: rightStack,
+            margin: [0, 28, 0, 0],
+          },
+        ],
+        columnGap: 15,
+      },
+
+      hair,
+
+      { text: dateLine, margin: [0, 0, 0, 8] },
+      { text: lm.subject, bold: true, color: brandColor, margin: [0, 0, 0, 10] },
+      { text: lm.salutation, margin: [0, 0, 0, 8] },
+
+      ...bodyParas.map((p) => ({ text: p, margin: [0, 0, 0, 6] })),
+
+      { text: lm.closing, margin: [0, 12, 0, 2], alignment: "right" },
+      { text: lm.signature, bold: true, alignment: "right" },
+    ],
+  };
+}
+
+/**
+ * ✅ Fallback qui accepte:
+ * - un LmModel (structuré)
+ * - OU un string (texte brut) => pour ton appel generateCvLm.ts
+ *
+ * Exemples:
+ * buildLmFallbackPdf(params.lmTextFallback || "", colors, scale)
+ * buildLmFallbackPdf(lmModel, colors, scale)
+ */
+export function buildLmFallbackPdf(text: string, colors: PdfColors, scale?: number): any;
+export function buildLmFallbackPdf(lm: LmModel, colors: PdfColors, scale?: number): any;
+export function buildLmFallbackPdf(text: string, scale?: number): any;
+export function buildLmFallbackPdf(lm: LmModel, scale?: number): any;
+export function buildLmFallbackPdf(
+  first: string | LmModel,
+  second?: PdfColors | number,
+  third?: number
+) {
+  const colors: PdfColors =
+    typeof second === "object" && second ? second : DEFAULT_COLORS;
+
+  const scale =
+    typeof second === "number" ? second : typeof third === "number" ? third : 1;
+
+  // Si on a un modèle structuré -> on garde le rendu exact
+  if (typeof first === "object" && first) {
+    return buildLmStyledPdf(first, colors, scale);
+  }
+
+  // Sinon texte brut (string)
+  const rawText = String(first || "");
+  const paras = splitParas(rawText);
+
+  const brandColor = colors.brand || DEFAULT_COLORS.brand;
+  const hairColor = colors.hair || DEFAULT_COLORS.hair;
+  const inkColor = colors.ink || DEFAULT_COLORS.ink;
+
+  const baseFs = 10.5 * scale;
+
+  return {
+    pageSize: "A4",
+    pageMargins: [40, 36, 40, 36],
+    defaultStyle: {
+      font: "Roboto",
+      fontSize: baseFs,
+      lineHeight: 1.26,
+      color: inkColor,
+    },
+    content: [
+      // barre brand
+      {
+        canvas: [
+          { type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 3, lineColor: brandColor },
+        ],
+        margin: [0, 0, 0, 10],
+      },
+      // ligne fine
+      {
+        canvas: [
+          { type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 1, lineColor: hairColor },
+        ],
+        margin: [0, 0, 0, 12],
+      },
+      // texte brut en paragraphes
+      ...(paras.length ? paras : [""]).map((p) => ({ text: p, margin: [0, 0, 0, 7] })),
+    ],
+  };
+}
+````
+
+## File: lib/pdf/templates/types.ts
+````typescript
+// src/lib/pdf/templates/types.ts
+export type Lang = "fr" | "en";
+
+export type CvDocModel = {
+  name: string;
+  title: string;
+  contact: string; // "Paris | +33... | mail | linkedin"
+  profile: string;
+
+  skills: {
+    cloud?: string[];
+    sec?: string[];
+    sys?: string[];
+    auto?: string[];
+    tools?: string[];
+    soft?: string[];
+  };
+
+  xp: Array<{
+    company: string;
+    city?: string;
+    role: string;
+    dates: string;
+    bullets: string[];
+  }>;
+
+  education: string[];
+  certs: string;
+  langLine: string;
+  hobbies?: string[];
+};
+
+export type LmModel = {
+  lang: Lang;
+  name: string;
+  contactLines: string[]; // ["Téléphone: ...", "Email: ..."]
+  service: string;
+  companyName: string;
+  companyAddr?: string; // multi-line
+  city: string;
+  dateStr: string;
+  aPrefix: string; // "À " (FR) / "At " (EN)
+  subject: string;
+  salutation: string;
+  body: string; // paragraphes séparés par \n\n
+  closing: string;
+  signature: string;
+};
+````
+
+## File: lib/pdf/colors.ts
+````typescript
+// lib/pdf/colors.ts
+export type PdfColors = {
+  brand: string;
+  brandDark: string;
+  ink: string;
+  muted: string;
+  border: string;
+  bgSoft: string;
+  hair: string; // ✅ requis par letter.ts
+};
+
+function clamp(n: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, n));
+}
+
+function normalizeHex(hex: string) {
+  let h = (hex || "").trim();
+  if (!h.startsWith("#")) h = `#${h}`;
+  if (h.length === 4) {
+    // #RGB -> #RRGGBB
+    h = `#${h[1]}${h[1]}${h[2]}${h[2]}${h[3]}${h[3]}`;
+  }
+  if (!/^#[0-9a-fA-F]{6}$/.test(h)) return "#2563eb";
+  return h.toLowerCase();
+}
+
+function hexToRgb(hex: string) {
+  const h = normalizeHex(hex).slice(1);
+  return {
+    r: parseInt(h.slice(0, 2), 16),
+    g: parseInt(h.slice(2, 4), 16),
+    b: parseInt(h.slice(4, 6), 16),
+  };
+}
+
+function rgbToHex(r: number, g: number, b: number) {
+  const to = (x: number) =>
+    clamp(Math.round(x), 0, 255).toString(16).padStart(2, "0");
+  return `#${to(r)}${to(g)}${to(b)}`;
+}
+
+function darken(hex: string, amount = 28) {
+  const { r, g, b } = hexToRgb(hex);
+  return rgbToHex(r - amount, g - amount, b - amount);
+}
+
+export function makePdfColors(brandHex: string): PdfColors {
+  const brand = normalizeHex(brandHex);
+  return {
+    brand,
+    brandDark: darken(brand, 28),
+
+    ink: "#0f172a", // slate-900
+    muted: "#475569", // slate-600
+    border: "#e2e8f0", // slate-200
+    bgSoft: "#f1f5f9", // slate-100
+    hair: "#cbd5e1", // slate-300 (ligne fine)
+  };
+}
+````
+
+## File: lib/pdf/fitOnePage.ts
+````typescript
+// src/lib/pdf/fitOnePage.ts
+import { PDFDocument } from "pdf-lib";
+import { pdfMakeToBlob } from "./pdfmakeClient";
+
+export async function countPdfPages(blob: Blob): Promise<number> {
+  const ab = await blob.arrayBuffer();
+  const pdf = await PDFDocument.load(ab);
+  return pdf.getPageCount();
+}
+
+export async function fitOnePage(
+  buildDoc: (scale: number) => any,
+  opts?: { min?: number; max?: number; iterations?: number; initial?: number }
+): Promise<{ blob: Blob; bestScale: number }> {
+  const min = opts?.min ?? 0.8;
+  const max = opts?.max ?? 1.6;
+  const iterations = opts?.iterations ?? 8;
+  const initial = opts?.initial ?? 1.0;
+
+  let low = min;
+  let high = max;
+
+  // test initial
+  let bestBlob: Blob | null = null;
+  let bestScale = initial;
+
+  let testBlob = await pdfMakeToBlob(buildDoc(initial));
+  let pages = await countPdfPages(testBlob);
+
+  if (pages > 1) {
+    high = initial;
+  } else {
+    bestBlob = testBlob;
+    low = initial;
+  }
+
+  for (let i = 0; i < iterations; i++) {
+    const mid = +(((low + high) / 2)).toFixed(3);
+    const blob = await pdfMakeToBlob(buildDoc(mid));
+    const n = await countPdfPages(blob);
+
+    if (n > 1) {
+      high = mid - 0.01;
+    } else {
+      bestBlob = blob;
+      bestScale = mid;
+      low = mid + 0.01;
+    }
+    if (high - low < 0.01) break;
+  }
+
+  if (!bestBlob) {
+    bestBlob = await pdfMakeToBlob(buildDoc(min));
+    bestScale = min;
+  }
+
+  return { blob: bestBlob, bestScale };
+}
+````
+
+## File: lib/pdf/generateCvLm.ts
+````typescript
+// src/lib/pdf/generateCvLm.ts
+import { makePdfColors } from "./colors";
+import { fitOnePage } from "./fitOnePage";
+import { mergePdfBlobs } from "./mergePdfs";
+import { downloadBlob } from "./pdfmakeClient";
+import { buildCvAtsPdf, type CvDocModel } from "./templates/cvAts";
+import { buildLmStyledPdf, buildLmFallbackPdf, type LmModel } from "./templates/letter";
+
+export async function generateAndDownloadCvLmPdf(params: {
+  brandHex: string;
+  cv: CvDocModel;
+  cvLang: "fr" | "en";
+  // LM: soit modèle structuré, soit texte brut
+  lm?: LmModel;
+  lmTextFallback?: string;
+  filename?: string;
+}) {
+  const colors = makePdfColors(params.brandHex);
+
+  // 1) CV -> fit 1 page
+  const cvFit = await fitOnePage((scale) =>
+    buildCvAtsPdf(params.cv, params.cvLang, colors, "auto", scale)
+  );
+
+  // 2) LM -> fit 1 page
+  const lmFit = await fitOnePage((scale) => {
+    if (params.lm) return buildLmStyledPdf(params.lm, colors, scale);
+    return buildLmFallbackPdf(params.lmTextFallback || "", colors, scale);
+  }, { min: 0.85, max: 1.6, iterations: 6, initial: 1.0 });
+
+  // 3) fusion (2 pages)
+  const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
+
+  downloadBlob(merged, params.filename || `CV_LM_${new Date().toISOString().slice(0, 10)}.pdf`);
+}
+````
+
+## File: lib/pdf/lmPrompt.ts
+````typescript
+// src/lib/pdf/lmPrompt.ts
+
+type LmPromptParams = {
+  lang: "fr" | "en";
+  cvText: string; // buildProfileContextForIA(profile)
+  jobTitle?: string;
+  companyName?: string;
+  jobDescription?: string;
+  constraints?: {
+    minWords?: number; // default 170
+    maxWords?: number; // default 240
+  };
+};
+
+/**
+ * Prompt "corps de LM" : domaine-agnostique, basé CV + fiche de poste.
+ * Sortie demandée: JSON { "body": "..." } (body = texte brut avec paragraphes séparés par \n\n)
+ */
+export function buildLmBodyPrompt(p: LmPromptParams): string {
+  const lang = p.lang ?? "fr";
+  const jobTitle = (p.jobTitle || "").trim();
+  const companyName = (p.companyName || "").trim();
+  const jobDescription = (p.jobDescription || "").trim();
+  const minWords = p.constraints?.minWords ?? 170;
+  const maxWords = p.constraints?.maxWords ?? 240;
+
+  const safeJobTitle = jobTitle || (lang === "en" ? "the role" : "le poste");
+  const safeCompany = companyName || (lang === "en" ? "your company" : "votre entreprise");
+  const safeJD = jobDescription || "—";
+
+  if (lang === "en") {
+    return `
+You are a senior career coach and recruiter.
+
+TASK:
+Write ONLY the BODY of a professional cover letter tailored to the job, using ONLY the candidate info provided.
+It must work for ANY domain (tech, admin, sales, healthcare, etc.) by extracting key requirements from the job description and matching them to the candidate profile.
+
+INPUTS:
+- Job title: ${safeJobTitle}
+- Company: ${safeCompany}
+- Job description:
+${safeJD}
+
+- Candidate profile (source of truth):
+${p.cvText}
+
+STRICT RULES:
+- DO NOT invent facts, employers, degrees, tools, dates, metrics.
+- If a detail is missing, write generically (e.g., "I have delivered impactful projects") without fake numbers.
+- Output MUST be STRICT JSON only:
+{ "body": "..." }
+- "body" must be plain text with paragraphs separated by ONE blank line (\n\n).
+- No header, no address, no subject line, no greeting, no signature, no bullets, no emojis.
+
+CONTENT GUIDANCE (domain-agnostic):
+- 3 to 5 short paragraphs.
+1) Motivation for ${safeJobTitle} at ${safeCompany} + a credible hook based on the profile.
+2) Match 3–5 requirements from the job description to relevant skills/experience from the profile.
+3) Mention 1–2 concrete contributions/achievements from the candidate’s experience (only if present), otherwise describe typical contributions.
+4) How the candidate will contribute in the first months (methods, collaboration, outcomes).
+5) Polite closing inviting to discuss.
+
+LENGTH:
+Between ${minWords} and ${maxWords} words.
+Return the JSON now.
+`.trim();
+  }
+
+  // FR
+  return `
+Tu es un coach carrières senior et recruteur.
+
+MISSION :
+Rédige UNIQUEMENT le CORPS d’une lettre de motivation professionnelle, parfaitement adaptée au poste, en utilisant UNIQUEMENT les informations du candidat fournies.
+Le prompt doit fonctionner pour TOUS les domaines (tech, administratif, commercial, santé, etc.) : tu extrais les exigences de la fiche de poste et tu les relies au profil.
+
+ENTRÉES :
+- Intitulé du poste : ${safeJobTitle}
+- Entreprise : ${safeCompany}
+- Fiche de poste / description :
+${safeJD}
+
+- Profil candidat (source de vérité) :
+${p.cvText}
+
+RÈGLES STRICTES :
+- N’invente rien (entreprises, diplômes, outils, dates, chiffres).
+- Si une info manque, reste générique ("j’ai contribué à des projets à impact") sans métriques inventées.
+- Réponds OBLIGATOIREMENT en JSON STRICT, sans texte autour :
+{ "body": "..." }
+- "body" = texte brut avec paragraphes séparés par UNE ligne vide (\n\n).
+- Pas d’en-tête, pas d’adresses, pas d’objet, pas de formule d’appel, pas de signature, pas de listes à puces, pas d’émojis.
+
+DIRECTIVE CONTENU (multi-domaines) :
+- 3 à 5 paragraphes courts.
+1) Motivation pour ${safeJobTitle} chez ${safeCompany} + accroche crédible basée sur le profil.
+2) Fais le lien entre 3–5 attentes de la fiche de poste et les compétences/expériences du CV.
+3) Cite 1–2 contributions/réalisations concrètes SI elles existent dans le CV, sinon décris des apports typiques (qualité, rigueur, coordination, relation client, etc.).
+4) Explique comment le candidat contribuera dans les premiers mois (méthode, collaboration, résultats).
+5) Conclusion polie ouvrant sur un entretien.
+
+LONGUEUR :
+Entre ${minWords} et ${maxWords} mots.
+Retourne le JSON maintenant.
+`.trim();
+}
+````
+
+## File: lib/pdf/mergePdfs.ts
+````typescript
+// src/lib/pdf/mergePdfs.ts
+import { PDFDocument } from "pdf-lib";
+
+/**
+ * Merge plusieurs PDFs (Blob) en un seul PDF (Blob).
+ * Compatible Next.js / TS: évite le type Uint8Array<ArrayBufferLike> non accepté par BlobPart.
+ */
+export async function mergePdfBlobs(blobs: Blob[]): Promise<Blob> {
+  const merged = await PDFDocument.create();
+
+  for (const b of blobs) {
+    const ab = await b.arrayBuffer();
+    const pdf = await PDFDocument.load(ab);
+
+    const pages = await merged.copyPages(pdf, pdf.getPageIndices());
+    for (const p of pages) merged.addPage(p);
+  }
+
+  const bytes = await merged.save();
+
+  // ✅ Cast sûr pour BlobPart (ArrayBuffer-backed)
+  const safeBytes = new Uint8Array(bytes);
+
+  return new Blob([safeBytes], { type: "application/pdf" });
+}
+````
+
+## File: lib/pdf/pdfmakeClient.ts
+````typescript
+// src/lib/pdf/pdfmakeClient.ts
+let cached: any | null = null;
+
+function buildVfsFromModule(mod: any) {
+  if (!mod) return null;
+
+  // Cas classique: { pdfMake: { vfs: {...} } }
+  const classic =
+    mod?.pdfMake?.vfs ??
+    mod?.default?.pdfMake?.vfs ??
+    mod?.default?.vfs ??
+    mod?.vfs;
+
+  if (classic && typeof classic === "object") return classic;
+
+  // ✅ Ton cas: le module expose directement les fichiers Roboto-*.ttf
+  // Ex: { "Roboto-Regular.ttf": "base64...", ..., default: {...} }
+  const candidate = typeof mod === "object" ? mod : null;
+  if (!candidate) return null;
+
+  const vfs: Record<string, string> = {};
+
+  for (const [k, v] of Object.entries(candidate)) {
+    if (k === "default") continue;
+    if (!k.toLowerCase().endsWith(".ttf")) continue;
+    if (typeof v !== "string") continue;
+    vfs[k] = v;
+  }
+
+  // Certains bundlers mettent les .ttf dans default
+  const def = candidate?.default;
+  if (def && typeof def === "object") {
+    for (const [k, v] of Object.entries(def)) {
+      if (!k.toLowerCase().endsWith(".ttf")) continue;
+      if (typeof v !== "string") continue;
+      vfs[k] = v;
+    }
+  }
+
+  return Object.keys(vfs).length ? vfs : null;
+}
+
+export async function getPdfMake() {
+  if (cached) return cached;
+
+  const pdfMakeMod: any = await import("pdfmake/build/pdfmake");
+  const pdfMake = pdfMakeMod.default ?? pdfMakeMod;
+
+  const fontsMod: any = await import("pdfmake/build/vfs_fonts");
+  const vfs = buildVfsFromModule(fontsMod);
+
+  if (!vfs) {
+    console.error("vfs_fonts module keys:", Object.keys(fontsMod || {}));
+    console.error("vfs_fonts.default keys:", Object.keys(fontsMod?.default || {}));
+    throw new Error("pdfmake vfs_fonts introuvable (vfs).");
+  }
+
+  pdfMake.vfs = vfs;
+
+  pdfMake.fonts = {
+    Roboto: {
+      normal: "Roboto-Regular.ttf",
+      bold: "Roboto-Medium.ttf",
+      italics: "Roboto-Italic.ttf",
+      bolditalics: "Roboto-MediumItalic.ttf",
+    },
+  };
+
+  cached = pdfMake;
+  return pdfMake;
+}
+
+export async function pdfMakeToBlob(docDef: any): Promise<Blob> {
+  const pdfMake = await getPdfMake();
+  return new Promise((resolve) => pdfMake.createPdf(docDef).getBlob(resolve));
+}
+
+export function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 15000);
+}
+````
+
+## File: lib/server/credits.ts
+````typescript
+// lib/server/credits.ts
+//
+// VERSION DEV SANS FIRESTORE
+// --------------------------
+// On simule juste des crédits illimités pour tous les utilisateurs.
+// Ça évite les erreurs Firebase Admin en local.
+// Quand tu voudras brancher Firestore côté serveur, tu pourras
+// rétablir la logique avec firebase-admin ici.
+
+type DevUser = {
+  id: string;
+  credits: number;
+};
+
+export async function verifyUserAndCredits(
+  userId: string
+): Promise<DevUser | null> {
+  if (!userId) return null;
+
+  // En DEV : tous les users sont autorisés, avec beaucoup de crédits.
+  return {
+    id: userId,
+    credits: 9999,
+  };
+}
+
+export async function consumeCredit(
+  userId: string,
+  amount = 1
+): Promise<void> {
+  // En DEV : on ne fait rien, on log juste.
+  console.log(
+    `[DEV][credits] Consommation simulée de ${amount} crédit(s) pour l'utilisateur ${userId}`
+  );
+}
+````
+
+## File: lib/apiClient.ts
+````typescript
+"use client";
+
+import { API_BASE, tryGetRecaptchaToken } from "@/lib/recaptcha";
+
+type JsonHeaders = Record<string, string>;
+
+function normalizePath(path: string) {
+  return (path || "").replace(/^\/+/, "");
+}
+
+function buildRecaptchaError(action: string) {
+  return new Error(
+    `reCAPTCHA indisponible pour l’action "${action}". ` +
+      `Vérifie : (1) NEXT_PUBLIC_RECAPTCHA_SITE_KEY, (2) script chargé, (3) adblock, (4) domaine autorisé côté Google.`
+  );
+}
+
+export async function postJsonWithRecaptcha<T>(
+  path: string,
+  action: string,
+  body: any,
+  extraHeaders: JsonHeaders = {}
+): Promise<T> {
+  const token = await tryGetRecaptchaToken(action);
+  if (!token) throw buildRecaptchaError(action);
+
+  const res = await fetch(`${API_BASE}/${normalizePath(path)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Recaptcha-Token": token,
+      ...extraHeaders,
+    },
+    body: JSON.stringify({
+      ...body,
+      recaptchaToken: token, // ✅ compatible avec ton backend
+      recaptchaAction: action,
+    }),
+    cache: "no-store",
+  });
+
+  const text = await res.text();
+  let data: any = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // si le backend renvoie pas du JSON
+  }
+
+  if (!res.ok) {
+    const msg =
+      (data && (data.error || data.message)) ||
+      text ||
+      `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+
+  return data as T;
+}
+
+export async function postBlobWithRecaptcha(
+  path: string,
+  action: string,
+  body: any,
+  extraHeaders: JsonHeaders = {}
+): Promise<Blob> {
+  const token = await tryGetRecaptchaToken(action);
+  if (!token) throw buildRecaptchaError(action);
+
+  const res = await fetch(`${API_BASE}/${normalizePath(path)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Recaptcha-Token": token,
+      ...extraHeaders,
+    },
+    body: JSON.stringify({
+      ...body,
+      recaptchaToken: token,
+      recaptchaAction: action,
+    }),
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    let data: any = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {}
+    const msg =
+      (data && (data.error || data.message)) ||
+      text ||
+      `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+
+  return await res.blob();
+}
+````
+
+## File: lib/auth.ts
+````typescript
+"use client";
+
+import { auth } from "./firebase";
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
+  updateProfile,
+  sendEmailVerification,
+} from "firebase/auth";
+
+export async function signupWithEmail(
+  firstName: string,
+  lastName: string,
+  email: string,
+  password: string
+) {
+  const cred = await createUserWithEmailAndPassword(auth, email, password);
+
+  await updateProfile(cred.user, {
+    displayName: `${firstName} ${lastName}`.trim(),
+  });
+
+  // 👉 ICI : on laisse Firebase envoyer son email standard
+  await sendEmailVerification(cred.user);
+
+  return cred;
+}
+
+export async function loginWithEmail(email: string, password: string) {
+  return signInWithEmailAndPassword(auth, email, password);
+}
+
+export async function logout() {
+  return signOut(auth);
+}
+````
+
+## File: lib/credits.ts
+````typescript
+// src/lib/credits.ts
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  increment,
+  query,
+  setDoc,
+  updateDoc,
+  where,
+} from "firebase/firestore";
+import { db } from "@/lib/firebase";
+
+/**
+ * Ajoute des crédits à un utilisateur identifié par son userId (document users/{userId}).
+ */
+export async function addCreditsToUserById(
+  userId: string,
+  creditsToAdd: number
+): Promise<void> {
+  if (!userId) {
+    console.error("[credits] userId manquant");
+    return;
+  }
+  if (!creditsToAdd || creditsToAdd <= 0) {
+    console.warn("[credits] creditsToAdd <= 0, rien à ajouter", {
+      userId,
+      creditsToAdd,
+    });
+    return;
+  }
+
+  const ref = doc(db, "users", userId);
+  const snap = await getDoc(ref);
+
+  if (!snap.exists()) {
+    console.warn(
+      "[credits] Doc user inexistant, création avec crédits initiaux",
+      { userId, creditsToAdd }
+    );
+    await setDoc(ref, {
+      credits: creditsToAdd,
+      createdAt: new Date(),
+    });
+    return;
+  }
+
+  console.log("[credits] Ajout de crédits par userId", { userId, creditsToAdd });
+
+  await updateDoc(ref, {
+    credits: increment(creditsToAdd),
+  });
+}
+
+/**
+ * Ajoute des crédits à (tous) les utilisateurs qui ont cet email.
+ * Fallback si on n’a pas externalId dans l’event Polar.
+ */
+export async function addCreditsToUserByEmail(
+  email: string,
+  creditsToAdd: number
+): Promise<void> {
+  if (!email) {
+    console.error("[credits] email manquant");
+    return;
+  }
+  if (!creditsToAdd || creditsToAdd <= 0) {
+    console.warn("[credits] creditsToAdd <= 0, rien à ajouter", {
+      email,
+      creditsToAdd,
+    });
+    return;
+  }
+
+  const usersCol = collection(db, "users");
+  const q = query(usersCol, where("email", "==", email));
+  const qs = await getDocs(q);
+
+  if (qs.empty) {
+    console.warn(
+      "[credits] Aucun user trouvé avec cet email, création impossible",
+      { email, creditsToAdd }
+    );
+    return;
+  }
+
+  console.log(
+    "[credits] Ajout de crédits par email (tous les users trouvés)",
+    { email, creditsToAdd, count: qs.size }
+  );
+
+  const promises: Promise<any>[] = [];
+  qs.forEach((docSnap) => {
+    promises.push(
+      updateDoc(docSnap.ref, {
+        credits: increment(creditsToAdd),
+      })
+    );
+  });
+
+  await Promise.all(promises);
+}
+
+/**
+ * Consomme des crédits pour un utilisateur.
+ *
+ * Pour être flexible avec ton code existant, cette fonction accepte :
+ *  - consumeCredits(userId, 3)
+ *  - consumeCredits({ userId: "xxx", amount: 3 })
+ *  - consumeCredits({ userId: "xxx", credits: 3 })
+ */
+export async function consumeCredits(arg1: any, arg2?: any): Promise<void> {
+  let userId: string | undefined;
+  let toConsume = 0;
+
+  if (typeof arg1 === "string") {
+    userId = arg1;
+    toConsume = typeof arg2 === "number" ? arg2 : 0;
+  } else if (typeof arg1 === "object" && arg1 !== null) {
+    userId = arg1.userId || arg1.uid;
+    toConsume =
+      arg1.amount ?? arg1.credits ?? arg1.count ?? arg1.nb ?? 0;
+  }
+
+  if (!userId || !toConsume || toConsume <= 0) {
+    console.warn(
+      "[credits] consumeCredits appelé sans paramètres valides",
+      { arg1, arg2 }
+    );
+    return;
+  }
+
+  const ref = doc(db, "users", userId);
+  const snap = await getDoc(ref);
+
+  if (!snap.exists()) {
+    console.warn(
+      "[credits] user inexistant pour consumeCredits, aucun débit",
+      { userId }
+    );
+    return;
+  }
+
+  console.log("[credits] Consommation de crédits", {
+    userId,
+    toConsume,
+  });
+
+  await updateDoc(ref, {
+    credits: increment(-toConsume),
+  });
+}
+````
+
+## File: lib/firebaseAdmin.ts
+````typescript
+// lib/firebaseAdmin.ts
+import admin from "firebase-admin";
+
+if (!admin.apps.length) {
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+  if (projectId && clientEmail && rawPrivateKey) {
+    const privateKey = rawPrivateKey.replace(/\\n/g, "\n");
+    try {
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId,
+          clientEmail,
+          privateKey,
+        }),
+      });
+      console.log("[firebaseAdmin] Initialisé avec les variables d'env");
+    } catch (err) {
+      console.error("[firebaseAdmin] Erreur d'initialisation :", err);
+    }
+  } else {
+    console.warn(
+      "[firebaseAdmin] Variables d'env manquantes. Admin ne sera pas initialisé (OK en DEV)."
+    );
+  }
+}
+
+export default admin;
+````
+
+## File: lib/firestore.ts
+````typescript
+import { db } from "./firebase";
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  setDoc,
+  updateDoc,
+  addDoc,
+  query,
+  where
+} from "firebase/firestore";
+
+// Placeholders pour tes futures fonctions Firestore (users, candidatures, etc.)
+export {
+  db,
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  setDoc,
+  updateDoc,
+  addDoc,
+  query,
+  where
+};
+````
+
+## File: lib/interviewPrompt.ts
+````typescript
+// lib/interviewPrompt.ts
+
+// Canal de l'entretien : écrit (chat) ou oral (avec micro + TTS plus tard)
+export type InterviewChannel = "written" | "oral";
+
+// Niveau de difficulté / séniorité
+export type InterviewLevel = "junior" | "intermediate" | "senior";
+
+// Élément d'historique échangé pendant l'entretien
+export type HistoryItem = {
+  role: "interviewer" | "candidate";
+  text: string;
+  createdAt?: string; // <-- IMPORTANT pour ne plus avoir createdAt en rouge
+  analysis?: string | null;
+};
+
+export type BuildPromptArgs = {
+  cvSummary: string;
+  jobDesc: string;
+  mode: string; // "mixed" | "tech" | "rh" | "hard" etc.
+  level: InterviewLevel;
+  channel: InterviewChannel;
+  history: HistoryItem[];
+  step: number;
+};
+
+/**
+ * Construit le prompt envoyé à Gemini pour générer :
+ * - la prochaine question
+ * - l'analyse rapide de la réponse précédente
+ * - le résumé final + score quand l'IA estime avoir assez d'informations
+ */
+export function buildPrompt({
+  cvSummary,
+  jobDesc,
+  mode,
+  level,
+  channel,
+  history,
+  step,
+}: BuildPromptArgs): string {
+  const historyText =
+    history.length === 0
+      ? "Aucun échange pour le moment (début d'entretien)."
+      : history
+          .map((h) => {
+            const who =
+              h.role === "interviewer" ? "INTERVIEWER" : "CANDIDAT";
+            return `- [${who}] ${h.text}`;
+          })
+          .join("\n");
+
+  let modeDescription = "";
+  switch (mode) {
+    case "tech":
+      modeDescription =
+        "Pose principalement des questions techniques (cloud, sécurité, réseau, etc.).";
+      break;
+    case "rh":
+      modeDescription =
+        "Pose surtout des questions RH, motivation, soft-skills, culture d'entreprise.";
+      break;
+    case "hard":
+      modeDescription =
+        "Sois très exigeant, avec des questions difficiles, de relance et de mise en situation.";
+      break;
+    default:
+      modeDescription =
+        "Mélange de questions techniques et RH/motivation.";
+  }
+
+  let levelDescription = "";
+  switch (level) {
+    case "junior":
+      levelDescription =
+        "Considère un profil plutôt junior : évalue le potentiel, la motivation et les bases techniques.";
+      break;
+    case "intermediate":
+      levelDescription =
+        "Considère un profil intermédiaire : quelques années d'expérience, autonomie moyenne.";
+      break;
+    case "senior":
+      levelDescription =
+        "Considère un profil senior : forte expertise, autonomie, leadership possible.";
+      break;
+  }
+
+  const channelDescription =
+    channel === "oral"
+      ? "Le candidat répond à l'oral. Les questions doivent être plutôt courtes, conversationnelles, comme dans un vrai échange vocal."
+      : "Le candidat répond à l'écrit via un chat. Tu peux poser des questions un peu plus détaillées mais reste concis.";
+
+  return `
+Tu joues le rôle d'un recruteur humain qui fait passer un entretien d'embauche en français.
+
+Contexte candidat (résumé de CV) :
+${cvSummary || "Non renseigné."}
+
+Contexte poste (fiche de poste / offre) :
+${jobDesc || "Non renseigné."}
+
+Mode d'entretien : ${mode}
+${modeDescription}
+
+Niveau d'entretien : ${level}
+${levelDescription}
+
+Canal : ${channel}
+${channelDescription}
+
+Étape actuelle de l'entretien : ${step}
+Historique des échanges (du plus ancien au plus récent) :
+${historyText}
+
+OBJECTIF :
+- Poser des questions pertinentes par rapport au poste et au profil.
+- Être honnête et exigeant sur la compatibilité avec la fiche de poste.
+- Quand tu estimes avoir assez d'informations, produire un résumé final détaillé + un score global de compatibilité sur 100.
+
+⚠️ TRÈS IMPORTANT : FORMAT DE RÉPONSE OBLIGATOIRE ⚠️
+Tu dois répondre STRICTEMENT en JSON valide, sans texte autour, sans Markdown, sans commentaires, sans \`\`\`.
+
+Format exact attendu :
+
+{
+  "next_question": string | null,
+  "short_analysis": string | null,
+  "final_summary": string | null,
+  "final_score": number | null
+}
+
+Règles :
+- Tant que l'entretien continue :
+  - "next_question" = la prochaine question à poser au candidat (en français).
+  - "short_analysis" = une analyse très courte (2-3 phrases max) de la dernière réponse du candidat.
+  - "final_summary" = null
+  - "final_score" = null
+- Quand tu estimes que l'entretien est terminé :
+  - "next_question" = null
+  - "short_analysis" = une courte phrase de conclusion si tu veux
+  - "final_summary" = un résumé structuré de la performance du candidat, points forts / points faibles, recommandation (oui / non / à voir).
+  - "final_score" = un nombre entier de 0 à 100 représentant la compatibilité globale avec la fiche de poste.
+
+Ta réponse DOIT être un JSON pur, directement parsable par JSON.parse en JavaScript.
+  `.trim();
+}
+````
+
+## File: lib/ipLocation.ts
+````typescript
+// lib/ipLocation.ts
+// Récupère IP + pays + ville côté client, avec un petit cache en sessionStorage
+
+export type ClientLocation = {
+  ip: string | null;
+  country: string | null;
+  city: string | null;
+};
+
+let inMemoryLocation: ClientLocation | null = null;
+let inFlightPromise: Promise<ClientLocation | null> | null = null;
+
+function loadFromSession(): ClientLocation | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem("smartcv_location_cache");
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "ip" in parsed &&
+      "country" in parsed &&
+      "city" in parsed
+    ) {
+      return parsed as ClientLocation;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function saveToSession(loc: ClientLocation) {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(
+      "smartcv_location_cache",
+      JSON.stringify(loc)
+    );
+  } catch {
+    // ignore
+  }
+}
+
+export async function getClientLocation(): Promise<ClientLocation | null> {
+  if (typeof window === "undefined") return null;
+
+  if (inMemoryLocation) return inMemoryLocation;
+
+  const cached = loadFromSession();
+  if (cached) {
+    inMemoryLocation = cached;
+    return cached;
+  }
+
+  if (inFlightPromise) return inFlightPromise;
+
+  inFlightPromise = (async () => {
+    try {
+      const res = await fetch("https://ipapi.co/json/");
+      if (!res.ok) throw new Error("IP API error");
+      const data = await res.json();
+
+      const loc: ClientLocation = {
+        ip: data.ip || null,
+        country: data.country_name || data.country || null,
+        city: data.city || null,
+      };
+
+      inMemoryLocation = loc;
+      saveToSession(loc);
+      return loc;
+    } catch (e) {
+      console.error("Erreur getClientLocation:", e);
+      const loc: ClientLocation = {
+        ip: null,
+        country: null,
+        city: null,
+      };
+      inMemoryLocation = loc;
+      saveToSession(loc);
+      return loc;
+    }
+  })();
+
+  return inFlightPromise;
+}
+````
+
+## File: lib/linkedin.ts
+````typescript
+// Fichier : lib/auth.ts
+
+// Vous devez vous assurer que ces imports sont valides dans votre structure
+import { auth } from "@/lib/firebase"; // Import de l'instance d'authentification Firebase
+import { signInWithCustomToken, UserCredential } from "firebase/auth";
+
+// 👉 Login via LinkedIn
+// idToken ici est le Custom Token Firebase généré par votre Cloud Function.
+export async function loginWithLinkedInIdToken(idToken: string): Promise<UserCredential> {
+  console.log(
+    "[auth] Tentative de connexion via Custom Token LinkedIn...",
+    idToken
+  );
+
+  try {
+    // 1. Utilisez le Custom Token pour connecter l'utilisateur Firebase.
+    const credential = await signInWithCustomToken(auth, idToken);
+    
+    console.log("[auth] Connexion LinkedIn réussie:", credential.user.uid);
+    
+    // Le Custom Token est échangé contre une session utilisateur complète.
+    return credential; 
+    
+  } catch (error) {
+    console.error("[auth] Erreur lors de la connexion via Custom Token:", error);
+    throw new Error("Impossible de se connecter à Firebase avec le Custom Token fourni.");
+  }
+}
+````
+
+## File: lib/logAuthFailed.ts
+````typescript
+// src/lib/logAuthFailed.ts
+import { addDoc, collection, serverTimestamp } from "firebase/firestore";
+import { db } from "@/lib/firebase";
+
+export interface LogAuthFailedParams {
+  email?: string;
+  provider?: string;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+/**
+ * Détection OS / device / navigateur à partir du userAgent
+ */
+function parseUserAgent(uaRaw: string | null | undefined) {
+  const ua = (uaRaw ?? "").toLowerCase();
+
+  let deviceType: string | null = null;
+  let os: string | null = null;
+  let browser: string | null = null;
+
+  // --- Device ---
+  if (ua.includes("iphone")) {
+    deviceType = "iphone";
+  } else if (ua.includes("ipad")) {
+    deviceType = "ipad";
+  } else if (ua.includes("android") && ua.includes("mobile")) {
+    deviceType = "mobile";
+  } else if (ua.includes("android")) {
+    deviceType = "tablet";
+  } else if (ua.includes("macintosh") || ua.includes("mac os x")) {
+    deviceType = "desktop";
+  } else if (ua.includes("windows")) {
+    deviceType = "desktop";
+  } else {
+    deviceType = "desktop";
+  }
+
+  // --- OS ---
+  if (ua.includes("iphone") || ua.includes("ipad") || ua.includes("ipod")) {
+    os = "iOS";
+  } else if (ua.includes("android")) {
+    os = "Android";
+  } else if (ua.includes("mac os x") || ua.includes("macintosh")) {
+    os = "macOS";
+  } else if (ua.includes("windows nt")) {
+    os = "Windows";
+  } else if (ua.includes("linux")) {
+    os = "Linux";
+  }
+
+  // --- Navigateur ---
+  if (ua.includes("safari") && !ua.includes("chrome") && !ua.includes("crios")) {
+    browser = "Safari";
+  } else if (
+    (ua.includes("chrome") || ua.includes("crios")) &&
+    !ua.includes("edge") &&
+    !ua.includes("edg/")
+  ) {
+    browser = "Chrome";
+  } else if (ua.includes("firefox") || ua.includes("fxios")) {
+    browser = "Firefox";
+  } else if (ua.includes("edg/")) {
+    browser = "Edge";
+  } else if (ua.includes("opera") || ua.includes("opr/")) {
+    browser = "Opera";
+  }
+
+  return { deviceType, os, browser };
+}
+
+/**
+ * Récupère l'IP + ville + pays via un petit service public
+ * (tu peux changer pour ton propre endpoint si tu veux).
+ */
+async function fetchIpInfo() {
+  if (typeof window === "undefined") return null;
+
+  try {
+    const res = await fetch("https://ipapi.co/json/");
+    if (!res.ok) return null;
+    const json: any = await res.json();
+
+    return {
+      ip: json.ip || null,
+      country: json.country_name || null,
+      city: json.city || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Log d'une tentative de connexion échouée (auth_failed)
+ * → écrit dans la collection "usageLogs"
+ * → enrichi avec IP, pays, ville, device, OS, navigateur, path
+ */
+export async function logAuthFailed(params: LogAuthFailedParams) {
+  try {
+    const ua =
+      typeof window !== "undefined"
+        ? window.navigator.userAgent || ""
+        : "";
+
+    const path =
+      typeof window !== "undefined"
+        ? window.location.pathname + window.location.search
+        : "";
+
+    const { deviceType, os, browser } = parseUserAgent(ua);
+
+    const geo = await fetchIpInfo();
+
+    await addDoc(collection(db, "usageLogs"), {
+      action: "auth_failed",
+      userId: null, // pas connecté
+      email: params.email || "",
+      provider: params.provider || "password",
+      errorCode: params.errorCode || "",
+      errorMessage: params.errorMessage || "",
+
+      // contexte technique
+      ua,
+      path,
+      deviceType: deviceType ?? null,
+      os: os ?? null,
+      browser: browser ?? null,
+
+      // géoloc basique
+      ip: geo?.ip ?? null,
+      country: geo?.country ?? null,
+      city: geo?.city ?? null,
+
+      createdAt: serverTimestamp(),
+    });
+  } catch (e) {
+    // On ne bloque pas l'utilisateur si le log plante
+    console.error("Erreur logAuthFailed:", e);
+  }
+}
+````
+
+## File: lib/logUsage.ts
+````typescript
+// src/lib/logUsage.ts
+import {
+  addDoc,
+  collection,
+  doc,
+  updateDoc,
+  increment,
+} from "firebase/firestore";
+import { db } from "@/lib/firebase";
+import type { User } from "firebase/auth";
+
+export type UsageDocType = "lm" | "cv" | "other";
+
+interface LogUsageOptions {
+  user: User;
+  action: string;      // ex: "generate_document", "download_document"
+  docType?: UsageDocType; // "lm" | "cv" | "other"
+  eventType?: string;  // ex: "generate", "download"
+  tool?: string;       // ex: "generateLetterAndPitch", "generateCvPdf"
+  creditsDelta?: number; // ex: -1 si tu consommes 1 crédit
+  path?: string;       // path courant (optionnel)
+}
+
+/**
+ * Log d'usage IA côté client :
+ * - crée un document dans "usageLogs"
+ * - met à jour les compteurs dans "users/{uid}"
+ *
+ * → Permet à ton admin d'afficher :
+ *   - LM générées (logs) : docType = "lm"
+ *   - CV générés (logs) : docType = "cv"
+ *   - totalIaCalls, totalDocumentsGenerated, totalLmGenerated, totalCvGenerated
+ */
+export async function logUsage(options: LogUsageOptions) {
+  const {
+    user,
+    action,
+    docType = "other",
+    eventType,
+    tool,
+    creditsDelta,
+  } = options;
+
+  try {
+    const now = Date.now();
+    const path =
+      options.path ||
+      (typeof window !== "undefined"
+        ? window.location.pathname + window.location.search
+        : "");
+
+    // 1) LOG dans usageLogs
+    await addDoc(collection(db, "usageLogs"), {
+      userId: user.uid,
+      email: user.email ?? "",
+      action,         // ex: "generate_document"
+      docType,        // "lm" | "cv" | "other"
+      eventType: eventType ?? null, // ex: "generate"
+      tool: tool ?? null,           // ex: "generateCvPdf"
+
+      creditsDelta: typeof creditsDelta === "number" ? creditsDelta : null,
+
+      path,
+      createdAt: now, // number → ton admin new Date(createdAt)
+
+      ip: null,
+      country: null,
+      city: null,
+      deviceType: null,
+      os: null,
+      browser: null,
+    });
+
+    // 2) Mise à jour des compteurs dans users/{uid}
+    const userRef = doc(db, "users", user.uid);
+
+    const updates: Record<string, any> = {
+      totalIaCalls: increment(1),
+    };
+
+    // Document IA → compteur global
+    if (docType === "lm" || docType === "cv") {
+      updates.totalDocumentsGenerated = increment(1);
+    }
+
+    if (docType === "lm") {
+      updates.totalLmGenerated = increment(1);
+    }
+    if (docType === "cv") {
+      updates.totalCvGenerated = increment(1);
+    }
+
+    if (typeof creditsDelta === "number" && creditsDelta !== 0) {
+      updates.credits = increment(creditsDelta);
+    }
+
+    await updateDoc(userRef, updates);
+  } catch (err) {
+    console.error("Erreur logUsage:", err);
+    // on ne bloque JAMAIS l'utilisateur si le log plante
+  }
+}
+````
+
+## File: lib/polar-checkout.ts
+````typescript
+// src/lib/polar-checkout.ts
+import { polar } from "@/lib/polar";
+
+// Mappe les packs utilisés dans ton app vers les Product IDs Polar
+// Ici on suppose trois packs : 10, 20, 30 crédits
+const PACK_TO_PRODUCT_ID: Record<string, string> = {
+  "10": process.env.POLAR_PRODUCT_10_ID || "",
+  "20": process.env.POLAR_PRODUCT_20_ID || "",
+  "30": process.env.POLAR_PRODUCT_30_ID || "",
+};
+
+const APP_URL =
+  process.env.NEXT_PUBLIC_APP_URL ?? "https://assistant-ia-v4.web.app";
+
+export type CreditPackId = "10" | "20" | "30";
+
+export interface CreateCheckoutOptions {
+  customerEmail?: string;
+  externalCustomerId?: string; // ex: id utilisateur (Firebase, Supabase, etc.)
+}
+
+/**
+ * Crée une session de paiement Polar pour un pack donné.
+ *
+ * @param packId - "10", "20" ou "30" (nombre de crédits du pack)
+ * @param opts - infos client (email, id externe)
+ */
+export async function createPolarCheckout(
+  packId: CreditPackId,
+  opts?: CreateCheckoutOptions
+) {
+  const productId = PACK_TO_PRODUCT_ID[packId];
+
+  if (!productId) {
+    throw new Error(
+      `Pack inconnu côté Polar : "${packId}". Vérifie PACK_TO_PRODUCT_ID dans src/lib/polar-checkout.ts`
+    );
+  }
+
+  // Polar remplace {CHECKOUT_ID} par l'id réel du checkout
+  const successUrl = `${APP_URL}/paiement/success?checkout_id={CHECKOUT_ID}`;
+  const returnUrl = `${APP_URL}/paiement/canceled`;
+
+  const checkout = await polar.checkouts.create({
+    products: [productId],
+    successUrl,
+    returnUrl,
+    customerEmail: opts?.customerEmail,
+    externalCustomerId: opts?.externalCustomerId,
+  });
+
+  if (!checkout.url) {
+    throw new Error("Polar n'a pas renvoyé d'URL de checkout");
+  }
+
+  return { url: checkout.url };
+}
+````
+
+## File: lib/polar.ts
+````typescript
+// src/lib/polar.ts
+import { Polar } from "@polar-sh/sdk";
+
+const server =
+  process.env.POLAR_ENV === "production" ? "production" : "sandbox";
+
+if (!process.env.POLAR_ACCESS_TOKEN) {
+  throw new Error("POLAR_ACCESS_TOKEN manquant dans .env");
+}
+
+// Instance Polar
+export const polar = new Polar({
+  accessToken: process.env.POLAR_ACCESS_TOKEN,
+  // @ts-ignore : selon la version du SDK, server peut être optionnel
+  server,
+});
+
+// ⚠️ Packs alignés avec ton UI : 20 / 50 / 100 crédits
+export type CreditPackId = "20" | "50" | "100";
+
+// ✅ IDs produits liés aux packs, alimentés par tes variables d'env
+const PACK_TO_PRODUCT_ID: Record<CreditPackId, string> = {
+  "20": process.env.POLAR_PRODUCT_20_ID ?? "",
+  "50": process.env.POLAR_PRODUCT_50_ID ?? "",
+  "100": process.env.POLAR_PRODUCT_100_ID ?? "",
+};
+
+function getProductIdForPack(packId: CreditPackId): string {
+  const productId = PACK_TO_PRODUCT_ID[packId];
+  if (!productId) {
+    throw new Error(
+      `Aucun POLAR_PRODUCT_${packId}_ID configuré dans les variables d'env pour le pack "${packId}".`
+    );
+  }
+  return productId;
+}
+
+interface CreateCheckoutOptions {
+  packId: CreditPackId;
+  userId: string;
+  email: string;
+}
+
+/**
+ * Crée un checkout Polar pour un pack de crédits et renvoie l'URL de paiement.
+ * Fonctionne autant en sandbox qu'en production (selon POLAR_ENV + les IDs).
+ * Cette URL sera utilisée dans l'Embedded Checkout (pop-up dans ton site).
+ */
+export async function createPolarCheckout(options: CreateCheckoutOptions) {
+  const { packId, userId, email } = options;
+
+  const productId = getProductIdForPack(packId);
+
+  const baseAppUrl =
+    process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+
+  // 👉 utilisé pour la redirection *si tu laisses Polar rediriger*
+  const successUrl = `${baseAppUrl}/app/credits?status=success&pack=${packId}`;
+  const returnUrl = `${baseAppUrl}/app/credits?status=cancel`;
+
+  // 👉 très important pour l'Embedded Checkout
+  // Polar docs : embed_origin = origin de la page qui intègre le checkout :contentReference[oaicite:1]{index=1}
+  const embedOrigin = baseAppUrl; // NEXT_PUBLIC_APP_URL doit être du style https://mon-site.com
+
+  console.log("[Polar] Création checkout", {
+    env: process.env.POLAR_ENV,
+    packId,
+    productId,
+    userId,
+    email,
+    successUrl,
+    returnUrl,
+    embedOrigin,
+  });
+
+  const payload: any = {
+    products: [productId],
+    success_url: successUrl,
+    return_url: returnUrl,
+    embed_origin: embedOrigin,
+    customer_email: email, // ⚠️ vrai email
+    external_customer_id: userId,
+
+    allow_discount_codes: true,
+    require_billing_address: false,
+    allow_trial: true,
+    is_business_customer: false,
+  };
+
+  const checkout = await (polar as any).checkouts.create(payload);
+
+  if (!checkout?.url) {
+    console.error(
+      "[Polar] Checkout créé mais pas d'URL dans la réponse:",
+      checkout
+    );
+    throw new Error("Checkout Polar créé mais URL manquante.");
+  }
+
+  console.log("[Polar] Checkout URL:", checkout.url);
+
+  return {
+    url: checkout.url as string,
+    checkout,
+  };
+}
+````
+
+## File: lib/userTracking.ts
+````typescript
+// lib/userTracking.ts
+import { User } from "firebase/auth";
+import {
+  collection,
+  addDoc,
+  doc,
+  setDoc,
+  increment,
+} from "firebase/firestore";
+import { db } from "@/lib/firebase";
+
+/**
+ * Infos IP / localisation
+ */
+type IpInfo = {
+  ip: string;
+  country: string;
+  city: string;
+};
+
+// Cache en mémoire pour éviter d'appeler l'API à chaque fois
+let ipInfoCache: IpInfo | null = null;
+let ipInfoPromise: Promise<IpInfo | null> | null = null;
+
+async function getIpInfo(): Promise<IpInfo | null> {
+  if (ipInfoCache) return ipInfoCache;
+  if (typeof window === "undefined") return null;
+
+  if (ipInfoPromise) return ipInfoPromise;
+
+  ipInfoPromise = (async () => {
+    try {
+      // API publique simple, tu peux la changer si besoin
+      const res = await fetch("https://ipapi.co/json/");
+      if (!res.ok) throw new Error("IP API error");
+      const data = await res.json();
+      const info: IpInfo = {
+        ip: data.ip,
+        country: data.country_name,
+        city: data.city,
+      };
+      ipInfoCache = info;
+      return info;
+    } catch (e) {
+      console.error("Erreur getIpInfo:", e);
+      return null;
+    } finally {
+      ipInfoPromise = null;
+    }
+  })();
+
+  return ipInfoPromise;
+}
+
+/**
+ * Infos device / OS / navigateur
+ * ➜ différencie iPhone / iPad / macOS / Android / Windows…
+ */
+type DeviceInfo = {
+  deviceType: string; // "iphone" | "ipad" | "mac" | "mobile" | "tablet" | "desktop" | "unknown"
+  os: string;
+  browser: string;
+};
+
+function detectDeviceInfo(): DeviceInfo {
+  if (typeof navigator === "undefined") {
+    return { deviceType: "unknown", os: "unknown", browser: "unknown" };
+  }
+
+  const ua = navigator.userAgent || "";
+  const lower = ua.toLowerCase();
+
+  let deviceType = "unknown";
+  let os = "unknown";
+  let browser = "unknown";
+
+  // --- OS + device ---
+  if (/iphone/i.test(ua)) {
+    deviceType = "iphone";
+    os = "iOS";
+  } else if (/ipad/i.test(ua)) {
+    deviceType = "ipad";
+    os = "iPadOS";
+  } else if (/android/i.test(ua)) {
+    os = "Android";
+    deviceType = /mobile/i.test(ua) ? "mobile" : "tablet";
+  } else if (/macintosh|mac os x/i.test(ua)) {
+    os = "macOS";
+    deviceType = "mac";
+  } else if (/windows/i.test(ua)) {
+    os = "Windows";
+    deviceType = "desktop";
+  } else if (/linux/i.test(ua)) {
+    os = "Linux";
+    deviceType = "desktop";
+  }
+
+  // --- navigateur ---
+  if (lower.includes("edg/")) {
+    browser = "Edge";
+  } else if (lower.includes("opr/") || lower.includes("opera")) {
+    browser = "Opera";
+  } else if (lower.includes("firefox")) {
+    browser = "Firefox";
+  } else if (lower.includes("chrome") && !lower.includes("edge") && !lower.includes("opr")) {
+    browser = "Chrome";
+  } else if (lower.includes("safari") && !lower.includes("chrome")) {
+    browser = "Safari";
+  }
+
+  return { deviceType, os, browser };
+}
+
+/**
+ * Mise à jour du doc "users/{uid}" pour suivre :
+ * - dernière activité
+ * - dernière page
+ * - IP / pays / ville
+ * - device / OS / navigateur
+ */
+export async function updateLastActive(
+  user: User,
+  extra?: { path?: string; action?: string }
+) {
+  if (!user) return;
+
+  try {
+    const [ipInfo, device] = await Promise.all([
+      getIpInfo(),
+      Promise.resolve(detectDeviceInfo()),
+    ]);
+
+    const ref = doc(db, "users", user.uid);
+
+    const path =
+      extra?.path ??
+      (typeof window !== "undefined"
+        ? window.location.pathname + window.location.search
+        : null);
+
+    const now = Date.now();
+
+    const payload: any = {
+      email: user.email ?? null,
+      displayName: user.displayName ?? null,
+      lastSeenAt: now,
+      lastSeenPage: path,
+      lastDeviceType: device.deviceType,
+      lastOs: device.os,
+      lastBrowser: device.browser,
+    };
+
+    if (user.metadata?.lastSignInTime) {
+      payload.lastLoginAt = new Date(
+        user.metadata.lastSignInTime
+      ).getTime();
+    }
+
+    if (ipInfo) {
+      payload.lastSeenIp = ipInfo.ip;
+      payload.lastSeenCountry = ipInfo.country;
+      payload.lastSeenCity = ipInfo.city;
+    }
+
+    if (extra?.action) {
+      payload.lastAction = extra.action;
+      payload.lastActionAt = now;
+    }
+
+    await setDoc(ref, payload, { merge: true });
+  } catch (e) {
+    console.error("Erreur updateLastActive:", e);
+  }
+}
+
+/**
+ * Options pour les logs d’usage
+ * - action = nom de l’évènement (ex: "lm_generate", "lm_download", "cv_generate")
+ * - docType = "lm" | "cv" | "pitch"...
+ * - eventType = "generate" | "download" | "view"...
+ * - tool = comment tu catégorises ton outil (ex: "lm", "cv", "assistant")
+ * - creditsDelta = variation de crédits (ex: -1 quand tu consommes 1 crédit)
+ *
+ * ➜ grâce à [key: string]: any, tu peux passer
+ *    feature, template, lang, contract, targetJob, companyName, etc.
+ */
+export type LogUsageOptions = {
+  tool?: string;
+  docType?: "lm" | "cv" | "pitch" | string;
+  eventType?: "generate" | "download" | "view" | "auth" | string;
+  creditsDelta?: number;
+  path?: string;
+  meta?: Record<string, any>;
+  // pour autoriser des clés libres (feature, template, lang, etc.)
+  [key: string]: any;
+};
+
+/**
+ * Log d’un événement important (appel IA, génération LM/CV, téléchargement…)
+ * ➜ crée un doc dans usageLogs
+ * ➜ met à jour les compteurs dans users
+ *
+ * Tous les champs supplémentaires (feature, template, lang, jobTitle, etc.)
+ * sont rangés dans log.meta.
+ */
+export async function logUsage(
+  user: User | null,
+  action: string,
+  options?: LogUsageOptions
+) {
+  if (!user) return;
+
+  try {
+    const [ipInfo, device] = await Promise.all([
+      getIpInfo(),
+      Promise.resolve(detectDeviceInfo()),
+    ]);
+
+    const now = Date.now();
+
+    // On extrait les options "connues" et on met le reste dans `rest`
+    const {
+      tool,
+      docType,
+      eventType,
+      creditsDelta,
+      path: optPath,
+      meta,
+      ...rest
+    } = options ?? {};
+
+    const path =
+      optPath ??
+      (typeof window !== "undefined"
+        ? window.location.pathname + window.location.search
+        : null);
+
+    // --- 1) Créer un document dans usageLogs ---
+    const log: any = {
+      userId: user.uid,
+      email: user.email ?? null,
+      action,
+      tool: tool ?? null,
+      docType: docType ?? null,
+      eventType: eventType ?? null,
+      createdAt: now,
+      path,
+      creditsDelta:
+        typeof creditsDelta === "number" ? creditsDelta : null,
+      deviceType: device.deviceType,
+      os: device.os,
+      browser: device.browser,
+    };
+
+    if (ipInfo) {
+      log.ip = ipInfo.ip;
+      log.country = ipInfo.country;
+      log.city = ipInfo.city;
+    }
+
+    // Fusionne meta + toutes les autres clés libres (feature, template, ...)
+    if (meta || Object.keys(rest).length > 0) {
+      log.meta = {
+        ...(meta || {}),
+        ...rest,
+      };
+    }
+
+    const logsRef = collection(db, "usageLogs");
+    await addDoc(logsRef, log);
+
+    // --- 2) Mettre à jour les compteurs dans users/{uid} ---
+    const userRef = doc(db, "users", user.uid);
+
+    const update: any = {
+      lastSeenAt: now,
+      lastSeenPage: path,
+      lastDeviceType: device.deviceType,
+      lastOs: device.os,
+      lastBrowser: device.browser,
+    };
+
+    if (ipInfo) {
+      update.lastSeenIp = ipInfo.ip;
+      update.lastSeenCountry = ipInfo.country;
+      update.lastSeenCity = ipInfo.city;
+    }
+
+    const inc: any = {};
+
+    // Appels IA
+    if (tool) {
+      inc.totalIaCalls = increment(1);
+    }
+
+    // Documents générés
+    if (docType) {
+      inc.totalDocumentsGenerated = increment(1);
+      if (docType === "lm") {
+        inc.totalLmGenerated = increment(1);
+      }
+      if (docType === "cv") {
+        inc.totalCvGenerated = increment(1);
+      }
+    }
+
+    // Crédits consommés / ajoutés
+    if (typeof creditsDelta === "number") {
+      inc.credits = increment(creditsDelta);
+    }
+
+    Object.assign(update, inc);
+
+    await setDoc(userRef, update, { merge: true });
+  } catch (e) {
+    console.error("Erreur logUsage:", e);
+  }
+}
+````
+
+## File: public/manifest.webmanifest
+````
+{
+  "name": "SmartCV",
+  "short_name": "SmartCV",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#020617",
+  "theme_color": "#0ea5e9",
+  "icons": []
+}
+````
+
+## File: types/cv.ts
+````typescript
+// types/cv.ts
+
+export type CvSkills = {
+  // Compétences métier (finance, RH, IT, marketing, etc.)
+  domain?: string[];
+  // Outils / logiciels (Excel, Word, PowerPoint, SAP, Canva, etc.)
+  tools?: string[];
+};
+
+export type CvExperience = {
+  company?: string;
+  role?: string;
+  location?: string;
+  dates?: string;
+  bullets?: string[];
+};
+
+export type CvProfile = {
+  fullName?: string;
+  email?: string;
+  phone?: string;
+  linkedin?: string;
+  contractType?: string;
+
+  // Résumé court du profil (max 3 phrases)
+  profileSummary?: string;
+
+  // Ligne compacte pour les langues : "Français (natif) · Anglais (B2 – TOEIC) · ..."
+  langLine?: string;
+
+  skills?: CvSkills;
+
+  // Formation courte, lignes prêtes à afficher
+  // ex: "2022–2024 · MSc Expert Financier – ESAM, Paris"
+  educationShort?: string[];
+
+  // Certifications principales
+  certifications?: string[];
+
+  // Centres d'intérêt détaillés
+  interests?: string[];
+
+  // Centres d'intérêt sur une seule ligne : "Musique, piano, voyages, ..."
+  interestsLine?: string;
+
+  // Expériences détaillées (utile plus tard pour les LM, pitch, etc.)
+  experiences?: CvExperience[];
+};
+
+export type CvApiResponse = {
+  success: boolean;
+  profile?: CvProfile;
+  error?: string;
+};
+````
+
+## File: .firebaserc
+````
+{
+  "projects": {
+    "a": "assistant-ia-v4"
+  },
+  "targets": {},
+  "etags": {}
+}
+````
+
+## File: .gitignore
+````
+node_modules/
+.next/
+out/
+.env
+.env.*
+serviceAccountKey.json
+*.log
+.DS_Store
+serviceAccountKey*.json
+````
+
+## File: api.txt
+````
+SMTP et API
+Serveur SMTP
+smtp-relay.brevo.com
+Port
+587
+Connexion
+9c1210001@smtp-brevo.com
+STARTTLS
+key: bskt8NcPaWFVZUh
+
+firebase functions:config:set smtp.host="smtp-relay.brevo.com"
+firebase functions:config:set smtp.port="587"
+firebase functions:config:set smtp.secure="false"
+firebase functions:config:set smtp.user="9c1210001@smtp-brevo.com"
+firebase functions:config:set smtp.pass="bskt8NcPaWFVZUh"
+firebase functions:config:set smtp.from='"Assistant IA" <aakane0105@gmail.com>'
+firebase functions:config:set smtp.from='"Assistant IA" <no-reply@tondomaine.com>'
+firebase functions:config:set smtp.from='"Assistant IA" <no-reply@assistant-ia-v4.com>'
+````
+
+## File: firebase.json
+````json
+{
+  "hosting": {
+    "site": "assistant-ia-v4",
+    "public": "out",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "/api/interview",
+        "function": "interview"
+      },
+      {
+        "source": "/api/extractProfile",
+        "function": "extractProfile"
+      },
+      {
+        "source": "/api/polar/webhook",
+        "function": "polarWebhook"
+      },
+      {
+        "source": "/api/jobs",
+        "function": "jobs"
+      },
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ],
+    "cleanUrls": true,
+    "trailingSlash": false
+  },
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "functions": {
+    "source": "functions"
+  }
+}
+````
+
+## File: firestore.indexes.json
+````json
+{
+  "indexes": [
+    {
+      "collectionGroup": "applications",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "userId", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}
+````
+
+## File: firestore.rules
+````
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.isAdmin == true ||
+        request.auth.token.email == "aakane0105@gmail.com"
+      );
+    }
+
+    // --- COLLECTION users ---
+    match /users/{userId} {
+      // L'utilisateur peut lire/écrire uniquement SON doc
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+
+      // L'admin peut tout lire/écrire
+      allow read, write: if isAdmin();
+    }
+
+    // --- COLLECTION profiles ---
+    match /profiles/{userId} {
+      // L'utilisateur gère son profil
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+
+      // Admin peut tout lire/écrire
+      allow read, write: if isAdmin();
+    }
+
+    // --- COLLECTION applications ---
+    match /applications/{appId} {
+      // Création d'une candidature : userId dans le doc = auth.uid
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid;
+
+      // Lecture / update / delete par le propriétaire
+      allow read, update, delete: if isSignedIn()
+        && resource.data.userId == request.auth.uid;
+
+      // Admin : lecture/écriture si besoin (stats, corrections, etc.)
+      allow read, write: if isAdmin();
+    }
+
+    // --- COLLECTION usageLogs ---
+    match /usageLogs/{logId} {
+      // 1) logs normaux d'un user connecté (LM, CV, etc.)
+      // 2) logs d'échec de connexion (auth_failed) AVANT login (pas d'auth)
+      allow create: if
+        (
+          isSignedIn() &&
+          request.resource.data.userId == request.auth.uid
+        )
+        ||
+        (
+          !isSignedIn() &&
+          request.resource.data.action == "auth_failed"
+        );
+
+      // lecture / modif / suppression : admin uniquement
+      allow read, update, delete: if isAdmin();
+    }
+
+    // --- CATCH-ALL ADMIN ---
+    match /{document=**} {
+      allow read, write: if isAdmin();
+    }
+  }
+}
+````
+
+## File: next-env.d.ts
+````typescript
+/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+
+// NOTE: This file should not be edited
+// see https://nextjs.org/docs/app/building-your-application/configuring/typescript for more information.
+````
+
+## File: next.config.mjs
+````javascript
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // ❌ IMPORTANT : on ne met PAS "output: 'export'"
+  // car ton projet utilise des routes API (/api/...)
+  // qui nécessitent un runtime Node.js.
+
+  reactStrictMode: true,
+
+  // Tu peux garder cette option si tu veux éviter l’optimisation d'images
+  // (utile par ex. pour un déploiement static sur certains hébergeurs)
+  images: {
+    unoptimized: true,
+  },
+
+  // (Optionnel) : si tu veux être explicite sur le runtime Node :
+  experimental: {
+    serverRuntime: "nodejs",
+  },
+};
+
+export default nextConfig;
+````
+
+## File: postcss.config.js
+````javascript
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {}
+  }
+};
+````
+
+## File: setAdmin.js
+````javascript
+// setAdmin.js
+const admin = require("firebase-admin");
+const serviceAccount = require("./serviceAccountKey.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+async function main() {
+  // 👉 Mets ici l'email EXACT utilisé dans Firebase Authentication
+  const email = "aakane0105@gmail.com"; // <--- NE PAS OUBLIER LE GUILLEMET DE FIN
+
+  try {
+    // On récupère l'utilisateur via son email
+    const userRecord = await admin.auth().getUserByEmail(email);
+    console.log("Utilisateur trouvé ✅");
+    console.log("UID :", userRecord.uid);
+    console.log("Email :", userRecord.email);
+
+    // On lui ajoute le rôle admin
+    await admin.auth().setCustomUserClaims(userRecord.uid, { isAdmin: true });
+
+    console.log("✅ isAdmin = true pour :", userRecord.uid);
+  } catch (err) {
+    console.error("Erreur setAdmin:", err);
+  }
+}
+
+main();
+````
+
+## File: syncAuthUsersToFirestore.js
+````javascript
+// syncAuthUsersToFirestore.js
+//
+// Script une fois pour toutes : synchronise tous les comptes Firebase Auth
+// vers la collection Firestore "users", pour qu'ils apparaissent dans ton admin.
+
+const admin = require("firebase-admin");
+const serviceAccount = require("./serviceAccountKey.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const db = admin.firestore();
+
+function toMillis(str) {
+  if (!str) return null;
+  const t = Date.parse(str);
+  return Number.isNaN(t) ? null : t;
+}
+
+async function syncAllUsers(nextPageToken) {
+  const result = await admin.auth().listUsers(1000, nextPageToken);
+
+  for (const user of result.users) {
+    const uid = user.uid;
+    const ref = db.collection("users").doc(uid);
+    const snap = await ref.get();
+
+    const baseData = {
+      email: user.email || null,
+      displayName: user.displayName || null,
+      emailVerified: user.emailVerified || false,
+      provider:
+        (user.providerData[0] && user.providerData[0].providerId) ||
+        "password",
+      createdAt: toMillis(user.metadata.creationTime) || Date.now(),
+      lastLoginAt: toMillis(user.metadata.lastSignInTime) || null,
+    };
+
+    if (!snap.exists) {
+      // Nouveau doc user créé
+      await ref.set({
+        ...baseData,
+        credits: 0,
+        blocked: false,
+      });
+      console.log("✅ Créé doc users pour", uid, baseData.email);
+    } else {
+      // Doc déjà existant → on ne touche pas aux crédits / blocked
+      await ref.set(baseData, { merge: true });
+      console.log("🔁 Mis à jour doc users pour", uid, baseData.email);
+    }
+  }
+
+  if (result.pageToken) {
+    await syncAllUsers(result.pageToken);
+  }
+}
+
+async function main() {
+  await syncAllUsers();
+  console.log("🎉 Sync terminé");
+  process.exit(0);
+}
+
+main().catch((err) => {
+  console.error("Erreur syncAllUsers:", err);
+  process.exit(1);
+});
+````
+
+## File: tailwind.config.js
+````javascript
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    "./app/**/*.{js,ts,jsx,tsx}",
+    "./components/**/*.{js,ts,jsx,tsx}"
+  ],
+  theme: {
+    extend: {}
+  },
+  plugins: []
+}
+````
+
+## File: tsconfig.json
+````json
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ESNext"
+    ],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "ESNext",
+    "moduleResolution": "Node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "paths": {
+      "@/*": [
+        "./*"
+      ]
+    },
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ]
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}
+````
+
+## File: .firebase/hosting.b3V0.cache
+````
+tech.txt,1766516748973,3cc77dc7579ee301c79c58a1da5d988087fb019c57e0d78f73a119a26fc00a4d
+tech.html,1766516748967,70478536984048f8c6baf85a4058f211be215908aa302b25aaed9a52c5f222ac
+signup.txt,1766516748973,67d7b353b52eddfad89558b7f87fa0ed0a8b9d01d3ac4a26af8f5c46c0aaaec0
+signup.html,1766516748966,13a430bdcfa6a23c937d07424d9976cba1c378d7fba5af9d709247d55dbae711
+manifest.webmanifest,1766516747523,b125a9afb1b3c4b81daaf5442dd9d589e2367c37c2fd3305fa23247173975337
+login.txt,1766516748972,caa566efee024b3a35054ae05a6f221d8495f025d7f380ea77aff75eb5fb3d5e
+login.html,1766516748966,d3998e585966bec43ed93623d16627486f69f8fab60f572b28cae0418e40727f
+index.txt,1766516748972,b0952ef67cb6b99e6c2afeaba613ffad79cb81f327adcc17ba2d877afab592dc
+index.html,1766516748965,9b9072f01f7c7b5092cee0c56e4e838dc370c49d1045768f26997eea029c3b26
+forgot-password.txt,1766516748971,88c0dd789a3046334a7199dcfcc9854cfc2551f6e0a3d67bde03695847b139c7
+forgot-password.html,1766516748964,c7999480bd7f5ecd38846e31c73bbc5a4d85cbdd954181b7b45e85e724dbcad9
+assistance-candidature.txt,1766516748972,571b66de82c739ba22388b13fa2683eeae37641c1f05ae600f98f1b66317d7b8
+assistance-candidature.html,1766516748964,497d9247344cccd26da023e712845771c7462cde598b6fe5e82f9c1d6435265c
+app.txt,1766516748972,7850b8a9e9ba265b34809ed488fba35e5e68db7e503f661eb1ac59a346b9067a
+app.html,1766516748966,73a6efe79ce7b661efb9f95998c80a538a98e79b73297ddf15162766e1fa4f58
+admin.txt,1766516748970,f803e183918a3f2766bc90dd598061cee600d5c7ee28285e0baf519cfd6cf810
+admin.html,1766516748962,e27231a563db9416d934f284b9a06cf556c887632aad85a59678fdbc833e139d
+404.html,1766516748361,0626120cd6599b9be504fa03b62df50001f4d6b7ad6f8cb18f42ef5bff48a7f3
+debug/polar.txt,1766516748967,162c79c96a088d3835c7deff2f7ee56b4824f4ff666e9cc3950531bb47524fc4
+debug/polar.html,1766516748960,9c12de9b764a377658e9776ec0b1b788f9a210cdbad24e04cb26a23b14ad27ac
+auth/verify-email.txt,1766516748967,63b1366132c2b0e2c175635e0649c2db808d8ec7667749d2639f53b758e377c7
+auth/verify-email.html,1766516748960,2f2ee707b9bc799fd433a74e7cb6dc81852665f6465c45576704e0988b31b106
+app/tracker.txt,1766516748970,18126b57901f775004395836548f7a73751e83b18b81872442dee1c87370dc22
+app/tracker.html,1766516748963,30b6204034b11845cb893ff05443198864a7adb00070b9adb7dd2ec98b08bcb3
+app/settings.txt,1766516748973,ccef11346e1bbd3e3b7ae52f767cba6a1aa6d92d4fcfd3793593ee8b7d9ccde9
+app/settings.html,1766516748966,5266df0af37d8fa6709cc6d2c863bbe4ab89b08efcac97998501d65a9b3d7b7b
+app/pitch.txt,1766516748969,36f5315cfc294be3857aa266a1740f5221496df763e9778ec8725bffd1a03544
+app/pitch.html,1766516748962,d6a772b420bd301d88a2ca95ae58b8e8cef8f1066b195f6141c8c37d3ecb53bf
+app/lm.txt,1766516748972,ab8e094152014d928f4b1837948edf892f04ac8a19b3a353a6ad42582165eb2f
+app/lm.html,1766516748964,e1ff1821ef676c6bba3853b7351d77bae4a3d321d16d9266707ecd3b0bf1f180
+app/interview.txt,1766516748971,fe4689f8802db6b00679134b9ee6b202e9e5f04e9f4bdc8cb6f1fa5920467554
+app/interview.html,1766516748964,f58af150bc197f2fd5351b159b958ad7c3d3a6b7f0aef7b7786cece06b0249f1
+app/history.txt,1766516748969,3d99fecc6e8369deb2ac7ff03c4b17d90cde33080bbc48ca2ca6cb30c8515953
+app/history.html,1766516748962,e13c02f140849dbd105464a044416fd5cecaf07c72d7f3cc9f9be4f1a2d5789a
+app/cv.txt,1766516748971,ae59d2a5c6c8bc3d41dca902c3119ff1dc33b3aeb63bef75758cf15824c15d58
+app/cv.html,1766516748964,6527edd251c87b7ca2c2310a42dca7da53e14ecb664b1e3d287d6616514f81c1
+app/credits.txt,1766516748968,24d4978dee084c63c1cbb323155cd4c70f6d02ca243de961f90d7e6b467f71fe
+app/credits.html,1766516748961,3cc63222ed5df58478beb80f7efb773c4d3b47f4af69d398f621ff2b2208e337
+app/apply.txt,1766516748969,8ea0c8e96099d408f8d6335b00bfa7124ac76c0c6c83be7dccd9dddfc4190d81
+app/apply.html,1766516748961,71be18f951c8b9bdf78fa5ffd11e7d108a8b6ef4ef461e65298d54e759f3f5e4
+api/polar/test,1766516748967,35d1b34b7807696b8413c672871fcf26b35d968667e349dfbe811cedc67ac17a
+admin/logs.txt,1766516748968,4193cfac968d950cd1d60e21536d13877be82d5fda4b328877374dcf3ffb6bbf
+admin/logs.html,1766516748961,7d85f1598fa19eb04fd7f41d2319e17fca3b8c1d30c79ba2e78bae763e7b8d1a
+admin/login.txt,1766516748966,fc9efe2a6fb3cbc9a59bc9c9a6f15f8407bc4554cb41a0b9a83ad59717910c6a
+admin/login.html,1766516748959,b77fe6a483e5cc895e0545a8dfa15d00ad77e642c37809d773749102a7da8e24
+_next/static/css/faac00ea2ad55afa.css,1766516747505,6d7858f4fcc4e1e9989a644e8cf8a19bb627645fdf7cac7bb293cc4e6ae1ada3
+_next/static/chunks/webpack-94aa307a0c675022.js,1766516747501,39d51b0f67df400cf90160e3e74e56e3b3ac0d30af506085df8bee1092e91cab
+_next/static/chunks/polyfills-42372ed130431b0a.js,1766516747505,67dee1c02c6a6700d63b5c1898cf2df618101a68a395db469192763d24925a23
+_next/static/chunks/main-app-7466cb2517b2ac24.js,1766516747498,3dad6f439d8b157d2427b4087aaeff0fef56e1e1041ee3b5f0fad10bf506a92d
+_next/static/chunks/main-76e1bcb595671093.js,1766516747504,bbcdc180a07d600a7f8dcfa6d3267afdec0b918f9bc722e4764b72782a68d238
+_next/static/chunks/framework-aec844d2ccbe7592.js,1766516747501,36f12099915a78862f76158596a2aac7e86dd87ba94f4d3b896a7749c5e4c9d6
+_next/static/chunks/fd9d1056-b4129a380d1be68f.js,1766516747498,8b73f2ae4babb3d70adf200a16329555cd03b390ca97f3fa3368428ebc73c549
+_next/static/chunks/ebf8faf4-eb27ebf8c37d4d67.js,1766516747497,a107c6566fbc2f52b78a30e52b2ae3b7b84b0da4ffe8d15f24849c217e372a5d
+_next/static/chunks/ca377847-044365abace2608d.js,1766516747496,c6e43c770559cc5ee6605295131dc3e9de57d9fda82d7043e9b70b2f97bc8002
+_next/static/chunks/941-da853eb9ae4bc965.js,1766516747494,f4b97a2711ed98aa8723dcc66969fec23e3ebc576ff38e09fd1f1cd10bd20a82
+_next/static/chunks/810-039b9229cc1a2fae.js,1766516747488,2f29a61132b062dab1e63516e7337a67aede0bce268795b569dfccfc5c400bab
+_next/static/chunks/7508b87c-2affb3ad7b55ab3d.js,1766516747486,798ec3d71f923e838d157bf4dd01e76244b35e1c9634e28e77c89c9df89a676d
+_next/static/chunks/648-a41745ebae293ba3.js,1766516747483,d08de5f20a30c50b96e1cb68dfbec730d23ae67cba384f345e34c09b6adddaf3
+_next/static/chunks/63b94182.662a1bbff33f68c9.js,1766516747489,86c28eeebf9d1883bb5afe89168408b3ccf891d873e2ac67eec46ef5baa42a41
+_next/static/chunks/600-2ae2ab76ace4e875.js,1766516747480,ea47caf34ad27d1a524604c65a1c0ecc0f6fb1f64426749920e60ac529a33563
+_next/static/chunks/5493da1b.e7544b77cf3a7468.js,1766516747486,76cae2b4134f6f89522b80ad97b81eb8b093f50a047c7faa2e0512533d603784
+_next/static/chunks/500-c984c19836bde651.js,1766516747477,94a6d0ca98e707e577d1f1b6336dcdf87e35f2c1be72c787845aad3abfdab19b
+_next/static/chunks/323-54d09e3358a73f44.js,1766516747481,2aae14a1d235667a06206f344a3f76216206cb0f4697ccc38edc1923e27c5d58
+_next/static/chunks/276-a01f3bf27c64a121.js,1766516747479,7959269d2568322cb0a6253c58e7242b54d27d373aa32b7b0c05474bf95e8fd1
+_next/static/chunks/pages/_error-7ba65e1336b92748.js,1766516747506,0402d6340a70945d851b2d22e156d955fbee54c1d8ec8b379f35fd464a8d08bf
+_next/static/chunks/pages/_app-72b849fbd24ac258.js,1766516747506,dae29acdf0128939e571909a9228115276818bce739f4d0f98c1da8ed68ba91d
+_next/static/chunks/app/page-04078e5e4ba66b1d.js,1766516747506,fd845f84ec7c187a3bb3e82cd5a690aa75f0b4ca0c53a65495ea449a96c15991
+_next/static/chunks/app/not-found-74a90fc08ab9437a.js,1766516747506,8ec8fde655d80c0e5d37c7714dac9911aa99f5add99e26b2820f5afcda111b2a
+_next/static/chunks/app/layout-9e322ebc6c69974b.js,1766516747505,57a38ab6c6c143610c4c5c55fe368f60c5aed79c207f486eb9d75bf8763d6394
+_next/static/chunks/app/tech/page-cc145f1ea41d0f3b.js,1766516747515,9782dc820a4127292f16e053f0bcc1695227f9ba956897623c527946b7b8fdc5
+_next/static/chunks/app/signup/page-8c48925c3f3c52ca.js,1766516747512,636d7396bfba3179391c46dc2cadcfe85fcd5c9955e05cb88622170aa8b44f23
+_next/static/chunks/app/login/page-8a1f8646938577f8.js,1766516747512,45da851b1c759ecdc39470f681d20a1f67bd96b97ce88568df91a0aff4ca6696
+_next/static/chunks/app/forgot-password/page-7ba7f56b957b3ead.js,1766516747512,59c307ab28b715a638e9ac9d484b2d73ac8bd3b271b1db0fb16ce4716a556865
+_next/static/chunks/app/debug/polar/page-e28997809c70dae8.js,1766516747519,eae0b7def982e0bf3068fde94e7f0f34defeceee17e2646fb7a9cb846c72169e
+_next/static/chunks/app/auth/verify-email/page-c03af4984154988e.js,1766516747519,6b22e7525d83798f87b4b2b1d90798e6972b3edc575929ee1352938bfa718515
+_next/static/chunks/app/assistance-candidature/page-f38626f0664fd689.js,1766516747510,81d9766776f30fbac7fbd008ba3ab85a44d797761bc1a6972d105a47c69f101f
+_next/static/chunks/app/app/page-3d33f0691cc7052c.js,1766516747512,f79254300ae18826e790c276848a5aa9223b69f41cb2b8516b8841a1e43a435b
+_next/static/chunks/app/app/layout-7aa6ad0f76d78662.js,1766516747509,47da4ba9f8b5600fd9cb70eb46bf190b3ea02b503488dfb3560c83c2a3d7b7b8
+_next/static/chunks/app/app/tracker/page-8f13d48cb47ca503.js,1766516747519,0b68abda42bcfe86ea7274e10859d1964851010b96b165ed852ecfd58ae16571
+_next/static/chunks/app/app/settings/page-654d883b731b8e6b.js,1766516747518,a65265b14afa8476fb7b78ff2f3f18b8989aec6b6b50f4b02960185d8fca1d76
+_next/static/chunks/app/app/pitch/page-a42bf5337283b380.js,1766516747517,8bb08510d6cd6129e33e6ec8e6fbd346c590b1fce79e8c3fd1af1c8492f985d1
+_next/static/chunks/app/app/lm/page-a1057059c1ffab1f.js,1766516747518,34ed764c2ca1bf552158c78b6a6350f2cdd4411a752d4d7b3661952c6d1772f2
+_next/static/chunks/app/app/interview/page-5d2b46a3565c14fc.js,1766516747517,e004acddbc6b4612633faad87f187fd7fccee1994dfd7a383d0134b3ba6e8e69
+_next/static/chunks/app/app/history/page-b44f1b622671fb6b.js,1766516747516,2b50c7db092b6dc9ae36249d114bd85396746f0b795a72f18bc9e9432fdd325b
+_next/static/chunks/app/app/cv/page-492c1c2b5ea110d3.js,1766516747517,27b93316c1ef03d32314815e1199788b00fbc1166d05264ad35be6c9b1aed703
+_next/static/chunks/app/app/credits/page-afe0ce4cf8da1f59.js,1766516747516,7572d8149de19adcb718582a8fbe62aacc563f5bf5998fc4683b678a5ad3af9c
+_next/static/chunks/app/app/apply/page-cf0ee0e768561642.js,1766516747516,1b88d79376396f77cdfb2520e7eec3848bd4533744dcf0d4638c8768c5073c5f
+_next/static/chunks/app/admin/page-f161718d3c048788.js,1766516747509,8bc2d31560e4e32b0c29fd167e4bda2a4c421fdbf15a83fe5ad1253555f62b2a
+_next/static/chunks/app/admin/logs/page-e8c5c4ae49457b18.js,1766516747515,554379c156358ee21df7e2bad9172a59004c4a34179d606eec21ae1da9d2e808
+_next/static/chunks/app/admin/login/page-d0fa36fddfc7acd4.js,1766516747515,b90b810232b2619ad3be8ca04464545ed5bee12883d847e4577c1320ac8f4e14
+_next/static/chunks/app/_not-found/page-7494094633467ef3.js,1766516747508,dcfa115b285fc1e7d920913e1a0464349f8c270c107df17678afbcaee62abec0
+_next/static/IlA4IUG3fQpM1zdQiAMyW/_ssgManifest.js,1766516747501,02dbc1aeab6ef0a6ff2ff9a1643158cf9bb38929945eaa343a3627dee9ba6778
+_next/static/IlA4IUG3fQpM1zdQiAMyW/_buildManifest.js,1766516747503,f46b17d6e2e887329d388286773626796e64b52f4cd965c9b0fe037e97f3ad58
+````
+
+## File: app/api/interview/route.ts
+````typescript
+// app/api/interview/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import {
+  buildPrompt,
+  InterviewLevel,
+  InterviewChannel,
+  HistoryItem,
+} from "@/lib/interviewPrompt";
+import { verifyUserAndCredits, consumeCredit } from "@/lib/server/credits";
+
+export const runtime = "nodejs";
+
+/**
+ * ✅ reCAPTCHA OFF par défaut
+ * -> Active uniquement si INTERVIEW_REQUIRE_RECAPTCHA=true
+ */
+const REQUIRE_RECAPTCHA =
+  (process.env.INTERVIEW_REQUIRE_RECAPTCHA || "").toLowerCase().trim() ===
+  "true";
+
+// ---- Sessions en mémoire (DEV) ---- //
+type InterviewSession = {
+  userId: string;
+  createdAt: string;
+  lastUpdated: string;
+  jobDesc: string;
+  cvSummary: string;
+  mode: string;
+  level: InterviewLevel;
+  channel: InterviewChannel;
+  status: "active" | "completed";
+  currentStep: number;
+  history: HistoryItem[];
+  score?: number | null;
+  finalSummary?: string | null;
+};
+
+const memorySessions = new Map<string, InterviewSession>();
+
+function createSessionId() {
+  try {
+    // @ts-ignore
+    return crypto.randomUUID();
+  } catch {
+    return Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+  }
+}
+
+function purgeOldSessions(maxAgeMs = 1000 * 60 * 60 * 6) {
+  const now = Date.now();
+  for (const [sid, s] of memorySessions.entries()) {
+    const t = Date.parse(s.lastUpdated || s.createdAt);
+    if (!Number.isNaN(t) && now - t > maxAgeMs) memorySessions.delete(sid);
+  }
+}
+
+// ---------------- reCAPTCHA (Enterprise via CF recaptchaVerify) ----------------
+type RecaptchaVerifyResult =
+  | { ok: true; score?: number }
+  | { ok: false; reason: string; score?: number };
+
+function stripTrailingSlash(s: string) {
+  return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+
+function getApiBaseServer(): string {
+  return stripTrailingSlash(
+    process.env.CLOUD_FUNCTIONS_BASE_URL ||
+      process.env.API_BASE_URL ||
+      "https://europe-west1-assistant-ia-v4.cloudfunctions.net"
+  );
+}
+
+async function verifyRecaptchaEnterpriseViaCF(
+  token: string,
+  action: string
+): Promise<RecaptchaVerifyResult> {
+  const base = getApiBaseServer();
+  try {
+    const res = await fetch(`${base}/recaptchaVerify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, action: (action || "").trim() }),
+      cache: "no-store",
+    });
+
+    const data: any = await res.json().catch(() => null);
+
+    if (!res.ok || !data?.ok) {
+      return {
+        ok: false,
+        reason: String(data?.reason || data?.error || "recaptcha_failed"),
+        score: typeof data?.score === "number" ? data.score : undefined,
+      };
+    }
+
+    return {
+      ok: true,
+      score: typeof data?.score === "number" ? data.score : undefined,
+    };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || "network_error" };
+  }
+}
+
+// ---- Handler principal ---- //
+export async function POST(req: NextRequest) {
+  try {
+    purgeOldSessions();
+
+    const body = await req.json().catch(() => null);
+    if (!body || typeof body !== "object") {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
+
+    const { action } = body as any;
+
+    // ✅ token peut venir de plusieurs endroits (selon ton front)
+    const recaptchaToken =
+      (body as any)?.recaptchaToken ||
+      (body as any)?.token ||
+      (body as any)?.recaptcha?.token ||
+      null;
+
+    const recaptchaAction =
+      (body as any)?.recaptchaAction ||
+      (body as any)?.recaptcha?.action ||
+      "interview";
+
+    // ✅ reCAPTCHA (optionnel)
+    if (REQUIRE_RECAPTCHA) {
+      if (!recaptchaToken || typeof recaptchaToken !== "string") {
+        return NextResponse.json(
+          {
+            error: "reCAPTCHA failed",
+            details: "token_missing_or_invalid",
+            requireRecaptcha: true,
+            expectedAction: recaptchaAction,
+          },
+          { status: 403 }
+        );
+      }
+
+      const rec = await verifyRecaptchaEnterpriseViaCF(
+        recaptchaToken,
+        recaptchaAction
+      );
+
+      if (!rec.ok) {
+        return NextResponse.json(
+          {
+            error: "reCAPTCHA failed",
+            details: rec.reason,
+            score: rec.score ?? null,
+            requireRecaptcha: true,
+            expectedAction: recaptchaAction,
+          },
+          { status: 403 }
+        );
+      }
+    }
+
+    // ---------- START ---------- //
+    if (action === "start") {
+      const { userId, jobDesc, cvSummary, mode, channel, level } = body as any;
+
+      if (!userId) {
+        return NextResponse.json({ error: "Missing userId" }, { status: 400 });
+      }
+
+      const user = await verifyUserAndCredits(userId);
+      if (!user) {
+        return NextResponse.json(
+          { error: "Unauthorized or no credits" },
+          { status: 401 }
+        );
+      }
+
+      const nowIso = new Date().toISOString();
+      const safeMode = (mode || "mixed") as string;
+      const safeChannel = (channel || "written") as InterviewChannel;
+      const safeLevel = (level || "junior") as InterviewLevel;
+
+      const sessionId = createSessionId();
+
+      const sessionData: InterviewSession = {
+        userId,
+        createdAt: nowIso,
+        lastUpdated: nowIso,
+        jobDesc: jobDesc || "",
+        cvSummary: cvSummary || "",
+        mode: safeMode,
+        level: safeLevel,
+        channel: safeChannel,
+        status: "active",
+        currentStep: 1,
+        history: [],
+      };
+
+      memorySessions.set(sessionId, sessionData);
+
+      const prompt = buildPrompt({
+        cvSummary: sessionData.cvSummary,
+        jobDesc: sessionData.jobDesc,
+        mode: sessionData.mode,
+        level: sessionData.level,
+        channel: sessionData.channel,
+        history: [],
+        step: 1,
+      });
+
+      const llmResponseText = await callLLM(prompt);
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(llmResponseText);
+      } catch {
+        parsed = { next_question: "Parlez-moi de vous.", short_analysis: null };
+      }
+
+      const firstQuestion = parsed.next_question || "Parlez-moi de vous.";
+
+      const historyItem: HistoryItem = {
+        role: "interviewer",
+        text: firstQuestion,
+        createdAt: new Date().toISOString(),
+      };
+
+      const updatedSession = memorySessions.get(sessionId);
+      if (updatedSession) {
+        updatedSession.history.push(historyItem);
+        updatedSession.currentStep = 1;
+        updatedSession.lastUpdated = new Date().toISOString();
+        memorySessions.set(sessionId, updatedSession);
+      }
+
+      await consumeCredit(userId);
+
+      return NextResponse.json({
+        sessionId,
+        firstQuestion,
+        shortAnalysis: parsed.short_analysis ?? null,
+      });
+    }
+
+    // ---------- ANSWER ---------- //
+    if (action === "answer") {
+      const { userId, sessionId, userMessage, channel, step } = body as any;
+
+      if (!userId || !sessionId || !userMessage?.trim()) {
+        return NextResponse.json(
+          { error: "Missing userId, sessionId or userMessage" },
+          { status: 400 }
+        );
+      }
+
+      const user = await verifyUserAndCredits(userId);
+      if (!user) {
+        return NextResponse.json(
+          { error: "Unauthorized or no credits" },
+          { status: 401 }
+        );
+      }
+
+      const session = memorySessions.get(sessionId);
+      if (!session) {
+        return NextResponse.json({ error: "Session not found" }, { status: 404 });
+      }
+
+      if (session.userId !== userId) {
+        return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+      }
+
+      const history = Array.isArray(session.history) ? [...session.history] : [];
+
+      history.push({
+        role: "candidate",
+        text: userMessage,
+        createdAt: new Date().toISOString(),
+      });
+
+      const nextStep =
+        typeof step === "number" && Number.isFinite(step)
+          ? step
+          : (session.currentStep || 1) + 1;
+
+      const prompt = buildPrompt({
+        cvSummary: session.cvSummary,
+        jobDesc: session.jobDesc,
+        mode: session.mode,
+        level: (session.level || "junior") as InterviewLevel,
+        channel: (channel || session.channel || "written") as InterviewChannel,
+        history,
+        step: nextStep,
+      });
+
+      const llmResponseText = await callLLM(prompt);
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(llmResponseText);
+      } catch {
+        parsed = {
+          next_question: "Merci. Peux-tu illustrer avec un exemple concret ?",
+          short_analysis: "",
+          final_summary: null,
+          final_score: null,
+        };
+      }
+
+      const nextQuestion =
+        parsed.next_question || "Merci, l’entretien est terminé.";
+      const shortAnalysis = parsed.short_analysis ?? "";
+      const isFinal = Boolean(parsed.final_summary);
+
+      history.push({
+        role: "interviewer",
+        text: nextQuestion,
+        createdAt: new Date().toISOString(),
+      });
+
+      const updated: InterviewSession = {
+        ...session,
+        history,
+        lastUpdated: new Date().toISOString(),
+        currentStep: nextStep,
+      };
+
+      if (isFinal) {
+        updated.status = "completed";
+        updated.score = parsed.final_score ?? null;
+        updated.finalSummary = parsed.final_summary ?? null;
+      }
+
+      memorySessions.set(sessionId, updated);
+
+      await consumeCredit(userId);
+
+      return NextResponse.json({
+        nextQuestion,
+        shortAnalysis,
+        finalSummary: parsed.final_summary ?? null,
+        finalScore: parsed.final_score ?? null,
+        isFinal,
+      });
+    }
+
+    return NextResponse.json({ error: "Unknown action" }, { status: 400 });
+  } catch (err) {
+    console.error("Interview API error:", err);
+    return NextResponse.json({ error: "Internal error" }, { status: 500 });
+  }
+}
+
+// ---- APPEL GEMINI ---- //
+async function callLLM(prompt: string): Promise<string> {
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    return JSON.stringify({
+      next_question:
+        "Mode démo : peux-tu me résumer ton expérience la plus récente en lien avec ce poste ?",
+      short_analysis:
+        "Mode démo sans Gemini : configure GEMINI_API_KEY pour avoir l’analyse réelle.",
+      final_summary: null,
+      final_score: null,
+    });
+  }
+
+  const modelRaw = process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
+  const model = modelRaw.startsWith("models/") ? modelRaw : `models/${modelRaw}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
+
+  const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!resp.ok) {
+    const errorText = await resp.text().catch(() => "");
+    console.error("Gemini error (interview):", resp.status, errorText);
+    return JSON.stringify({
+      next_question:
+        "Je n'arrive pas à joindre l’IA. Donne-moi : contexte / actions / résultats (STAR).",
+      short_analysis: `Fallback Gemini HTTP ${resp.status}`,
+      final_summary: null,
+      final_score: null,
+    });
+  }
+
+  const data = await resp.json().catch(() => null);
+
+  const textRaw: string =
+    data?.candidates?.[0]?.content?.parts
+      ?.map((p: any) => p.text || "")
+      .join("")
+      .trim() || "";
+
+  if (!textRaw) {
+    return JSON.stringify({
+      next_question: "Peux-tu préciser ?",
+      short_analysis: "",
+      final_summary: null,
+      final_score: null,
+    });
+  }
+
+  return textRaw.trim();
+}
+````
+
+## File: app/app/credits/page.tsx
+````typescript
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { useUserCredits } from "@/hooks/useUserCredits";
+import { useAuth } from "@/context/AuthContext";
+import { getRecaptchaToken } from "@/lib/recaptcha";
+import { useRechargeHistory } from "@/hooks/useRechargeHistory";
+
+type PackKey = "20" | "50" | "100";
+
+const CREDIT_PACKS: {
+  key: PackKey;
+  label: string;
+  credits: number;
+  desc: string;
+}[] = [
+  {
+    key: "20",
+    credits: 20,
+    label: "Pack Découverte",
+    desc: "Idéal pour tester les fonctionnalités IA.",
+  },
+  {
+    key: "50",
+    credits: 50,
+    label: "Pack Boost",
+    desc: "Parfait pour une phase active de recherche.",
+  },
+  {
+    key: "100",
+    credits: 100,
+    label: "Pack Intensif",
+    desc: "Pour candidatures + entretiens à fond.",
+  },
+];
+
+// ⚙️ Base de l'API :
+// - en prod : Cloud Functions
+// - en dev : tu peux override avec NEXT_PUBLIC_API_BASE_URL dans .env.local
+const DEFAULT_API_BASE = "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE).replace(/\/+$/, "");
+
+export default function CreditsPage() {
+  const { user } = useAuth();
+  const { credits, loading, error } = useUserCredits();
+
+  const [buyLoading, setBuyLoading] = useState<PackKey | null>(null);
+  const [buyError, setBuyError] = useState<string | null>(null);
+
+  // 👉 URL d’embed du checkout Polar (quand non null, on affiche la popup)
+  const [embedUrl, setEmbedUrl] = useState<string | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+
+  // 🎉 Animation / bandeau succès dans la page
+  const [showSuccessAnimation, setShowSuccessAnimation] = useState(false);
+
+  // Pour info, si un jour tu veux savoir quel pack a été démarré
+  const [lastPack, setLastPack] = useState<PackKey | null>(null);
+
+  // Message global en haut de page (success / cancel)
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+  // ✅ IMPORTANT (Option B) :
+  // on mémorise le solde AVANT l’achat, puis on ferme automatiquement la popup
+  // dès que credits > soldeAvant (webhook OK -> Firestore se met à jour)
+  const [creditsBeforePurchase, setCreditsBeforePurchase] = useState<number | null>(null);
+
+  // ✅ Historique des recharges
+  const { items: recharges, loading: rechargesLoading, error: rechargesError } = useRechargeHistory(30);
+
+  const triggerSuccessClose = (message?: string) => {
+    setEmbedUrl(null);
+    setBuyLoading(null);
+    setLastPack(null);
+    setCreditsBeforePurchase(null);
+
+    setShowSuccessAnimation(true);
+    window.setTimeout(() => setShowSuccessAnimation(false), 4000);
+
+    setStatusMessage(message || "✅ Paiement confirmé ! Tes crédits ont été ajoutés à ton compte.");
+  };
+
+  const handleBuy = async (pack: PackKey) => {
+    try {
+      setBuyError(null);
+      setStatusMessage(null);
+
+      if (!user?.uid || !user.email) {
+        setBuyError("Tu dois être connecté pour recharger tes crédits.");
+        return;
+      }
+
+      setBuyLoading(pack);
+      setLastPack(pack);
+
+      // On capture le solde actuel pour détecter l’augmentation après webhook
+      if (typeof credits === "number") {
+        setCreditsBeforePurchase(credits);
+      } else {
+        setCreditsBeforePurchase(0);
+      }
+
+      // 👉 Appel à ta Cloud Function HTTPS : /polarCheckout
+      const endpoint = `${API_BASE}/polarCheckout`;
+
+      // ✅ reCAPTCHA token
+      let recaptchaToken = "";
+      try {
+        recaptchaToken = await getRecaptchaToken("polar_checkout");
+      } catch {
+        setBuyError(
+          "Sécurité: impossible de valider reCAPTCHA (script bloqué ?). Désactive l'adblock et réessaie."
+        );
+        setBuyLoading(null);
+        setCreditsBeforePurchase(null);
+        return;
+      }
+
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          packId: pack, // "20" | "50" | "100"
+          userId: user.uid, // pour externalCustomerId
+          email: user.email, // pour customerEmail
+          recaptchaToken, // ✅ ajouté
+        }),
+      });
+
+      const contentType = res.headers.get("content-type") || "";
+      let data: any = null;
+
+      if (contentType.includes("application/json")) {
+        data = await res.json();
+      } else {
+        const text = await res.text();
+        console.error("[Credits] Réponse non JSON de /polarCheckout :", text.slice(0, 300));
+        throw new Error(
+          "Le serveur de paiement a renvoyé une réponse invalide (HTML). Vérifie la fonction polarCheckout."
+        );
+      }
+
+      if (!res.ok || !data?.url) {
+        console.error("Erreur API /polarCheckout :", data);
+        throw new Error(data?.error || "Impossible de créer le paiement Polar.");
+      }
+
+      // 👉 On ajoute les params d’embed : embed=true & embed_origin=...
+      const origin = window.location.origin;
+      const urlBase = data.url as string;
+      const sep = urlBase.includes("?") ? "&" : "?";
+      const fullEmbedUrl = `${urlBase}${sep}embed=true&embed_origin=${encodeURIComponent(origin)}`;
+
+      setEmbedUrl(fullEmbedUrl); // ouvre la popup
+    } catch (e: any) {
+      console.error("Erreur checkout Polar (iframe) :", e);
+      setBuyError(
+        e?.message || "Erreur lors de la création du paiement. Essaie à nouveau dans quelques instants."
+      );
+      setBuyLoading(null);
+      setCreditsBeforePurchase(null);
+    }
+  };
+
+  // 🔐 (Option A / bonus) : si un jour Polar redirige l’iframe vers ton domaine,
+  // on peut fermer via status=success. Mais actuellement l’iframe reste chez Polar,
+  // donc ça ne marche pas (cross-origin).
+  const handleIframeLoad = () => {
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+
+    try {
+      const win = iframe.contentWindow;
+      if (!win) return;
+
+      const href = win.location.href; // accessible seulement si même origine
+
+      if (href.includes("/app/credits") && href.includes("status=success")) {
+        triggerSuccessClose("✅ Paiement confirmé ! Tes crédits vont se mettre à jour dans quelques instants.");
+      }
+
+      if (href.includes("/app/credits") && href.includes("status=cancel")) {
+        setEmbedUrl(null);
+        setBuyLoading(null);
+        setLastPack(null);
+        setCreditsBeforePurchase(null);
+        setStatusMessage("Paiement annulé.");
+      }
+    } catch {
+      // cross-origin -> normal
+    }
+  };
+
+  // ✅ LA FERMETURE AUTO (Option B) :
+  // Dès que les crédits augmentent après l’achat, on ferme la popup.
+  useEffect(() => {
+    if (!embedUrl) return;
+    if (creditsBeforePurchase === null) return;
+    if (loading) return;
+    if (typeof credits !== "number") return;
+
+    if (credits > creditsBeforePurchase) {
+      triggerSuccessClose("✅ Paiement confirmé ! Tes crédits ont été ajoutés.");
+    }
+  }, [credits, loading, embedUrl, creditsBeforePurchase]);
+
+  const closeModal = () => {
+    setEmbedUrl(null);
+    setBuyLoading(null);
+    setLastPack(null);
+    setCreditsBeforePurchase(null);
+  };
+
+  // Si on arrive sur /app/credits?status=success dans la page normale (sans iframe)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    const status = url.searchParams.get("status");
+
+    if (status === "success") {
+      setStatusMessage("✅ Paiement confirmé ! Tes crédits ont été pris en compte.");
+      setShowSuccessAnimation(true);
+      setTimeout(() => setShowSuccessAnimation(false), 4000);
+    } else if (status === "cancel") {
+      setStatusMessage("Paiement annulé.");
+    }
+  }, []);
+
+  return (
+    <div className="space-y-6">
+      {/* Animation succès flottante */}
+      {showSuccessAnimation && (
+        <div className="fixed top-4 left-1/2 z-40 -translate-x-1/2">
+          <div className="rounded-full border border-emerald-400/70 bg-emerald-500/10 px-4 py-2 shadow-lg backdrop-blur flex items-center gap-2 animate-[fadeInOut_4s_ease-in-out]">
+            <span className="text-lg">⚡</span>
+            <span className="text-[13px] text-emerald-200">Crédits ajoutés à ton compte !</span>
+          </div>
+        </div>
+      )}
+
+      {/* Titre + résumé */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div>
+          <h1 className="text-lg sm:text-xl font-semibold text-[var(--ink)]">Crédits IA</h1>
+          <p className="text-[12px] text-[var(--muted)]">
+            Utilise tes crédits pour analyser ton CV, générer des lettres de motivation, des pitchs, et préparer tes
+            entretiens.
+          </p>
+        </div>
+
+        {/* Petit récap du solde */}
+        <div className="inline-flex flex-col items-end gap-1">
+          <span className="text-[11px] text-[var(--muted)]">Solde actuel</span>
+          <div className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px] bg-[var(--bg-soft)] border border-[var(--border)]/80">
+            <span className="text-[15px]">⚡</span>
+            {loading ? (
+              <span className="text-[var(--muted)]">Chargement…</span>
+            ) : (
+              <span className="font-semibold text-[var(--ink)]">{credits} crédits</span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {statusMessage && <p className="text-[12px] text-emerald-400">{statusMessage}</p>}
+      {error && <p className="text-[12px] text-red-400">{error}</p>}
+
+      {/* Packs de rechargement */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <div>
+            <h2 className="text-base font-semibold text-[var(--ink)]">Recharger mes crédits</h2>
+            <p className="text-[12px] text-[var(--muted)]">
+              Choisis un pack ci-dessous pour ajouter des crédits à ton compte. Paiement sécurisé via Polar.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById("credit-packs");
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
+            className="btn-primary text-[12px] px-3 py-1.5"
+          >
+            Ajouter du crédit
+          </button>
+        </div>
+
+        <div id="credit-packs" className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4 mt-2">
+          {CREDIT_PACKS.map((pack) => (
+            <div
+              key={pack.key}
+              className="card-soft border border-[var(--border)]/80 rounded-2xl p-3 sm:p-4 flex flex-col justify-between"
+            >
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-[13px] font-semibold text-[var(--ink)]">{pack.label}</h3>
+                  <span className="inline-flex items-center rounded-full px-2 py-[2px] text-[11px] bg-[var(--bg)] border border-[var(--border)]/80">
+                    ⚡ {pack.credits} crédits
+                  </span>
+                </div>
+                <p className="text-[12px] text-[var(--muted)]">{pack.desc}</p>
+              </div>
+
+              <div className="mt-3 flex flex-col gap-1">
+                <button
+                  type="button"
+                  onClick={() => handleBuy(pack.key)}
+                  disabled={buyLoading === pack.key}
+                  className="btn-primary w-full text-[12px] flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {buyLoading === pack.key ? (
+                    <>
+                      <span className="loader" />
+                      <span>Ouverture du paiement…</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Recharger</span>
+                      <span className="text-[13px]">→</span>
+                    </>
+                  )}
+                </button>
+                <span className="text-[10px] text-[var(--muted)] text-center">
+                  Paiement unique, pas d’abonnement.
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {buyError && <p className="text-[12px] text-red-400">{buyError}</p>}
+      </section>
+
+      {/* Explication d’usage */}
+      <section className="text-[11px] text-[var(--muted)] space-y-1">
+        <p>1 crédit ≈ 1 action IA (analyse CV, génération de lettre, pitch, Q&A entretien…).</p>
+        <p>
+          Ton solde est mis à jour automatiquement après chaque achat dès que le paiement est confirmé (via le webhook
+          Polar).
+        </p>
+      </section>
+
+      {/* ✅ Historique des recharges */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3">
+        <div>
+          <h2 className="text-base font-semibold text-[var(--ink)]">Historique des recharges</h2>
+          <p className="text-[12px] text-[var(--muted)]">
+            Liste des rechargements crédités sur ton compte (webhook Polar).
+          </p>
+        </div>
+
+        {rechargesError && <p className="text-[12px] text-red-400">{rechargesError}</p>}
+
+        {rechargesLoading ? (
+          <p className="text-[12px] text-[var(--muted)]">Chargement…</p>
+        ) : recharges.length === 0 ? (
+          <p className="text-[12px] text-[var(--muted)]">Aucune recharge pour le moment.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[12px]">
+              <thead className="text-[var(--muted)]">
+                <tr className="text-left">
+                  <th className="py-2 pr-4">Date</th>
+                  <th className="py-2 pr-4">Crédits</th>
+                  <th className="py-2 pr-4">Montant</th>
+                  <th className="py-2 pr-4">Statut</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recharges.map((r) => {
+                  const d = r.createdAt ? new Date(r.createdAt) : null;
+                  const amount = typeof r.amount === "number" ? (r.amount / 100).toFixed(2) : null;
+                  const cur = r.currency ? String(r.currency).toUpperCase() : "";
+                  return (
+                    <tr key={r.id} className="border-t border-[var(--border)]/80">
+                      <td className="py-2 pr-4">{d ? d.toLocaleString("fr-FR") : "—"}</td>
+                      <td className="py-2 pr-4">
+                        {typeof r.creditsAdded === "number" ? `+${r.creditsAdded}` : "—"}
+                      </td>
+                      <td className="py-2 pr-4">{amount ? `${amount} ${cur}` : "—"}</td>
+                      <td className="py-2 pr-4">{r.status || "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      {/* 🔥 POPUP CHECKOUT POLAR EN IFRAME */}
+      {embedUrl && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="relative w-full max-w-lg h-[520px] sm:h-[580px] bg-[var(--bg)] border border-[var(--border)]/80 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)]/70 bg-[var(--bg-soft)]/80">
+              <div className="flex flex-col">
+                <span className="text-[12px] font-semibold text-[var(--ink)]">Paiement sécurisé</span>
+                <span className="text-[11px] text-[var(--muted)]">Transaction gérée par Polar (Stripe)</span>
+              </div>
+              <button
+                type="button"
+                onClick={closeModal}
+                className="text-[11px] rounded-full border border-[var(--border)] px-2 py-1 hover:bg-[var(--bg)]"
+              >
+                ✕
+              </button>
+            </div>
+
+            <iframe
+              ref={iframeRef}
+              src={embedUrl}
+              onLoad={handleIframeLoad}
+              className="flex-1 w-full border-0"
+              title="Paiement Polar"
+              allow="payment *; publickey-credentials-get *"
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+````
+
+## File: app/app/lm/page.tsx
+````typescript
+"use client";
+
+import { logUsage } from "@/lib/logUsage";
+import { useEffect, useMemo, useState, FormEvent } from "react";
+import { motion } from "framer-motion";
+import { auth, db } from "@/lib/firebase";
+import { onAuthStateChanged } from "firebase/auth";
+import { doc, getDoc, collection, addDoc, serverTimestamp } from "firebase/firestore";
+
+// ✅ PDF (génération locale, rendu identique à tes HTML pdfmake)
+import { makePdfColors } from "@/lib/pdf/colors";
+import { fitOnePage } from "@/lib/pdf/fitOnePage";
+import { mergePdfBlobs } from "@/lib/pdf/mergePdfs";
+import { downloadBlob } from "@/lib/pdf/pdfmakeClient";
+import { buildCvAtsPdf, type CvDocModel } from "@/lib/pdf/templates/cvAts";
+import { buildLmStyledPdf, type LmModel } from "@/lib/pdf/templates/letter";
+
+// --- TYPES ---
+
+type CvSkillsSection = { title: string; items: string[] };
+type CvSkills = { sections: CvSkillsSection[]; tools: string[] };
+
+type CvExperience = {
+  company: string;
+  role: string;
+  dates: string;
+  bullets: string[];
+  location?: string;
+};
+
+type CvEducation = {
+  school: string;
+  degree: string;
+  dates: string;
+  location?: string;
+};
+
+type CvProfile = {
+  fullName: string;
+  email: string;
+  phone: string;
+  linkedin: string;
+  profileSummary: string;
+
+  city?: string;
+  address?: string;
+
+  contractType: string;
+  contractTypeStandard?: string;
+  contractTypeFull?: string;
+
+  primaryDomain?: string;
+  secondaryDomains?: string[];
+  softSkills?: string[];
+
+  drivingLicense?: string;
+  vehicle?: string;
+
+  skills: CvSkills;
+  experiences: CvExperience[];
+  education: CvEducation[];
+  educationShort: string[];
+  certs: string;
+  langLine: string;
+  hobbies: string[];
+  updatedAt?: number;
+};
+
+type Lang = "fr" | "en";
+
+// 🔗 ENDPOINT LOCAL (Proxy Next.js)
+// On pointe vers notre API locale pour gérer l'auth proprement
+const LETTER_AND_PITCH_URL = "/api/generateLetterAndPitch";
+
+// =============================
+// ✅ reCAPTCHA Enterprise (client)
+// =============================
+
+const RECAPTCHA_SITE_KEY = process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY || "";
+let recaptchaLoadPromise: Promise<void> | null = null;
+
+function loadRecaptchaEnterprise(siteKey: string): Promise<void> {
+  if (typeof window === "undefined") {
+    return Promise.reject(new Error("reCAPTCHA: window indisponible (SSR)."));
+  }
+  if ((window as any).grecaptcha?.enterprise) return Promise.resolve();
+  if (recaptchaLoadPromise) return recaptchaLoadPromise;
+
+  recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
+    const existing = document.querySelector(
+      'script[data-recaptcha-enterprise="true"]'
+    ) as HTMLScriptElement | null;
+
+    if (existing) {
+      const t = window.setInterval(() => {
+        if ((window as any).grecaptcha?.enterprise) {
+          window.clearInterval(t);
+          resolve();
+        }
+      }, 50);
+
+      window.setTimeout(() => {
+        window.clearInterval(t);
+        if (!(window as any).grecaptcha?.enterprise) {
+          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
+        }
+      }, 6000);
+      return;
+    }
+
+    const s = document.createElement("script");
+    s.src = `https://www.google.com/recaptcha/enterprise.js?render=${encodeURIComponent(
+      siteKey
+    )}`;
+    s.async = true;
+    s.defer = true;
+    s.setAttribute("data-recaptcha-enterprise", "true");
+
+    s.onload = () => {
+      const t = window.setInterval(() => {
+        if ((window as any).grecaptcha?.enterprise) {
+          window.clearInterval(t);
+          resolve();
+        }
+      }, 50);
+
+      window.setTimeout(() => {
+        window.clearInterval(t);
+        if (!(window as any).grecaptcha?.enterprise) {
+          reject(new Error("reCAPTCHA Enterprise non disponible (timeout)."));
+        }
+      }, 6000);
+    };
+
+    s.onerror = () =>
+      reject(new Error("Impossible de charger reCAPTCHA Enterprise."));
+    document.head.appendChild(s);
+  });
+
+  return recaptchaLoadPromise;
+}
+
+async function getRecaptchaToken(action: string): Promise<string> {
+  if (!RECAPTCHA_SITE_KEY) {
+    throw new Error("reCAPTCHA: NEXT_PUBLIC_RECAPTCHA_SITE_KEY manquante.");
+  }
+
+  await loadRecaptchaEnterprise(RECAPTCHA_SITE_KEY);
+
+  const g = (window as any).grecaptcha;
+  if (!g?.enterprise?.ready || !g?.enterprise?.execute) {
+    throw new Error(
+      "reCAPTCHA Enterprise indisponible (grecaptcha.enterprise manquant)."
+    );
+  }
+
+  await new Promise<void>((resolve) => g.enterprise.ready(() => resolve()));
+  const token = await g.enterprise.execute(RECAPTCHA_SITE_KEY, { action });
+
+  if (!token || typeof token !== "string") {
+    throw new Error("reCAPTCHA: token vide.");
+  }
+  return token;
+}
+
+// =============================
+// ✅ Helpers (texte & PDF locaux)
+// =============================
+
+function safeText(v: any) {
+  return String(v ?? "").trim();
+}
+
+function buildContactLine(p: CvProfile) {
+  const parts: string[] = [];
+  if (p.city) parts.push(safeText(p.city));
+  if (p.phone) parts.push(safeText(p.phone));
+  if (p.email) parts.push(safeText(p.email));
+  if (p.linkedin) parts.push(safeText(p.linkedin));
+  return parts.filter(Boolean).join(" | ");
+}
+
+function categorizeSkills(profile: CvProfile) {
+  const cloud: string[] = [];
+  const sec: string[] = [];
+  const sys: string[] = [];
+  const auto: string[] = [];
+  const tools: string[] = [];
+  const soft: string[] = Array.isArray(profile.softSkills) ? profile.softSkills : [];
+
+  const sections = profile.skills?.sections || [];
+  for (const s of sections) {
+    const title = (s?.title || "").toLowerCase();
+    const items = (s?.items || []).filter(Boolean);
+
+    const pushAll = (arr: string[], vals: string[]) => vals.forEach((x) => arr.push(x));
+
+    if (title.includes("cloud") || title.includes("azure") || title.includes("aws") || title.includes("gcp")) {
+      pushAll(cloud, items);
+    } else if (title.includes("sécu") || title.includes("secu") || title.includes("security") || title.includes("cyber")) {
+      pushAll(sec, items);
+    } else if (
+      title.includes("réseau") ||
+      title.includes("reseau") ||
+      title.includes("system") ||
+      title.includes("système") ||
+      title.includes("sys")
+    ) {
+      pushAll(sys, items);
+    } else if (title.includes("autom") || title.includes("devops") || title.includes("ia") || title.includes("api")) {
+      pushAll(auto, items);
+    } else {
+      pushAll(tools, items);
+    }
+  }
+
+  const extraTools = Array.isArray(profile.skills?.tools) ? profile.skills.tools : [];
+  extraTools.forEach((t) => tools.push(t));
+
+  const uniq = (arr: string[]) => Array.from(new Set(arr.map((x) => safeText(x)).filter(Boolean)));
+
+  return {
+    cloud: uniq(cloud),
+    sec: uniq(sec),
+    sys: uniq(sys),
+    auto: uniq(auto),
+    tools: uniq(tools),
+    soft: uniq(soft),
+  };
+}
+
+function profileToCvDocModel(profile: CvProfile, params: { targetJob: string; contract: string }): CvDocModel {
+  const titleParts: string[] = [];
+  if (params.targetJob?.trim()) titleParts.push(params.targetJob.trim());
+  if (params.contract?.trim()) titleParts.push(params.contract.trim());
+  const title = titleParts.length ? titleParts.join(" — ") : (profile.contractType || "Candidature");
+
+  const skills = categorizeSkills(profile);
+
+  const xp = (profile.experiences || []).map((x) => ({
+    company: safeText(x.company),
+    city: safeText(x.location || ""),
+    role: safeText(x.role),
+    dates: safeText(x.dates),
+    bullets: Array.isArray(x.bullets) ? x.bullets.map(safeText).filter(Boolean) : [],
+  }));
+
+  const educationLines =
+    Array.isArray(profile.educationShort) && profile.educationShort.length
+      ? profile.educationShort.map(safeText).filter(Boolean)
+      : (profile.education || []).map((e) => {
+          const a = safeText(e.degree);
+          const b = safeText(e.school);
+          const c = safeText(e.dates);
+          const d = safeText(e.location || "");
+          return [a, b, c, d].filter(Boolean).join(" — ");
+        });
+
+  return {
+    name: safeText(profile.fullName) || safeText(profile.email) || "Candidat",
+    title,
+    contactLine: buildContactLine(profile),
+    profile: safeText(profile.profileSummary),
+    skills,
+    xp,
+    education: educationLines,
+    certs: safeText(profile.certs),
+    langLine: safeText(profile.langLine),
+    hobbies: Array.isArray(profile.hobbies) ? profile.hobbies.map(safeText).filter(Boolean) : [],
+  };
+}
+
+// --- Pour que l’IA écrive une VRAIE lettre (expériences, résultats, outils) ---
+function buildCandidateHighlights(profile: CvProfile) {
+  const topXp = (profile.experiences || []).slice(0, 3).map((xp, i) => {
+    const bullets = (xp.bullets || []).slice(0, 4).map((b) => `- ${b}`).join("\n");
+    return `EXP${i + 1}: ${xp.role} @ ${xp.company} (${xp.dates}${xp.location ? `, ${xp.location}` : ""})
+${bullets}`;
+  });
+
+  const skillLines = (profile.skills?.sections || [])
+    .slice(0, 4)
+    .map((s) => `${s.title}: ${(s.items || []).slice(0, 10).join(", ")}`);
+
+  const tools = (profile.skills?.tools || []).slice(0, 18);
+
+  return `
+CANDIDATE_NAME: ${profile.fullName}
+SUMMARY: ${profile.profileSummary}
+
+TOP_EXPERIENCES:
+${topXp.join("\n\n")}
+
+KEY_SKILLS:
+${skillLines.join("\n")}
+
+TOOLS:
+${tools.join(", ")}
+
+CERTS: ${profile.certs}
+LANGS: ${profile.langLine}
+`.trim();
+}
+
+function buildJobDescWithInstructions(args: {
+  jobDescription: string;
+  lang: Lang;
+  jobTitle: string;
+  companyName: string;
+  jobLink: string;
+  profile: CvProfile;
+}) {
+  const base = (args.jobDescription || "").trim();
+
+  const instrFR = `
+---
+INSTRUCTIONS IMPORTANTES (à respecter):
+- Rédige une lettre de motivation PERSONNALISÉE et crédible.
+- Utilise explicitement 2 à 3 expériences ci-dessous (réalisations / responsabilités).
+- Mets en avant compétences + outils pertinents pour le poste.
+- Adapte le discours à l'entreprise "${args.companyName}" et au poste "${args.jobTitle}".
+- Ton: professionnel, concret, pas de blabla.
+- Longueur: 220 à 320 mots (≈ 1 page A4).
+- Structure: 3 à 4 paragraphes.
+- Termine par une phrase d’appel à entretien.
+- IMPORTANT: Retourne UNIQUEMENT le CORPS de la lettre (pas d’en-tête, pas d’adresse, pas de signature).
+
+OFFRE_URL: ${args.jobLink || "(non fournie)"}
+
+PROFIL (à utiliser):
+${buildCandidateHighlights(args.profile)}
+`.trim();
+
+  const instrEN = `
+---
+IMPORTANT INSTRUCTIONS:
+- Write a REAL, tailored cover letter (credible, specific).
+- Explicitly use 2–3 experiences below (achievements/responsibilities).
+- Highlight relevant skills + tools for the role.
+- Adapt to company "${args.companyName}" and role "${args.jobTitle}".
+- Tone: professional, concrete, no fluff.
+- Length: 220–320 words (~1 A4 page).
+- Structure: 3–4 paragraphs.
+- End with a clear interview call-to-action.
+- IMPORTANT: Return ONLY the BODY (no header, no address, no signature).
+
+JOB_URL: ${args.jobLink || "(not provided)"}
+
+PROFILE (use it):
+${buildCandidateHighlights(args.profile)}
+`.trim();
+
+  const injected = args.lang === "fr" ? instrFR : instrEN;
+  if (!base) return injected;
+  return `${base}\n\n${injected}`;
+}
+
+function extractBodyFromLetterText(letterText: string, lang: Lang, fullName: string) {
+  const raw = safeText(letterText);
+  if (!raw) return "";
+
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return raw;
+
+  const first = lines[0].toLowerCase();
+  const isGreeting =
+    (lang === "fr" && (first.startsWith("madame") || first.startsWith("bonjour"))) ||
+    (lang === "en" && (first.startsWith("dear") || first.startsWith("hello")));
+
+  if (isGreeting) lines.shift();
+
+  while (lines.length) {
+    const last = lines[lines.length - 1].toLowerCase();
+    if (
+      last.includes("cordialement") ||
+      last.includes("bien cordialement") ||
+      last.includes("salutations") ||
+      last.includes("sincerely") ||
+      last.includes("best regards") ||
+      last.includes("kind regards")
+    ) {
+      lines.pop();
+      continue;
+    }
+    if (fullName && last.includes(fullName.toLowerCase())) {
+      lines.pop();
+      continue;
+    }
+    break;
+  }
+
+  const body = lines.join("\n\n").trim();
+  return body || raw;
+}
+
+function buildLmModel(profile: CvProfile, lang: Lang, companyName: string, jobTitle: string, letterText: string): LmModel {
+  const name = safeText(profile.fullName) || "Candidat";
+  const contactLines: string[] = [];
+  if (profile.phone) contactLines.push(lang === "fr" ? `Téléphone : ${safeText(profile.phone)}` : `Phone: ${safeText(profile.phone)}`);
+  if (profile.email) contactLines.push(lang === "fr" ? `Email : ${safeText(profile.email)}` : `Email: ${safeText(profile.email)}`);
+  if (profile.linkedin) contactLines.push(lang === "fr" ? `LinkedIn : ${safeText(profile.linkedin)}` : `LinkedIn: ${safeText(profile.linkedin)}`);
+
+  const city = safeText(profile.city) || "Paris";
+  const dateStr =
+    lang === "fr"
+      ? new Date().toLocaleDateString("fr-FR")
+      : new Date().toLocaleDateString("en-GB");
+
+  const subject =
+    lang === "fr"
+      ? `Objet : Candidature – ${jobTitle || "poste"}`
+      : `Subject: Application – ${jobTitle || "role"}`;
+
+  const salutation = lang === "fr" ? "Madame, Monsieur," : "Dear Hiring Manager,";
+  const closing = lang === "fr" ? "Cordialement," : "Sincerely,";
+
+  const body = extractBodyFromLetterText(letterText, lang, name);
+
+  return {
+    lang,
+    name,
+    contactLines,
+    service: lang === "fr" ? "Service Recrutement" : "Recruitment Team",
+    companyName: safeText(companyName) || (lang === "fr" ? "Entreprise" : "Company"),
+    companyAddr: "",
+    city,
+    dateStr,
+    subject,
+    salutation,
+    body: body || safeText(letterText),
+    closing,
+    signature: name,
+  };
+}
+
+// =============================
+// PAGE
+// =============================
+
+export default function AssistanceCandidaturePage() {
+  // --- PROFIL CV IA ---
+  const [userId, setUserId] = useState<string | null>(null);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [profile, setProfile] = useState<CvProfile | null>(null);
+  const [loadingProfile, setLoadingProfile] = useState(true);
+
+  // Bandeau global "IA en cours"
+  const [globalLoadingMessage, setGlobalLoadingMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        setUserId(null);
+        setUserEmail(null);
+        setProfile(null);
+        setLoadingProfile(false);
+        return;
+      }
+
+      setUserId(user.uid);
+      setUserEmail(user.email ?? null);
+
+      try {
+        const ref = doc(db, "profiles", user.uid);
+        const snap = await getDoc(ref);
+
+        if (snap.exists()) {
+          const data = snap.data() as any;
+
+          const loadedProfile: CvProfile = {
+            fullName: data.fullName || "",
+            email: data.email || "",
+            phone: data.phone || "",
+            linkedin: data.linkedin || "",
+            profileSummary: data.profileSummary || "",
+            city: data.city || "",
+            address: data.address || "",
+            contractType: data.contractType || data.contractTypeStandard || "",
+            contractTypeStandard: data.contractTypeStandard || "",
+            contractTypeFull: data.contractTypeFull || "",
+            primaryDomain: data.primaryDomain || "",
+            secondaryDomains: Array.isArray(data.secondaryDomains) ? data.secondaryDomains : [],
+            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
+            drivingLicense: data.drivingLicense || "",
+            vehicle: data.vehicle || "",
+            skills: {
+              sections: Array.isArray(data.skills?.sections) ? data.skills.sections : [],
+              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
+            },
+            experiences: Array.isArray(data.experiences) ? data.experiences : [],
+            education: Array.isArray(data.education) ? data.education : [],
+            educationShort: Array.isArray(data.educationShort) ? data.educationShort : [],
+            certs: data.certs || "",
+            langLine: data.langLine || "",
+            hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
+            updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : undefined,
+          };
+
+          setProfile(loadedProfile);
+        } else {
+          setProfile(null);
+        }
+      } catch (e) {
+        console.error("Erreur chargement profil Firestore (assistance):", e);
+      } finally {
+        setLoadingProfile(false);
+      }
+    });
+
+    return () => unsub();
+  }, []);
+
+  // --- ÉTATS CV IA ---
+  const [cvTargetJob, setCvTargetJob] = useState("");
+  const [cvTemplate, setCvTemplate] = useState("ats");
+  const [cvLang, setCvLang] = useState<Lang>("fr");
+  const [cvContract, setCvContract] = useState("CDI");
+  const [cvJobLink, setCvJobLink] = useState("");
+  const [cvJobDesc, setCvJobDesc] = useState("");
+  const [cvAutoCreate, setCvAutoCreate] = useState(true);
+
+  const [cvLoading, setCvLoading] = useState(false);
+  const [cvZipLoading, setCvZipLoading] = useState(false);
+  const [cvStatus, setCvStatus] = useState<string | null>(null);
+  const [cvError, setCvError] = useState<string | null>(null);
+
+  // ✅ Couleur PDF (rouge par défaut)
+  const [pdfBrand, setPdfBrand] = useState("#ef4444"); // 🔴 rouge
+
+  // --- ÉTATS LETTRE DE MOTIVATION ---
+  const [lmLang, setLmLang] = useState<Lang>("fr");
+  const [companyName, setCompanyName] = useState("");
+  const [jobTitle, setJobTitle] = useState("");
+  const [jobDescription, setJobDescription] = useState("");
+  const [jobLink, setJobLink] = useState("");
+  const [letterText, setLetterText] = useState("");
+  const [lmLoading, setLmLoading] = useState(false);
+  const [lmError, setLmError] = useState<string | null>(null);
+  const [letterCopied, setLetterCopied] = useState(false);
+  const [lmPdfLoading, setLmPdfLoading] = useState(false);
+  const [lmPdfError, setLmPdfError] = useState<string | null>(null);
+
+  // --- ÉTATS PITCH ---
+  const [pitchLang, setPitchLang] = useState<Lang>("fr");
+  const [pitchText, setPitchText] = useState("");
+  const [pitchLoading, setPitchLoading] = useState(false);
+  const [pitchError, setPitchError] = useState<string | null>(null);
+  const [pitchCopied, setPitchCopied] = useState(false);
+
+  // --- MAIL ---
+  const [recruiterName, setRecruiterName] = useState("");
+  const [emailPreview, setEmailPreview] = useState("");
+  const [subjectPreview, setSubjectPreview] = useState("");
+
+  // --- DERIVÉS ---
+  const visibilityLabel = userId ? "Associé à ton compte" : "Invité";
+
+  const miniHeadline =
+    profile?.profileSummary?.split(".")[0] ||
+    profile?.contractType ||
+    "Analyse ton CV PDF dans l’onglet « CV IA » pour activer l’assistant.";
+
+  const profileName = profile?.fullName || userEmail || "Profil non détecté";
+
+  const targetedJob = jobTitle || cvTargetJob || "Poste cible non renseigné";
+  const targetedCompany = companyName || "Entreprise non renseignée";
+
+  // --- Auto create /applications ---
+  type GenerationKind = "cv" | "cv_lm" | "lm" | "pitch";
+
+  const autoCreateApplication = async (kind: GenerationKind) => {
+    if (!cvAutoCreate) return;
+    if (!userId || !profile) return;
+
+    try {
+      const appsRef = collection(db, "applications");
+      await addDoc(appsRef, {
+        userId,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        company: companyName || "",
+        jobTitle: jobTitle || cvTargetJob || "",
+        jobLink: jobLink || cvJobLink || "",
+        status: "draft",
+        source: "Assistant candidature IA",
+        hasCv: kind === "cv" || kind === "cv_lm",
+        hasLm: kind === "lm" || kind === "cv_lm",
+        hasPitch: kind === "pitch",
+        langCv: cvLang,
+        langLm: lmLang,
+        langPitch: pitchLang,
+      });
+    } catch (e) {
+      console.error("Erreur création entrée suivi de candidature :", e);
+    }
+  };
+
+  // =============================
+  // ✅ Génération IA (lettre / pitch) - MODIFIÉ POUR TOKEN
+  // =============================
+
+  const generateCoverLetterText = async (lang: Lang): Promise<string> => {
+    if (!profile) throw new Error("Profil manquant.");
+    if (!jobTitle && !jobDescription) {
+      throw new Error("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
+    }
+
+    // 1. Récupérer l'utilisateur pour le token
+    const user = auth.currentUser;
+    if (!user) throw new Error("Vous devez être connecté pour générer une lettre.");
+    
+    // 2. Récupérer le token Auth
+    const token = await user.getIdToken();
+
+    const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
+
+    // ✅ injection pour forcer une VRAIE lettre (expériences, outils, concret)
+    const enrichedJobDescription = buildJobDescWithInstructions({
+      jobDescription,
+      lang,
+      jobTitle,
+      companyName,
+      jobLink,
+      profile,
+    });
+
+    // 3. Appel vers l'API locale avec le TOKEN dans les headers
+    const resp = await fetch(LETTER_AND_PITCH_URL, {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}` // <--- CLÉ DE L'AUTHENTIFICATION
+      },
+      body: JSON.stringify({
+        profile,
+        jobTitle,
+        companyName,
+        jobDescription: enrichedJobDescription,
+        lang,
+        recaptchaToken,
+      }),
+    });
+
+    const json = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const msg = (json && json.error) || "Erreur pendant la génération de la lettre de motivation.";
+      throw new Error(msg);
+    }
+
+    const coverLetter = typeof json.coverLetter === "string" ? json.coverLetter.trim() : "";
+    if (!coverLetter) throw new Error("Lettre vide renvoyée par l'API.");
+    return coverLetter;
+  };
+
+  // =============================
+  // ✅ PDF locaux (CV + LM)
+  // =============================
+
+  const colors = useMemo(() => makePdfColors(pdfBrand), [pdfBrand]);
+
+  const handleGenerateCv = async () => {
+    if (!profile) {
+      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      return;
+    }
+
+    setCvError(null);
+    setCvStatus(null);
+    setCvLoading(true);
+    setGlobalLoadingMessage("Mise en page du CV (1 page)…");
+
+    try {
+      if (cvTemplate !== "ats") {
+        setCvStatus("Note : génération locale disponible en ATS (sobre) pour le moment.");
+      }
+
+      const cvModel: CvDocModel = profileToCvDocModel(profile, {
+        targetJob: cvTargetJob,
+        contract: cvContract,
+      });
+
+      const { blob, bestScale } = await fitOnePage((scale) =>
+        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
+      );
+
+      downloadBlob(blob, "cv-ia.pdf");
+      setCvStatus(`CV généré (1 page) ✅ (scale=${bestScale.toFixed(2)})`);
+
+      await autoCreateApplication("cv");
+
+      if (auth.currentUser) {
+        await logUsage({
+          user: auth.currentUser,
+          action: "generate_document",
+          docType: "cv",
+          eventType: "generate",
+          tool: "clientPdfMakeCv",
+        });
+      }
+    } catch (err: any) {
+      console.error("Erreur génération CV locale:", err);
+      setCvError(err?.message || "Impossible de générer le CV pour le moment.");
+    } finally {
+      setCvLoading(false);
+      setGlobalLoadingMessage(null);
+    }
+  };
+
+  const handleGenerateCvLmPdf = async () => {
+    if (!profile) {
+      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      return;
+    }
+
+    setCvError(null);
+    setCvStatus(null);
+    setCvZipLoading(true);
+    setGlobalLoadingMessage("Mise en page CV + lettre (1 page + 1 page)…");
+
+    try {
+      // 1) CV
+      const cvModel: CvDocModel = profileToCvDocModel(profile, {
+        targetJob: cvTargetJob,
+        contract: cvContract,
+      });
+
+      const cvFit = await fitOnePage((scale) =>
+        buildCvAtsPdf(cvModel, cvLang, colors, "auto", scale)
+      );
+
+      // 2) Lettre : si pas encore générée -> IA
+      let cover = letterText?.trim();
+      if (!cover) {
+        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
+        cover = await generateCoverLetterText(lmLang);
+        setLetterText(cover);
+      }
+
+      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
+
+      const lmFit = await fitOnePage(
+        (scale) => buildLmStyledPdf(lmModel, colors, scale),
+        { min: 0.85, max: 1.6, iterations: 7, initial: 1.0 }
+      );
+
+      // 3) Fusion -> 2 pages
+      const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
+      downloadBlob(merged, "cv-lm-ia.pdf");
+
+      setCvStatus("CV (1 page) + LM (1 page) générés ✅ (PDF 2 pages)");
+      await autoCreateApplication("cv_lm");
+
+      if (auth.currentUser) {
+        await logUsage({
+          user: auth.currentUser,
+          action: "generate_document",
+          docType: "cv",
+          eventType: "generate",
+          tool: "clientPdfMakeCvLm",
+        });
+        await logUsage({
+          user: auth.currentUser,
+          action: "generate_document",
+          docType: "lm",
+          eventType: "generate",
+          tool: "clientPdfMakeCvLm",
+          creditsDelta: 0,
+        });
+      }
+    } catch (err: any) {
+      console.error("Erreur génération CV+LM locale:", err);
+      setCvError(err?.message || "Impossible de générer CV + LM pour le moment.");
+    } finally {
+      setCvZipLoading(false);
+      setGlobalLoadingMessage(null);
+    }
+  };
+
+  // --- ACTIONS LETTRE ---
+  const handleGenerateLetter = async (e?: FormEvent) => {
+    if (e) e.preventDefault();
+    if (!profile) {
+      setLmError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      return;
+    }
+    if (!jobTitle && !jobDescription) {
+      setLmError("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
+      return;
+    }
+
+    setLmError(null);
+    setLmPdfError(null);
+    setPitchError(null);
+    setLmLoading(true);
+    setLetterCopied(false);
+    setGlobalLoadingMessage("L’IA rédige ta lettre de motivation…");
+
+    try {
+      const coverLetter = await generateCoverLetterText(lmLang);
+      setLetterText(coverLetter);
+
+      await autoCreateApplication("lm");
+
+      if (auth.currentUser) {
+        await logUsage({
+          user: auth.currentUser,
+          action: "generate_document",
+          docType: "lm",
+          eventType: "generate",
+          tool: "generateLetterAndPitch",
+        });
+      }
+    } catch (err: any) {
+      console.error("Erreur generateLetter:", err);
+      setLmError(err?.message || "Impossible de générer la lettre de motivation pour le moment.");
+    } finally {
+      setLmLoading(false);
+      setGlobalLoadingMessage(null);
+    }
+  };
+
+  // ✅ PDF LM local (auto-génère si texte vide)
+  const handleDownloadLetterPdf = async () => {
+    if (!profile) {
+      setLmPdfError("Profil manquant.");
+      return;
+    }
+    if (!jobTitle && !jobDescription && !letterText) {
+      setLmPdfError("Renseigne au moins le poste ou colle un extrait d’offre, puis génère/télécharge.");
+      return;
+    }
+
+    setLmPdfError(null);
+    setLmPdfLoading(true);
+    setGlobalLoadingMessage("Mise en forme PDF (lettre 1 page)…");
+
+    try {
+      let cover = letterText?.trim();
+      if (!cover) {
+        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
+        cover = await generateCoverLetterText(lmLang);
+        setLetterText(cover);
+      }
+
+      const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
+
+      const { blob } = await fitOnePage(
+        (scale) => buildLmStyledPdf(lmModel, colors, scale),
+        { min: 0.85, max: 1.6, iterations: 7, initial: 1.0 }
+      );
+
+      downloadBlob(blob, "lettre-motivation.pdf");
+
+      if (auth.currentUser) {
+        await logUsage({
+          user: auth.currentUser,
+          action: "download_pdf",
+          docType: "other",
+          eventType: "lm_pdf_download",
+          tool: "clientPdfMakeLm",
+        });
+      }
+    } catch (err: any) {
+      console.error("Erreur LM PDF (local):", err);
+      setLmPdfError(err?.message || "Impossible de générer le PDF pour le moment.");
+    } finally {
+      setLmPdfLoading(false);
+      setGlobalLoadingMessage(null);
+    }
+  };
+
+  const handleCopyLetter = async () => {
+    if (!letterText) return;
+    try {
+      await navigator.clipboard.writeText(letterText);
+      setLetterCopied(true);
+      setTimeout(() => setLetterCopied(false), 1500);
+    } catch (e) {
+      console.error("Erreur copie LM:", e);
+    }
+  };
+
+  // --- PITCH ---
+  const handleGeneratePitch = async () => {
+    if (!profile) {
+      setPitchError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA pour analyser ton CV PDF.");
+      return;
+    }
+
+    const effectiveJobTitle = jobTitle || cvTargetJob || "Candidature cible";
+    const effectiveDesc = jobDescription || cvJobDesc || "";
+
+    setPitchError(null);
+    setPitchLoading(true);
+    setPitchCopied(false);
+    setGlobalLoadingMessage("L’IA prépare ton pitch d’ascenseur…");
+
+    try {
+      // 1. Récupérer User + Token
+      const user = auth.currentUser;
+      if (!user) throw new Error("Connecte-toi pour générer un pitch.");
+      const token = await user.getIdToken();
+
+      const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
+
+      // 2. Appel API Locale avec Token
+      const resp = await fetch(LETTER_AND_PITCH_URL, {
+        method: "POST",
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}` 
+        },
+        body: JSON.stringify({
+          profile,
+          jobTitle: effectiveJobTitle,
+          companyName,
+          jobDescription: effectiveDesc,
+          lang: pitchLang,
+          recaptchaToken,
+        }),
+      });
+
+      const json = await resp.json().catch(() => null);
+
+      if (!resp.ok) {
+        const msg = (json && json.error) || "Erreur pendant la génération du pitch.";
+        throw new Error(msg);
+      }
+
+      const pitch = typeof json.pitch === "string" ? json.pitch.trim() : "";
+      if (!pitch) throw new Error("Pitch vide renvoyé par l'API.");
+
+      setPitchText(pitch);
+      await autoCreateApplication("pitch");
+
+      if (auth.currentUser) {
+        await logUsage({
+          user: auth.currentUser,
+          action: "generate_pitch",
+          docType: "other",
+          eventType: "generate",
+          tool: "generateLetterAndPitch",
+        });
+      }
+    } catch (err: any) {
+      console.error("Erreur generatePitch:", err);
+      setPitchError(err?.message || "Impossible de générer le pitch pour le moment.");
+    } finally {
+      setPitchLoading(false);
+      setGlobalLoadingMessage(null);
+    }
+  };
+
+  const handleCopyPitch = async () => {
+    if (!pitchText) return;
+    try {
+      await navigator.clipboard.writeText(pitchText);
+      setPitchCopied(true);
+      setTimeout(() => setPitchCopied(false), 1500);
+    } catch (e) {
+      console.error("Erreur copie pitch:", e);
+    }
+  };
+
+  // --- MAIL ---
+  const buildEmailContent = () => {
+    const name = profile?.fullName || "Je";
+    const subject = `Candidature – ${jobTitle || "poste"} – ${name}`;
+    const recruiter = recruiterName.trim() || "Madame, Monsieur";
+
+    const body = `Bonjour ${recruiter},
+
+Je me permets de vous adresser ma candidature pour le poste de ${jobTitle || "..."} au sein de ${
+      companyName || "votre entreprise"
+    }.
+
+Vous trouverez ci-joint mon CV ainsi que ma lettre de motivation.
+Mon profil correspond particulièrement à vos attentes sur ce poste, et je serais ravi(e) d'échanger avec vous pour en discuter de vive voix.
+
+Je reste bien entendu disponible pour tout complément d'information.
+
+Cordialement,
+
+${name}
+`;
+
+    setSubjectPreview(subject);
+    setEmailPreview(body);
+  };
+
+  const handleGenerateEmail = (e: FormEvent) => {
+    e.preventDefault();
+    buildEmailContent();
+  };
+
+  // --- RENDER ---
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.25 }}
+      className="max-w-3xl mx-auto px-3 sm:px-4 py-5 sm:py-6 space-y-4"
+    >
+      {/* Bandeau global IA */}
+      {globalLoadingMessage && (
+        <div className="mb-2 rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-1.5 text-[11px] flex items-center gap-2 text-[var(--muted)]">
+          <span className="inline-flex w-3 h-3 rounded-full border-2 border-[var(--brand)] border-t-transparent animate-spin" />
+          <span>{globalLoadingMessage}</span>
+        </div>
+      )}
+
+      {/* HEADER */}
+      <section className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="badge-muted flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+            <span className="text-[11px] uppercase tracking-wider text-[var(--muted)]">
+              Assistant de candidature IA
+            </span>
+          </p>
+          <div className="flex flex-wrap gap-2 text-[11px]">
+            <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
+              Profil IA :{" "}
+              <span className="ml-1 font-medium">
+                {loadingProfile ? "Chargement…" : profile ? "Détecté ✅" : "Non détecté"}
+              </span>
+            </span>
+            <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
+              Visibilité : <span className="ml-1 font-medium">{visibilityLabel}</span>
+            </span>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="space-y-1">
+            <h1 className="text-lg sm:text-xl font-semibold">Prépare ta candidature avec ton CV IA</h1>
+            <p className="text-[12px] text-[var(--muted)] max-w-xl">
+              Génère un <strong>CV 1 page</strong>, une <strong>lettre de motivation</strong> (1 page), un{" "}
+              <strong>pitch</strong> et un <strong>mail</strong>.
+            </p>
+          </div>
+
+          <div className="w-full sm:w-[220px] rounded-2xl border border-[var(--border)] bg-[var(--bg-soft)] px-3 py-2.5 text-[11px]">
+            <p className="text-[var(--muted)] mb-1">Résumé du profil</p>
+            <p className="font-semibold text-[var(--ink)] leading-tight">{profileName}</p>
+            <p className="mt-0.5 text-[var(--muted)] line-clamp-2">{miniHeadline}</p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-1.5 text-[11px]">
+          {[
+            "Cible le poste",
+            "Génère CV & LM",
+            "Prépare ton pitch",
+            "Génère ton mail",
+          ].map((t, i) => (
+            <span
+              key={i}
+              className="inline-flex items-center gap-1 rounded-full bg-[var(--bg-soft)] border border-[var(--border)] px-2 py-[3px]"
+            >
+              <span className="w-4 h-4 rounded-full bg-[var(--brand)]/10 flex items-center justify-center text-[10px] text-[var(--brand)]">
+                {i + 1}
+              </span>
+              <span>{t}</span>
+            </span>
+          ))}
+        </div>
+      </section>
+
+      {/* ÉTAPE 1 : CV */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
+              Étape 1
+            </span>
+            <div>
+              <h2 className="text-base sm:text-lg font-semibold text-[var(--ink)]">CV IA – 1 page A4</h2>
+              <p className="text-[11px] text-[var(--muted)]">
+                Génération locale (PDF) – rendu identique aux templates HTML.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-3 text-[13px]">
+          <div>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Titre / objectif du CV</label>
+            <input
+              id="cvTargetJob"
+              type="text"
+              className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+              placeholder="Ex : Ingénieur Cybersécurité"
+              value={cvTargetJob}
+              onChange={(e) => setCvTargetJob(e.target.value)}
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Modèle</label>
+              <select
+                id="cvTemplate"
+                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
+                value={cvTemplate}
+                onChange={(e) => setCvTemplate(e.target.value)}
+              >
+                <option value="ats">ATS (sobre) ✅</option>
+                <option value="design">Design (CLOUD)</option>
+                <option value="magazine">Magazine</option>
+                <option value="classic">Classique</option>
+                <option value="modern">Moderne</option>
+                <option value="minimalist">Minimaliste</option>
+                <option value="academic">Académique</option>
+              </select>
+              {cvTemplate !== "ats" && (
+                <p className="mt-1 text-[10px] text-[var(--muted)]">
+                  Génération locale disponible en <strong>ATS</strong> pour l’instant.
+                </p>
+              )}
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Langue</label>
+              <select
+                id="cvLang"
+                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
+                value={cvLang}
+                onChange={(e) => setCvLang(e.target.value as Lang)}
+              >
+                <option value="fr">Français</option>
+                <option value="en">English</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Contrat visé</label>
+              <select
+                id="cvContract"
+                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
+                value={cvContract}
+                onChange={(e) => setCvContract(e.target.value)}
+              >
+                <option value="CDI">CDI</option>
+                <option value="CDD">CDD</option>
+                <option value="Alternance">Alternance</option>
+                <option value="Stage">Stage</option>
+                <option value="Freelance">Freelance</option>
+              </select>
+            </div>
+
+            {/* ✅ COULEUR PDF */}
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Couleur PDF (CV + LM)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="color"
+                  value={pdfBrand}
+                  onChange={(e) => setPdfBrand(e.target.value)}
+                  className="h-9 w-12 rounded-lg border border-[var(--border)] bg-[var(--bg-soft)]"
+                  aria-label="Couleur du PDF"
+                />
+                <input
+                  type="text"
+                  value={pdfBrand}
+                  onChange={(e) => setPdfBrand(e.target.value)}
+                  className="input flex-1 text-[var(--ink)] bg-[var(--bg)]"
+                  placeholder="#ef4444"
+                />
+              </div>
+              <p className="mt-1 text-[10px] text-[var(--muted)]">
+                Par défaut : <strong>rouge</strong> (#ef4444).
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Lien de l&apos;offre (optionnel)
+              </label>
+              <input
+                id="cvJobLink"
+                type="url"
+                className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                placeholder="https://"
+                value={cvJobLink}
+                onChange={(e) => setCvJobLink(e.target.value)}
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">
+                Extraits de l&apos;offre (optionnel)
+              </label>
+              <textarea
+                id="cvJD"
+                rows={3}
+                className="input textarea w-full text-[13px] text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                placeholder="Colle quelques missions / outils / mots-clés de l’offre."
+                value={cvJobDesc}
+                onChange={(e) => setCvJobDesc(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="pt-1">
+            <label className="flex items-center gap-2 cursor-pointer text-[12px]">
+              <input
+                id="autoCreateSwitch"
+                type="checkbox"
+                className="toggle-checkbox"
+                checked={cvAutoCreate}
+                onChange={(e) => setCvAutoCreate(e.target.checked)}
+              />
+              <span className="text-[var(--muted)]">
+                Créer automatiquement une entrée dans le <strong>Suivi 📌</strong> à chaque génération.
+              </span>
+            </label>
+          </div>
+        </div>
+
+        <div className="flex flex-col sm:flex-row gap-2 pt-2">
+          <button
+            id="generateCvBtn"
+            type="button"
+            onClick={handleGenerateCv}
+            disabled={cvLoading || !profile}
+            className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <span>{cvLoading ? "Génération du CV..." : "Générer le CV (PDF) — 1 page"}</span>
+            <div id="cvBtnSpinner" className={`loader absolute inset-0 m-auto ${cvLoading ? "" : "hidden"}`} />
+          </button>
+
+          <button
+            id="generateCvLmPdfBtn"
+            type="button"
+            onClick={handleGenerateCvLmPdf}
+            disabled={cvZipLoading || !profile}
+            className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <span>{cvZipLoading ? "Génération PDF..." : "CV + LM (PDF) — 2 pages"}</span>
+            <div id="cvLmZipBtnSpinner" className={`loader absolute inset-0 m-auto ${cvZipLoading ? "" : "hidden"}`} />
+          </button>
+        </div>
+
+        <div className="mt-2 p-2.5 rounded-md border border-dashed border-[var(--border)]/70 text-[11px] text-[var(--muted)]">
+          {cvStatus ? (
+            <p className="text-center text-emerald-400 text-[12px]">{cvStatus}</p>
+          ) : (
+            <p className="text-center">
+              Génération locale : téléchargement direct (CV 1 page, ou CV+LM 2 pages).
+            </p>
+          )}
+          {cvError && <p className="mt-1 text-center text-red-400 text-[12px]">{cvError}</p>}
+        </div>
+      </section>
+
+      {/* ÉTAPE 2 : LM */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
+        <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
+          <span>
+            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
+          </span>
+          <span>
+            🏢 <span className="font-medium text-[var(--ink)]">{targetedCompany}</span>
+          </span>
+        </div>
+
+        <form onSubmit={handleGenerateLetter} className="space-y-3">
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
+                Étape 2
+              </span>
+              <div>
+                <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Lettre de motivation IA</h3>
+                <p className="text-[11px] text-[var(--muted)]">
+                  La lettre est générée en s’appuyant sur <strong>tes expériences</strong> (et outils), puis exportée en PDF (1 page).
+                </p>
+              </div>
+            </div>
+            <select
+              id="lmLang"
+              className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
+              value={lmLang}
+              onChange={(e) => setLmLang(e.target.value as Lang)}
+            >
+              <option value="fr">FR</option>
+              <option value="en">EN</option>
+            </select>
+          </div>
+
+          <div className="space-y-3 text-[13px]">
+            <div className="grid sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
+                <input
+                  id="companyName"
+                  type="text"
+                  className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                  placeholder="Ex : IMOGATE"
+                  value={companyName}
+                  onChange={(e) => setCompanyName(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
+                <input
+                  id="jobTitle"
+                  type="text"
+                  className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                  placeholder="Ex : Ingénieur Réseaux & Sécurité"
+                  value={jobTitle}
+                  onChange={(e) => setJobTitle(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Extraits de l&apos;offre (optionnel)</label>
+              <textarea
+                id="jobDescription"
+                rows={3}
+                className="input textarea w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                placeholder="Colle quelques missions / outils / contexte de l’offre."
+                value={jobDescription}
+                onChange={(e) => setJobDescription(e.target.value)}
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Lien de l&apos;offre (optionnel)</label>
+              <input
+                id="jobLink"
+                type="url"
+                className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+                placeholder="https://"
+                value={jobLink}
+                onChange={(e) => setJobLink(e.target.value)}
+              />
+            </div>
+
+            {lmError && <p className="text-[11px] text-red-400">{lmError}</p>}
+
+            <div className="flex flex-col sm:flex-row gap-2 pt-1">
+              <button
+                id="generateCoverLetterBtn"
+                type="submit"
+                disabled={lmLoading || !profile}
+                className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <span>{lmLoading ? "Génération de la LM..." : "Générer la lettre"}</span>
+                <div id="lmBtnSpinner" className={`loader absolute inset-0 m-auto ${lmLoading ? "" : "hidden"}`} />
+              </button>
+
+              <button
+                id="downloadLetterPdfBtn"
+                type="button"
+                onClick={handleDownloadLetterPdf}
+                disabled={lmPdfLoading || !profile}
+                className="btn-secondary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <span>{lmPdfLoading ? "Création du PDF..." : "Télécharger en PDF (1 page)"}</span>
+                <div className={`loader absolute inset-0 m-auto ${lmPdfLoading ? "" : "hidden"}`} />
+              </button>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2">
+              <button
+                id="copyLetterBtn"
+                type="button"
+                onClick={handleCopyLetter}
+                disabled={!letterText}
+                className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <span>{letterCopied ? "Texte copié ✅" : "Copier le texte"}</span>
+              </button>
+            </div>
+
+            {lmPdfError && <p className="text-[11px] text-red-400">{lmPdfError}</p>}
+          </div>
+        </form>
+
+        <div className="mt-2 p-3 card-soft rounded-md border border-dashed border-[var(--brand)]/50">
+          <p className="text-[11px] text-[var(--muted)] mb-1 text-center">
+            Dernière lettre générée (tu peux l&apos;adapter avant envoi ou PDF).
+          </p>
+          <div className="letter-pre text-[13px] text-[var(--ink)] overflow-auto max-h-[220px] whitespace-pre-line">
+            {letterText ? (
+              <p>{letterText}</p>
+            ) : (
+              <p className="text-center text-[var(--muted)]">Lance une génération pour voir ici le texte de la LM IA.</p>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* ÉTAPE 3 : PITCH */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3">
+        <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
+          <span>
+            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
+          </span>
+          <span>🧩 Utilise ce pitch pour mails, LinkedIn et entretiens.</span>
+        </div>
+
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
+              Étape 3
+            </span>
+            <div>
+              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Pitch d&apos;ascenseur</h3>
+              <p className="text-[11px] text-[var(--muted)]">
+                Résumé percutant de 2–4 phrases pour te présenter en 30–40 secondes.
+              </p>
+            </div>
+          </div>
+          <select
+            id="pitchLang"
+            className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
+            value={pitchLang}
+            onChange={(e) => setPitchLang(e.target.value as Lang)}
+          >
+            <option value="fr">FR</option>
+            <option value="en">EN</option>
+          </select>
+        </div>
+
+        {pitchError && <p className="text-[11px] text-red-400">{pitchError}</p>}
+
+        <div className="flex flex-col sm:flex-row gap-2 pt-1">
+          <button
+            id="generatePitchBtn"
+            type="button"
+            onClick={handleGeneratePitch}
+            disabled={pitchLoading || !profile}
+            className="btn-primary relative flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <span>{pitchLoading ? "Génération du pitch..." : "Générer le pitch"}</span>
+            <div id="pitchBtnSpinner" className={`loader absolute inset-0 m-auto ${pitchLoading ? "" : "hidden"}`} />
+          </button>
+          <button
+            id="copyPitchBtn"
+            type="button"
+            onClick={handleCopyPitch}
+            disabled={!pitchText}
+            className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <span>{pitchCopied ? "Pitch copié ✅" : "Copier le pitch"}</span>
+          </button>
+        </div>
+
+        <div className="mt-2 p-3 card-soft rounded-md text-[13px] text-[var(--ink)] whitespace-pre-line">
+          {pitchText ? (
+            <p>{pitchText}</p>
+          ) : (
+            <p className="text-center text-[11px] text-[var(--muted)]">
+              Après génération, ton pitch apparaîtra ici.
+            </p>
+          )}
+        </div>
+      </section>
+
+      {/* ÉTAPE 4 : MAIL */}
+      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
+              Étape 4
+            </span>
+            <div>
+              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Mail de candidature</h3>
+              <p className="text-[11px] text-[var(--muted)] max-w-xl">
+                Génère un <strong>objet</strong> et un <strong>corps de mail</strong> à copier.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <form onSubmit={handleGenerateEmail} className="grid md:grid-cols-2 gap-4 text-sm mt-1">
+          <div>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l&apos;entreprise</label>
+            <input
+              className="input w-full"
+              value={companyName}
+              onChange={(e) => setCompanyName(e.target.value)}
+              placeholder="Ex : IMOGATE"
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
+            <input
+              className="input w-full"
+              value={jobTitle}
+              onChange={(e) => setJobTitle(e.target.value)}
+              placeholder="Ex : Ingénieur Réseaux & Sécurité"
+            />
+          </div>
+          <div>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom du recruteur (optionnel)</label>
+            <input
+              className="input w-full"
+              value={recruiterName}
+              onChange={(e) => setRecruiterName(e.target.value)}
+              placeholder="Ex : Mme Dupont"
+            />
+          </div>
+          <div className="md:col-span-2 flex justify-end">
+            <button type="submit" className="btn-primary min-w-[200px]">
+              Générer le mail
+            </button>
+          </div>
+        </form>
+
+        <div className="grid md:grid-cols-2 gap-4 mt-3 text-sm">
+          <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
+            <h4 className="font-semibold text-sm mb-2">Objet</h4>
+            <div className="text-xs text-[var(--muted)] whitespace-pre-line">
+              {subjectPreview || "L'objet généré apparaîtra ici."}
+            </div>
+          </div>
+          <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
+            <h4 className="font-semibold text-sm mb-2">Corps du mail</h4>
+            <div className="text-xs text-[var(--muted)] whitespace-pre-line max-h-64 overflow-auto">
+              {emailPreview || "Le texte du mail apparaîtra ici après génération."}
+            </div>
+          </div>
+        </div>
+
+        <p className="text-[10px] text-[var(--muted)] mt-3">
+          📌 Copie-colle l&apos;objet et le texte, puis joins le CV et la lettre PDF.
+        </p>
+      </section>
+    </motion.div>
+  );
+}
+````
+
+## File: app/app/page.tsx
+````typescript
+"use client";
+
+import { useState, useEffect, useRef, ChangeEvent, FormEvent } from "react";
+import { motion } from "framer-motion";
+import { auth, db } from "@/lib/firebase";
+import { onAuthStateChanged } from "firebase/auth";
+import {
+  doc,
+  getDoc,
+  setDoc,
+  collection,
+  query,
+  where,
+  onSnapshot,
+} from "firebase/firestore";
+import Chart from "chart.js/auto";
+import { useAuth } from "@/context/AuthContext";
+import { useUserProfile } from "@/hooks/useUserProfile";
+import { consumeCredits } from "@/lib/credits";
+import { logUsage } from "@/lib/userTracking";
+import { getRecaptchaToken } from "@/lib/recaptcha";
+
+// --- TYPES ---
+
+type CvSkillsSection = {
+  title: string;
+  items: string[];
+};
+
+type CvSkills = {
+  sections: CvSkillsSection[];
+  tools: string[];
+};
+
+type CvExperience = {
+  company: string;
+  role: string;
+  dates: string;
+  bullets: string[];
+  location?: string;
+};
+
+type CvEducation = {
+  school: string;
+  degree: string;
+  dates: string;
+  location?: string;
+};
+
+type CvProfile = {
+  fullName: string;
+  email: string;
+  phone: string;
+  linkedin: string;
+  profileSummary: string;
+
+  city?: string;
+  address?: string;
+
+  contractType: string;
+  contractTypeStandard?: string;
+  contractTypeFull?: string;
+
+  primaryDomain?: string;
+  secondaryDomains?: string[];
+  softSkills?: string[];
+
+  drivingLicense?: string;
+  vehicle?: string;
+
+  skills: CvSkills;
+  experiences: CvExperience[];
+  education: CvEducation[];
+  educationShort: string[];
+  certs: string;
+  langLine: string;
+  hobbies: string[];
+  updatedAt?: number;
+};
+
+type DashboardCounts = {
+  totalApps: number;
+  cvCount: number;
+  lmCount: number;
+};
+
+// ✅ Appelle le proxy Next.js (pas la Cloud Function en direct)
+const WORKER_URL = "/api/extractProfile";
+
+// --- HELPERS GÉNÉRAUX ---
+
+function getInitials(name?: string) {
+  if (!name) return "?";
+  const parts = name.trim().split(/\s+/);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) return (parts[0][0] || "?").toUpperCase();
+  return (
+    ((parts[0][0] || "") + (parts[parts.length - 1][0] || "")).toUpperCase()
+  );
+}
+
+function formatUpdatedAt(ts?: number) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  return new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
+}
+
+function normalizeText(str: string): string {
+  return str
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+// 🌐 Drapeaux langues (robuste, ignore natif/bilingue/etc.)
+function getFlagEmoji(langPart: string): string {
+  if (!langPart) return "🌐";
+
+  const lower = langPart.toLowerCase();
+
+  // On enlève ce qu'il y a entre parenthèses (souvent le niveau)
+  let base = lower.replace(/\(.*?\)/g, " ").trim();
+
+  const levelWords = [
+    "natif",
+    "bilingue",
+    "courant",
+    "intermédiaire",
+    "intermediaire",
+    "débutant",
+    "debutant",
+    "langue maternelle",
+    "maternelle",
+    "maternel",
+    "c1",
+    "c2",
+    "b1",
+    "b2",
+    "a1",
+    "a2",
+  ];
+
+  levelWords.forEach((w) => {
+    base = base.replace(new RegExp("\\b" + w + "\\b", "g"), " ");
+  });
+
+  base = base.trim();
+  if (!base) base = lower;
+
+  if (base.match(/\bfrançais\b|\bfrancais\b|\bfrench\b/)) return "🇫🇷";
+  if (base.match(/\banglais\b|\benglish\b/)) return "🇬🇧";
+  if (base.match(/\bamericain\b|\bétats-unis\b|\busa\b|\bamerican\b/))
+    return "🇺🇸";
+
+  if (base.match(/\bespagnol\b|\bspanish\b/)) return "🇪🇸";
+  if (base.match(/\ballemand\b|\bgerman\b/)) return "🇩🇪";
+  if (base.match(/\bitalien\b|\bitalian\b/)) return "🇮🇹";
+  if (base.match(/\bportugais\b|\bportuguese\b/)) return "🇵🇹";
+  if (base.match(/\bnéerlandais\b|\bneerlandais\b|\bdutch\b/)) return "🇳🇱";
+
+  if (base.match(/\barabe\b|\barabic\b|\barab\b/)) return "🇸🇦";
+  if (base.match(/\bchinois\b|\bmandarin\b|\bchinese\b/)) return "🇨🇳";
+  if (base.match(/\brusse\b|\brussian\b/)) return "🇷🇺";
+  if (base.match(/\bjaponais\b|\bjapanese\b/)) return "🇯🇵";
+  if (base.match(/\bcoréen\b|\bcoreen\b|\bkorean\b/)) return "🇰🇷";
+  if (base.match(/\bhindi\b|\bhindou\b/)) return "🇮🇳";
+  if (base.match(/\bturc\b|\bturkish\b/)) return "🇹🇷";
+
+  return "🌐";
+}
+
+// 🌐 Parse le champ langLine en { flag, text }[]
+function parseLangLine(langLine: string): { flag: string; text: string }[] {
+  if (!langLine) return [];
+  const parts = langLine
+    .split("·")
+    .join("|")
+    .split(",")
+    .join("|")
+    .split("|")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+
+  return parts.map((part) => ({
+    flag: getFlagEmoji(part),
+    text: part,
+  }));
+}
+
+// 🎯 Emoji pour les hobbies
+function getHobbyEmoji(hobby: string): string {
+  const p = hobby.toLowerCase();
+  if (p.includes("football") || p.includes("foot")) return "⚽";
+  if (p.includes("basket") || p.includes("basketball")) return "🏀";
+  if (p.includes("sport") || p.includes("fitness") || p.includes("gym"))
+    return "💪";
+  if (p.includes("musique") || p.includes("guitare") || p.includes("piano"))
+    return "🎵";
+  if (p.includes("lecture") || p.includes("livre")) return "📚";
+  if (p.includes("cinéma") || p.includes("cinema") || p.includes("film"))
+    return "🎬";
+  if (p.includes("jeu vidéo") || p.includes("jeux vidéo") || p.includes("gaming"))
+    return "🎮";
+  if (p.includes("voyage") || p.includes("travel")) return "✈️";
+  if (p.includes("cuisine") || p.includes("cooking")) return "🍳";
+  if (p.includes("photo") || p.includes("photographie")) return "📸";
+  if (p.includes("dessin") || p.includes("peinture") || p.includes("art"))
+    return "🎨";
+  if (p.includes("randonnée") || p.includes("rando") || p.includes("hiking"))
+    return "🥾";
+  return "⭐";
+}
+
+// --- RADAR GÉNÉRIQUE (multi-métiers, robuste) ---
+
+type RadarAxisDef = {
+  id: string;
+  label: string;
+  keywords: string[];
+};
+
+const DOMAIN_AXES: RadarAxisDef[] = [
+  {
+    id: "finance",
+    label: "Finance & Contrôle",
+    keywords: [
+      "finance",
+      "financier",
+      "controle de gestion",
+      "contrôle de gestion",
+      "controle interne",
+      "contrôle interne",
+      "audit",
+      "conformite",
+      "conformité",
+      "risque",
+      "risques",
+      "reporting",
+      "budget",
+      "bilan",
+      "comptable",
+      "tresorerie",
+      "trésorerie",
+      "analyse financiere",
+      "analyse financière",
+      "cfa",
+      "ifrs",
+    ],
+  },
+  {
+    id: "it_dev",
+    label: "IT & Développement",
+    keywords: [
+      "developpement",
+      "développement",
+      "javascript",
+      "typescript",
+      "python",
+      "java",
+      "c++",
+      "c#",
+      "php",
+      "go",
+      "react",
+      "node",
+      "angular",
+      "vue",
+      "api",
+      "application",
+      "fullstack",
+      "frontend",
+      "backend",
+      "devops",
+      "git",
+      "docker",
+      "kubernetes",
+    ],
+  },
+  {
+    id: "cyber",
+    label: "Cybersécurité & Réseaux",
+    keywords: [
+      "cyber",
+      "cybersecurite",
+      "cybersécurité",
+      "pentest",
+      "penetration test",
+      "vulnerabilite",
+      "vulnérabilité",
+      "soc",
+      "firewall",
+      "pare feu",
+      "pare-feu",
+      "vpn",
+      "ids",
+      "ips",
+      "wireshark",
+      "nmap",
+      "kali",
+      "siem",
+      "owasp",
+    ],
+  },
+  {
+    id: "data",
+    label: "Data & Analytics",
+    keywords: [
+      "data",
+      "donnees",
+      "données",
+      "sql",
+      "power bi",
+      "tableau",
+      "statistique",
+      "statistiques",
+      "machine learning",
+      "intelligence artificielle",
+      "ia ",
+      "analyse de donnees",
+      "analyse de données",
+      "data analyst",
+      "data engineer",
+      "pandas",
+      "numpy",
+    ],
+  },
+  {
+    id: "marketing",
+    label: "Marketing & Communication",
+    keywords: [
+      "marketing",
+      "communication",
+      "social media",
+      "réseaux sociaux",
+      "reseaux sociaux",
+      "seo",
+      "sea",
+      "content",
+      "contenu",
+      "campagne",
+      "publicite",
+      "publicité",
+      "branding",
+      "influence",
+      "community manager",
+    ],
+  },
+  {
+    id: "sales",
+    label: "Commerce & Vente",
+    keywords: [
+      "commercial",
+      "vente",
+      "business developer",
+      "account manager",
+      "prospection",
+      "negociation",
+      "négociation",
+      "pipeline",
+      "portefeuille clients",
+      "chiffre d affaires",
+      "ca ",
+      "b2b",
+      "b2c",
+    ],
+  },
+  {
+    id: "hr",
+    label: "RH & Recrutement",
+    keywords: [
+      "ressources humaines",
+      "rh",
+      "recrutement",
+      "onboarding",
+      "formation",
+      "gestion du personnel",
+      "talent acquisition",
+      "people",
+      "paie",
+      "gestion des talents",
+    ],
+  },
+  {
+    id: "project",
+    label: "Gestion de projet",
+    keywords: [
+      "chef de projet",
+      "gestion de projet",
+      "project manager",
+      "planning",
+      "pilotage",
+      "agile",
+      "scrum",
+      "kanban",
+      "coordination",
+      "roadmap",
+      "livrable",
+      "livrables",
+      "planning",
+    ],
+  },
+  {
+    id: "ops",
+    label: "Opérations & Logistique",
+    keywords: [
+      "logistique",
+      "supply chain",
+      "transport",
+      "flux",
+      "optimisation des processus",
+      "lean",
+      "maintenance",
+      "production",
+      "magasinier",
+      "preparation de commandes",
+      "exploitation",
+    ],
+  },
+  {
+    id: "health",
+    label: "Santé & Social",
+    keywords: [
+      "infirmier",
+      "infirmière",
+      "aide soignant",
+      "aide-soignant",
+      "medecin",
+      "médecin",
+      "paramedical",
+      "paramédical",
+      "social",
+      "accompagnement",
+      "patients",
+      "soins",
+      "assistante sociale",
+      "assistant social",
+      "ehpad",
+    ],
+  },
+  {
+    id: "education",
+    label: "Éducation & Formation",
+    keywords: [
+      "enseignant",
+      "professeur",
+      "formateur",
+      "formatrice",
+      "pedagogie",
+      "pédagogie",
+      "cours",
+      "formation",
+      "apprentissage",
+      "eleves",
+      "élèves",
+      "etudiants",
+      "étudiants",
+      "éducation",
+    ],
+  },
+];
+
+const DOMAIN_CORE_KEYWORDS: Record<string, string[]> = {
+  finance: [
+    "comptable",
+    "controle de gestion",
+    "contrôle de gestion",
+    "controle interne",
+    "contrôle interne",
+    "audit",
+    "bilan",
+    "compte de resultat",
+    "compte de résultat",
+    "tresorerie",
+    "trésorerie",
+    "analyse financiere",
+    "analyse financière",
+    "cfa",
+    "ifrs",
+  ],
+  it_dev: [
+    "developpement",
+    "développement",
+    "javascript",
+    "typescript",
+    "python",
+    "java",
+    "c++",
+    "c#",
+    "php",
+    "react",
+    "node",
+    "angular",
+    "vue",
+    "fullstack",
+    "frontend",
+    "backend",
+    "devops",
+    "docker",
+    "kubernetes",
+  ],
+  cyber: [
+    "pentest",
+    "penetration test",
+    "wireshark",
+    "nmap",
+    "kali",
+    "ids",
+    "ips",
+    "soc",
+    "siem",
+    "owasp",
+    "firewall",
+    "pare feu",
+    "pare-feu",
+  ],
+  data: [
+    "data analyst",
+    "data engineer",
+    "power bi",
+    "tableau",
+    "sql",
+    "pandas",
+    "numpy",
+    "machine learning",
+    "intelligence artificielle",
+  ],
+  marketing: [
+    "seo",
+    "sea",
+    "community manager",
+    "social media",
+    "campagne",
+    "branding",
+    "communication digitale",
+  ],
+  sales: [
+    "business developer",
+    "account manager",
+    "commercial",
+    "prospection",
+    "negociation",
+    "négociation",
+    "pipeline",
+  ],
+  hr: [
+    "ressources humaines",
+    "rh",
+    "recrutement",
+    "talent acquisition",
+    "gestion de la paie",
+    "gestion du personnel",
+  ],
+  project: [
+    "chef de projet",
+    "project manager",
+    "scrum master",
+    "agile",
+    "gestion de projet",
+  ],
+  ops: ["supply chain", "logistique", "exploitation", "maintenance", "production"],
+  health: ["infirmier", "infirmière", "medecin", "médecin", "aide soignant", "aide-soignant", "soins", "patients"],
+  education: ["enseignant", "professeur", "formateur", "formatrice", "pedagogie", "pédagogie", "eleves", "élèves", "etudiants", "étudiants"],
+};
+
+const SOFT_SKILLS_KEYWORDS = [
+  "communication",
+  "travail en equipe",
+  "travail en équipe",
+  "collaboration",
+  "autonome",
+  "autonomie",
+  "rigoureux",
+  "rigoureuse",
+  "organise",
+  "organisé",
+  "organisee",
+  "organisée",
+  "adaptabilite",
+  "adaptabilité",
+  "gestion du stress",
+  "leadership",
+  "esprit d analyse",
+  "esprit d'analyse",
+  "empathie",
+  "relationnel",
+];
+
+function countHits(keywords: string[], text: string): number {
+  let hits = 0;
+  for (const k of keywords) {
+    const normK = normalizeText(k);
+    if (text.includes(normK)) hits++;
+  }
+  return hits;
+}
+
+function scaleScore(hits: number): number {
+  if (hits <= 0) return 3;
+  if (hits === 1) return 5;
+  if (hits === 2) return 7;
+  if (hits === 3) return 9;
+  return 10;
+}
+
+// 🔎 construit les données du radar à partir du profil (générique multi-métiers)
+function buildRadarData(profile: CvProfile | null) {
+  const defaultLabels = [
+    "Analyse / Résolution",
+    "Organisation & Processus",
+    "Outils & Tech",
+    "Apprentissage",
+    "Soft skills",
+  ];
+
+  if (!profile) {
+    return { labels: defaultLabels, data: [3, 3, 3, 3, 3] };
+  }
+
+  const rawText =
+    JSON.stringify(profile.skills.sections || "") +
+    JSON.stringify(profile.skills.tools || "") +
+    JSON.stringify(profile.experiences || "") +
+    JSON.stringify(profile.education || "") +
+    (profile.profileSummary || "") +
+    (profile.contractType || "") +
+    (profile.certs || "") +
+    (profile.langLine || "");
+
+  const lower = normalizeText(rawText);
+
+  const aiDomainIds: string[] = [];
+  if (profile.primaryDomain && profile.primaryDomain !== "autre") {
+    aiDomainIds.push(profile.primaryDomain);
+  }
+  if (Array.isArray(profile.secondaryDomains)) {
+    for (const d of profile.secondaryDomains) {
+      if (d && d !== "autre" && !aiDomainIds.includes(d)) {
+        aiDomainIds.push(d);
+      }
+    }
+  }
+
+  let relevant: {
+    axis: RadarAxisDef;
+    totalHits: number;
+    coreHits: number;
+    score: number;
+  }[] = [];
+
+  if (aiDomainIds.length > 0) {
+    relevant = aiDomainIds
+      .map((id) => {
+        const axis = DOMAIN_AXES.find((a) => a.id === id);
+        if (!axis) return null;
+
+        const totalHits = countHits(axis.keywords, lower);
+        const coreKeywords = DOMAIN_CORE_KEYWORDS[axis.id] || axis.keywords;
+        const coreHits = countHits(coreKeywords, lower);
+
+        const rawHits = Math.max(totalHits, coreHits);
+        const score = scaleScore(rawHits);
+
+        return { axis, totalHits, coreHits, score };
+      })
+      .filter(
+        (
+          x
+        ): x is {
+          axis: RadarAxisDef;
+          totalHits: number;
+          coreHits: number;
+          score: number;
+        } => !!x
+      );
+  } else {
+    const domainScores = DOMAIN_AXES.map((axis) => {
+      const totalHits = countHits(axis.keywords, lower);
+      const coreKeywords = DOMAIN_CORE_KEYWORDS[axis.id] || axis.keywords;
+      const coreHits = countHits(coreKeywords, lower);
+
+      const isRelevant = coreHits > 0 && totalHits > 0;
+      const score = isRelevant ? scaleScore(totalHits) : 0;
+
+      return { axis, totalHits, coreHits, isRelevant, score };
+    });
+
+    relevant = domainScores
+      .filter((d) => d.isRelevant)
+      .sort((a, b) => b.totalHits - a.totalHits)
+      .slice(0, 4) as any;
+  }
+
+  let softHits = countHits(SOFT_SKILLS_KEYWORDS, lower);
+  const softSkillsCount = Array.isArray(profile.softSkills)
+    ? profile.softSkills.length
+    : 0;
+
+  if (softSkillsCount > 0) {
+    softHits += Math.min(4, Math.floor(softSkillsCount / 2));
+  }
+
+  const softScore = scaleScore(softHits);
+
+  if (!relevant.length) {
+    const generic = [
+      scaleScore(countHits(["analyse", "diagnostic"], lower)),
+      scaleScore(countHits(["processus", "organisation"], lower)),
+      scaleScore(countHits(["outil", "logiciel", "technique"], lower)),
+      scaleScore(countHits(["apprentissage", "formation", "veille"], lower)),
+    ];
+    return {
+      labels: defaultLabels,
+      data: [...generic, softScore],
+    };
+  }
+
+  const labels = relevant.map((r) => r.axis.label).concat("Soft skills");
+  const data = relevant.map((r) => r.score).concat(softScore);
+
+  console.debug(
+    "[Radar IA] Domaines retenus :",
+    relevant.map((r) => ({
+      id: r.axis.id,
+      label: r.axis.label,
+      hits: r.totalHits,
+      score: r.score,
+    })),
+    "SoftSkillsCount:",
+    softSkillsCount,
+    "SoftScore:",
+    softScore
+  );
+
+  return { labels, data };
+}
+
+// Items pour la navigation rapide
+const navItems = [
+  { id: "infos-personnelles", label: "Infos & CV" },
+  { id: "competences", label: "Compétences & Outils" },
+  { id: "experience", label: "Expérience" },
+  { id: "formation", label: "Formation & Certifs" },
+  { id: "langues", label: "Langues" },
+  { id: "hobbies", label: "Centres d'intérêt" },
+];
+
+type ActiveModal =
+  | "infos"
+  | "skills"
+  | "experience"
+  | "education"
+  | "languages"
+  | "hobbies"
+  | null;
+
+type ExperienceDraft = {
+  company: string;
+  role: string;
+  dates: string;
+  bulletsText: string;
+};
+
+type EducationDraft = {
+  school: string;
+  degree: string;
+  dates: string;
+  location: string;
+};
+
+type LanguageDraft = {
+  language: string;
+  level: string;
+};
+
+const LANGUAGE_OPTIONS = [
+  "Français",
+  "Anglais",
+  "Espagnol",
+  "Allemand",
+  "Italien",
+  "Portugais",
+  "Néerlandais",
+  "Arabe",
+  "Russe",
+  "Chinois (Mandarin)",
+  "Japonais",
+  "Coréen",
+  "Hindi",
+  "Turc",
+];
+
+const LANGUAGE_LEVEL_OPTIONS = [
+  "Natif / Bilingue (C2)",
+  "Courant (C1)",
+  "Intermédiaire (B2)",
+  "Opérationnel (B1)",
+  "Débutant (A2 - A1)",
+];
+
+const CERTIFICATION_OPTIONS = [
+  "TOEIC",
+  "TOEFL",
+  "IELTS",
+  "CCNA",
+  "CCNP",
+  "CompTIA Security+",
+  "CompTIA Network+",
+  "AWS Cloud Practitioner",
+  "AWS Solutions Architect Associate",
+  "Azure AZ-900",
+  "Azure AZ-104",
+  "Azure AZ-500",
+  "Azure SC-900",
+  "Azure MS-900",
+  "Google Cloud Digital Leader",
+  "PMI PMP",
+  "Prince2 Foundation",
+  "Prince2 Practitioner",
+  "ITIL Foundation",
+  "CFA Niveau 1",
+  "AMF",
+  "Tosa Excel",
+];
+
+const HOBBY_OPTIONS = [
+  "Voyage",
+  "Lecture",
+  "Musique",
+  "Piano",
+  "Guitare",
+  "Sport (Football)",
+  "Sport (Basketball)",
+  "Fitness / Musculation",
+  "Course à pied",
+  "Randonnée",
+  "Natation",
+  "Cinéma",
+  "Séries",
+  "Jeux vidéo",
+  "Photographie",
+  "Cuisine",
+  "Pâtisserie",
+  "Dessin",
+  "Peinture",
+  "Art digital",
+  "Bénévolat",
+  "Entrepreneuriat",
+  "Technologie / veille tech",
+  "Échecs",
+  "Podcasts",
+];
+
+const CONTRACT_TYPE_OPTIONS = [
+  "CDI",
+  "CDD",
+  "Intérim",
+  "Alternance",
+  "Stage",
+  "Freelance",
+  "Temps plein",
+  "Temps partiel",
+  "Indépendant",
+  "Contrat pro",
+];
+
+// --- COMPOSANT PRINCIPAL ---
+
+export default function DashboardPage() {
+  const [file, setFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [profile, setProfile] = useState<CvProfile | null>(null);
+
+  const radarCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const [userId, setUserId] = useState<string | null>(null);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [loadingProfileFromDb, setLoadingProfileFromDb] =
+    useState<boolean>(true);
+
+  const [dashboardCounts, setDashboardCounts] = useState<DashboardCounts>({
+    totalApps: 0,
+    cvCount: 0,
+    lmCount: 0,
+  });
+  const [loadingCounts, setLoadingCounts] = useState<boolean>(true);
+
+  // --- ÉTATS MODALES ---
+
+  const [activeModal, setActiveModal] = useState<ActiveModal>(null);
+
+  const [infosDraft, setInfosDraft] = useState({
+    fullName: "",
+    email: "",
+    phone: "",
+    linkedin: "",
+    contractType: "",
+    profileSummary: "",
+    drivingLicense: "",
+    vehicle: "",
+    address: "",
+  });
+
+  const [skillsSectionsText, setSkillsSectionsText] = useState("");
+  const [skillsToolsText, setSkillsToolsText] = useState("");
+
+  const [experiencesDraft, setExperiencesDraft] = useState<ExperienceDraft[]>(
+    []
+  );
+
+  const [educationDrafts, setEducationDrafts] = useState<EducationDraft[]>([]);
+  const [certsList, setCertsList] = useState<string[]>([]);
+  const [certInput, setCertInput] = useState("");
+
+  const [languagesDraft, setLanguagesDraft] = useState<LanguageDraft[]>([]);
+  const [hobbiesList, setHobbiesList] = useState<string[]>([]);
+  const [hobbyInput, setHobbyInput] = useState("");
+
+  const { user } = useAuth();
+  const { profile: accountProfile, loading: loadingAccountProfile } =
+    useUserProfile();
+  const remainingCredits = accountProfile?.credits ?? 0;
+  const isBlocked = accountProfile?.blocked === true;
+
+  // 🔐 Auth + chargement du profil Firestore + stats candidatures
+  useEffect(() => {
+    let unsubApps: (() => void) | null = null;
+
+    const unsubAuth = onAuthStateChanged(auth, async (user) => {
+      if (unsubApps) {
+        unsubApps();
+        unsubApps = null;
+      }
+
+      if (!user) {
+        setUserId(null);
+        setUserEmail(null);
+        setProfile(null);
+        setLoadingProfileFromDb(false);
+        setDashboardCounts({ totalApps: 0, cvCount: 0, lmCount: 0 });
+        setLoadingCounts(false);
+        return;
+      }
+
+      setUserId(user.uid);
+      setUserEmail(user.email ?? null);
+
+      // --- Chargement du profil
+      try {
+        const ref = doc(db, "profiles", user.uid);
+        const snap = await getDoc(ref);
+        if (snap.exists()) {
+          const data = snap.data() as any;
+
+          const loadedProfile: CvProfile = {
+            fullName: data.fullName || "",
+            email: data.email || "",
+            phone: data.phone || "",
+            linkedin: data.linkedin || "",
+            profileSummary: data.profileSummary || "",
+            city: data.city || "",
+            address: data.address || "",
+            contractType: data.contractType || data.contractTypeStandard || "",
+            contractTypeStandard: data.contractTypeStandard || "",
+            contractTypeFull: data.contractTypeFull || "",
+            primaryDomain: data.primaryDomain || "",
+            secondaryDomains: Array.isArray(data.secondaryDomains)
+              ? data.secondaryDomains
+              : [],
+            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
+            drivingLicense: data.drivingLicense || "",
+            vehicle: data.vehicle || "",
+            skills: {
+              sections: Array.isArray(data.skills?.sections)
+                ? data.skills.sections
+                : [],
+              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
+            },
+            experiences: Array.isArray(data.experiences) ? data.experiences : [],
+            education: Array.isArray(data.education) ? data.education : [],
+            educationShort: Array.isArray(data.educationShort)
+              ? data.educationShort
+              : [],
+            certs: data.certs || "",
+            langLine: data.langLine || "",
+            hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
+            updatedAt:
+              typeof data.updatedAt === "number" ? data.updatedAt : undefined,
+          };
+
+          setProfile(loadedProfile);
+        } else {
+          setProfile(null);
+        }
+      } catch (e) {
+        console.error("Erreur chargement profil Firestore:", e);
+      } finally {
+        setLoadingProfileFromDb(false);
+      }
+
+      // --- Stats candidatures
+      setLoadingCounts(true);
+
+      const q = query(
+        collection(db, "applications"),
+        where("userId", "==", user.uid)
+      );
+
+      unsubApps = onSnapshot(
+        q,
+        (snap) => {
+          let totalApps = 0;
+          let cvCount = 0;
+          let lmCount = 0;
+
+          snap.docs.forEach((docSnap) => {
+            const data = docSnap.data() as any;
+            totalApps++;
+            if (data.hasCv) cvCount++;
+            if (data.hasLm) lmCount++;
+          });
+
+          setDashboardCounts({ totalApps, cvCount, lmCount });
+          setLoadingCounts(false);
+        },
+        (err) => {
+          console.error("Erreur chargement stats dashboard:", err);
+          setLoadingCounts(false);
+        }
+      );
+    });
+
+    return () => {
+      if (unsubApps) unsubApps();
+      unsubAuth();
+    };
+  }, []);
+
+  // 💾 sauvegarde du profil en base (Firestore)
+  const saveProfileToDb = async (p: CvProfile) => {
+    if (!userId) return;
+    const ref = doc(db, "profiles", userId);
+    const payload = {
+      ...p,
+      ownerUid: userId,
+      ownerEmail: userEmail ?? null,
+      updatedAt: Date.now(),
+    };
+    await setDoc(ref, payload, { merge: true });
+  };
+
+  // 🎯 Radar Chart
+  useEffect(() => {
+    if (!radarCanvasRef.current || !profile) return;
+
+    const ctx = radarCanvasRef.current.getContext("2d");
+    if (!ctx) return;
+
+    const existingChart = Chart.getChart(radarCanvasRef.current as any);
+    if (existingChart) {
+      existingChart.destroy();
+    }
+
+    const { labels, data } = buildRadarData(profile);
+
+    const chartInstance = new Chart(ctx, {
+      type: "radar",
+      data: {
+        labels,
+        datasets: [
+          {
+            label: "Niveau estimé",
+            data,
+            backgroundColor: "rgba(56, 189, 248, 0.25)",
+            borderColor: "rgba(56, 189, 248, 0.9)",
+            borderWidth: 2,
+            pointBackgroundColor: "rgba(56, 189, 248, 1)",
+            pointRadius: 3,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          r: {
+            beginAtZero: true,
+            min: 0,
+            max: 10,
+            ticks: {
+              stepSize: 2,
+              showLabelBackdrop: false,
+              display: false,
+            },
+            grid: {
+              color: "rgba(148, 163, 184, 0.35)",
+            },
+            angleLines: {
+              color: "rgba(148, 163, 184, 0.35)",
+            },
+            pointLabels: {
+              font: { size: 11 },
+              color: "#e5e7eb",
+            },
+          },
+        },
+        plugins: {
+          legend: { display: false },
+        },
+      },
+    });
+
+    return () => {
+      chartInstance.destroy();
+    };
+  }, [profile]);
+
+  // --- UPLOAD CV ---
+
+  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
+    setError(null);
+    const f = e.target.files?.[0];
+    if (!f) return;
+
+    if (!f.type.includes("pdf")) {
+      setError("Merci d'importer un CV au format PDF.");
+      return;
+    }
+
+    setFile(f);
+  };
+
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("Impossible de lire le fichier."));
+      reader.onload = () => {
+        const result = reader.result as string;
+        const base64 = result.split(",")[1];
+        if (!base64) {
+          reject(new Error("Encodage base64 invalide."));
+        } else {
+          resolve(base64);
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handleUpload = async () => {
+    if (!file) {
+      setError("Choisis d'abord un CV au format PDF.");
+      return;
+    }
+
+    if (!user) {
+      setError("Tu dois être connecté pour analyser ton CV.");
+      return;
+    }
+
+    if (loadingAccountProfile) {
+      setError(
+        "Ton profil utilisateur est en cours de chargement, réessaie dans un instant."
+      );
+      return;
+    }
+
+    if (isBlocked) {
+      setError(
+        "Ton compte est bloqué. Contacte l'administrateur pour en savoir plus."
+      );
+      return;
+    }
+
+    const cost = 1; // 💰 coût d'une analyse de CV
+    if (remainingCredits < cost) {
+      setError(
+        "Tu n'as plus assez de crédits pour analyser un CV. Contacte l'administrateur."
+      );
+      return;
+    }
+
+    setError(null);
+    setUploading(true);
+
+    try {
+      // 1) Consommation des crédits (transaction Firestore)
+      await consumeCredits(user.uid, cost);
+
+      // 2) Log d'usage
+      await logUsage(user, "cv_analyze", {
+        fileName: file.name,
+        fileSize: file.size,
+        feature: "dashboard-cv-upload",
+      });
+
+      // 3) Appel via l'API Next.js (✅ auth + recaptcha)
+      const base64Pdf = await fileToBase64(file);
+
+      const idToken = await user.getIdToken();
+      const recaptchaToken = await getRecaptchaToken("extract_profile");
+
+      const res = await fetch(WORKER_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+          "X-Recaptcha-Token": recaptchaToken,
+        },
+        body: JSON.stringify({
+          base64Pdf,
+          meta: {
+            fileName: file.name,
+            fileSize: file.size,
+            feature: "dashboard-cv-upload",
+          },
+        }),
+      });
+
+      const json = await res.json().catch(() => null);
+
+      if (!res.ok) {
+        const msg = (json && (json.error || json.message)) || `HTTP ${res.status}`;
+        if (res.status === 401 || msg === "unauthenticated") {
+          throw new Error("unauthenticated");
+        }
+        throw new Error(msg);
+      }
+
+      const now = Date.now();
+      const rawProfile = json?.profile ?? json;
+
+      const receivedProfile: CvProfile = {
+        fullName: rawProfile.fullName || "",
+        email: rawProfile.email || "",
+        phone: rawProfile.phone || "",
+        linkedin: rawProfile.linkedin || "",
+        profileSummary: rawProfile.profileSummary || "",
+        city: rawProfile.city || "",
+        address: rawProfile.address || "",
+        contractType:
+          rawProfile.contractType || rawProfile.contractTypeStandard || "",
+        contractTypeStandard: rawProfile.contractTypeStandard || "",
+        contractTypeFull: rawProfile.contractTypeFull || "",
+        primaryDomain: rawProfile.primaryDomain || "",
+        secondaryDomains: Array.isArray(rawProfile.secondaryDomains)
+          ? rawProfile.secondaryDomains
+          : [],
+        softSkills: Array.isArray(rawProfile.softSkills)
+          ? rawProfile.softSkills
+          : [],
+        drivingLicense: rawProfile.drivingLicense || "",
+        vehicle: rawProfile.vehicle || "",
+        skills: {
+          sections: Array.isArray(rawProfile.skills?.sections)
+            ? rawProfile.skills.sections
+            : [],
+          tools: Array.isArray(rawProfile.skills?.tools)
+            ? rawProfile.skills.tools
+            : [],
+        },
+        experiences: Array.isArray(rawProfile.experiences)
+          ? rawProfile.experiences
+          : [],
+        education: Array.isArray(rawProfile.education)
+          ? rawProfile.education
+          : [],
+        educationShort: Array.isArray(rawProfile.educationShort)
+          ? rawProfile.educationShort
+          : [],
+        certs: rawProfile.certs || "",
+        langLine: rawProfile.langLine || "",
+        hobbies: Array.isArray(rawProfile.hobbies) ? rawProfile.hobbies : [],
+        updatedAt: now,
+      };
+
+      setProfile(receivedProfile);
+
+      if (userId) {
+        await saveProfileToDb(receivedProfile);
+      }
+    } catch (err: any) {
+      console.error(err);
+      if (err instanceof Error) {
+        if (err.message === "unauthenticated") {
+          setError("Session expirée. Déconnecte-toi / reconnecte-toi puis réessaie.");
+        } else if (err.message === "NOT_ENOUGH_CREDITS" || err.message === "NO_CREDITS") {
+          setError(
+            "Tu n'as plus assez de crédits pour analyser un CV. Contacte l'administrateur."
+          );
+        } else if (err.message === "USER_BLOCKED") {
+          setError(
+            "Ton compte est bloqué. Contacte l'administrateur pour en savoir plus."
+          );
+        } else if (err.message === "USER_DOC_NOT_FOUND") {
+          setError(
+            "Profil utilisateur introuvable dans la base. Contacte l'administrateur."
+          );
+        } else {
+          setError(err.message || "Impossible d'analyser ton CV pour le moment.");
+        }
+      } else {
+        setError("Impossible d'analyser ton CV pour le moment.");
+      }
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // --- MODALES : OUVERTURE ---
+
+  const openInfosModal = () => {
+    if (!profile) return;
+    setInfosDraft({
+      fullName: profile.fullName,
+      email: profile.email || userEmail || "",
+      phone: profile.phone || "",
+      linkedin: profile.linkedin || "",
+      contractType:
+        profile.contractType || profile.contractTypeStandard || "",
+      profileSummary: profile.profileSummary || "",
+      drivingLicense: profile.drivingLicense || "",
+      vehicle: profile.vehicle || "",
+      address: profile.address || profile.city || "",
+    });
+    setActiveModal("infos");
+  };
+
+  const openSkillsModal = () => {
+    if (!profile) return;
+    const sectionsText = (profile.skills.sections || [])
+      .map((sec) => `${sec.title}: ${sec.items.join(", ")}`)
+      .join("\n");
+    const toolsText = (profile.skills.tools || []).join(", ");
+
+    setSkillsSectionsText(sectionsText);
+    setSkillsToolsText(toolsText);
+    setActiveModal("skills");
+  };
+
+  const openExperienceModal = () => {
+    if (!profile) return;
+    const drafts: ExperienceDraft[] =
+      profile.experiences?.map((exp) => ({
+        company: exp.company || "",
+        role: exp.role || "",
+        dates: exp.dates || "",
+        bulletsText: (exp.bullets || []).join("\n"),
+      })) || [];
+
+    if (drafts.length === 0) {
+      drafts.push({ company: "", role: "", dates: "", bulletsText: "" });
+    }
+
+    setExperiencesDraft(drafts);
+    setActiveModal("experience");
+  };
+
+  const addExperienceDraft = () => {
+    setExperiencesDraft((prev) => [
+      ...prev,
+      { company: "", role: "", dates: "", bulletsText: "" },
+    ]);
+  };
+
+  const updateExperienceDraft = (
+    index: number,
+    field: keyof ExperienceDraft,
+    value: string
+  ) => {
+    setExperiencesDraft((prev) =>
+      prev.map((exp, i) =>
+        i === index
+          ? {
+              ...exp,
+              [field]: value,
+            }
+          : exp
+      )
+    );
+  };
+
+  const openEducationModal = () => {
+    if (!profile) return;
+
+    const drafts: EducationDraft[] =
+      Array.isArray(profile.education) && profile.education.length > 0
+        ? profile.education.map((edu) => ({
+            school: edu.school || "",
+            degree: edu.degree || "",
+            dates: edu.dates || "",
+            location: (edu as any).location || "",
+          }))
+        : [
+            {
+              school: "",
+              degree: "",
+              dates: "",
+              location: "",
+            },
+          ];
+
+    setEducationDrafts(drafts);
+
+    const list =
+      profile.certs
+        ?.split(/[,\n]/)
+        .map((c: string) => c.trim())
+        .filter((c: string) => c.length > 0) || [];
+    setCertsList(list);
+    setCertInput("");
+
+    setActiveModal("education");
+  };
+
+  const addEducationDraft = () => {
+    setEducationDrafts((prev) => [
+      ...prev,
+      { school: "", degree: "", dates: "", location: "" },
+    ]);
+  };
+
+  const updateEducationDraft = (
+    index: number,
+    field: keyof EducationDraft,
+    value: string
+  ) => {
+    setEducationDrafts((prev) =>
+      prev.map((edu, i) =>
+        i === index
+          ? {
+              ...edu,
+              [field]: value,
+            }
+          : edu
+      )
+    );
+  };
+
+  const openLanguagesModal = () => {
+    if (!profile) return;
+
+    const parsed = parseLangLine(profile.langLine || "");
+    let drafts: LanguageDraft[] = [];
+
+    if (parsed.length > 0) {
+      drafts = parsed.map((p) => {
+        const txt = p.text;
+        const match = txt.match(/^(.*?)\s*\((.*)\)$/);
+        if (match) {
+          return {
+            language: match[1].trim(),
+            level: match[2].trim(),
+          };
+        }
+        return {
+          language: txt,
+          level: "",
+        };
+      });
+    }
+
+    if (drafts.length === 0) {
+      drafts = [{ language: "", level: "" }];
+    }
+
+    setLanguagesDraft(drafts);
+    setActiveModal("languages");
+  };
+
+  const openHobbiesModal = () => {
+    if (!profile) return;
+    setHobbiesList(profile.hobbies || []);
+    setHobbyInput("");
+    setActiveModal("hobbies");
+  };
+
+  // --- MODALES : SAUVEGARDE ---
+
+  const handleModalSave = async (e?: FormEvent) => {
+    if (e) e.preventDefault();
+    if (!profile || !activeModal) {
+      setActiveModal(null);
+      return;
+    }
+
+    let updated: CvProfile = { ...profile };
+
+    if (activeModal === "infos") {
+      updated = {
+        ...profile,
+        fullName: infosDraft.fullName.trim(),
+        email: infosDraft.email.trim(),
+        phone: infosDraft.phone.trim(),
+        linkedin: infosDraft.linkedin.trim(),
+        contractType: infosDraft.contractType.trim(),
+        profileSummary: infosDraft.profileSummary.trim(),
+        drivingLicense: infosDraft.drivingLicense.trim(),
+        vehicle: infosDraft.vehicle.trim(),
+        address: infosDraft.address.trim(),
+        city:
+          infosDraft.address.trim().split(",")[0].trim() ||
+          profile.city ||
+          "",
+      };
+    }
+
+    if (activeModal === "skills") {
+      const sections: CvSkillsSection[] = skillsSectionsText
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const [titlePart, itemsPart] = line.split(":");
+          const title = (titlePart || "Compétences").trim();
+          const items = itemsPart
+            ? itemsPart
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : [];
+          return { title, items };
+        });
+
+      const tools = skillsToolsText
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
+
+      updated = {
+        ...profile,
+        skills: {
+          sections,
+          tools,
+        },
+      };
+    }
+
+    if (activeModal === "experience") {
+      const experiences: CvExperience[] = experiencesDraft
+        .map((d) => ({
+          company: d.company.trim(),
+          role: d.role.trim(),
+          dates: d.dates.trim(),
+          bullets: d.bulletsText
+            .split("\n")
+            .map((b) => b.trim())
+            .filter(Boolean),
+        }))
+        .filter(
+          (exp) =>
+            exp.company || exp.role || exp.dates || exp.bullets.length > 0
+        );
+
+      updated = {
+        ...profile,
+        experiences,
+      };
+    }
+
+    if (activeModal === "education") {
+      const education: CvEducation[] = educationDrafts
+        .map((d) => ({
+          school: d.school.trim(),
+          degree: d.degree.trim(),
+          dates: d.dates.trim(),
+          location: d.location.trim(),
+        }))
+        .filter(
+          (e) => e.school || e.degree || e.dates || (e.location ?? "").length
+        );
+
+      const educationShort = education.map((e) => {
+        const parts: string[] = [];
+        if (e.dates) parts.push(e.dates);
+        let main = "";
+        if (e.degree && e.school) main = `${e.degree} – ${e.school}`;
+        else if (e.degree) main = e.degree;
+        else if (e.school) main = e.school;
+        if (main) parts.push(main);
+        if (e.location) {
+          if (parts.length > 1) {
+            parts[parts.length - 1] = `${parts[parts.length - 1]} (${e.location})`;
+          } else {
+            parts.push(`(${e.location})`);
+          }
+        }
+        return parts.join(" · ");
+      });
+
+      const certsJoined = certsList.join(", ");
+
+      updated = {
+        ...profile,
+        education,
+        educationShort,
+        certs: certsJoined,
+      };
+    }
+
+    if (activeModal === "languages") {
+      const cleaned = languagesDraft
+        .map((l) => ({
+          language: l.language.trim(),
+          level: l.level.trim(),
+        }))
+        .filter((l) => l.language.length > 0);
+
+      const langLine = cleaned
+        .map((l) => (l.level ? `${l.language} (${l.level})` : `${l.language}`))
+        .join(" · ");
+
+      updated = {
+        ...profile,
+        langLine,
+      };
+    }
+
+    if (activeModal === "hobbies") {
+      const hobbies = hobbiesList
+        .map((h) => h.trim())
+        .filter((h) => h.length > 0);
+      updated = {
+        ...profile,
+        hobbies,
+      };
+    }
+
+    setProfile(updated);
+    if (userId) {
+      await saveProfileToDb(updated);
+    }
+    setActiveModal(null);
+  };
+
+  const handleModalCancel = () => {
+    setActiveModal(null);
+  };
+
+  const headline =
+    profile?.profileSummary?.split(".")[0] ||
+    (profile?.contractType
+      ? profile.contractType
+      : "Profil en cours de configuration");
+
+  const updatedLabel = profile?.updatedAt
+    ? `Profil mis à jour le ${formatUpdatedAt(profile.updatedAt)}`
+    : "Profil non encore enregistré";
+
+  const langDisplay = parseLangLine(profile?.langLine || "");
+  const visibilityLabel = userId ? "Associé à ton compte" : "Invité";
+
+  // --- RENDER ---
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.25 }}
+      className="max-w-6xl mx-auto px-3 sm:px-4 py-5 sm:py-6 space-y-5"
+    >
+      {/* 1. VUE D'ENSEMBLE + STATS */}
+      <section className="space-y-4">
+        <div>
+          <p className="badge-muted mb-2 flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+            <span className="text-[11px] uppercase tracking-wider text-[var(--muted)]">
+              Vue d&apos;ensemble
+            </span>
+          </p>
+          <h1 className="text-xl sm:text-2xl font-semibold">
+            Ton tableau de bord de candidatures
+          </h1>
+          <p className="text-xs sm:text-sm text-[var(--muted)] mt-1 max-w-xl">
+            Accède rapidement à ton CV IA et à toutes les infos qui serviront à
+            générer ton CV, tes lettres de motivation et ton pitch.
+          </p>
+        </div>
+
+        {/* STATS CARDS */}
+        <div className="grid gap-3 md:grid-cols-4">
+          {/* Crédits */}
+          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
+              Crédits restants
+            </p>
+            <p className="text-2xl font-semibold">
+              {loadingAccountProfile ? "…" : remainingCredits}
+            </p>
+            <p className="text-[11px] text-[var(--muted)]">
+              Utilisés pour analyser ton CV et générer des contenus.
+            </p>
+          </div>
+
+          {/* CV générés */}
+          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
+              CV générés
+            </p>
+            <p className="text-2xl font-semibold">
+              {loadingCounts ? "…" : dashboardCounts.cvCount}
+            </p>
+            <p className="text-[11px] text-[var(--muted)]">
+              Nombre de candidatures où un <strong>CV IA</strong> est associé
+              (coché ou généré).
+            </p>
+          </div>
+
+          {/* LM IA générées */}
+          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
+              LM IA générées
+            </p>
+            <p className="text-2xl font-semibold">
+              {loadingCounts ? "…" : dashboardCounts.lmCount}
+            </p>
+            <p className="text-[11px] text-[var(--muted)]">
+              Nombre de candidatures avec une <strong>lettre IA</strong>{" "}
+              associée.
+            </p>
+          </div>
+
+          {/* Candidatures suivies */}
+          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
+              Candidatures suivies
+            </p>
+            <p className="text-2xl font-semibold">
+              {loadingCounts ? "…" : dashboardCounts.totalApps}
+            </p>
+            <p className="text-[11px] text-[var(--muted)]">
+              Total de lignes dans ton{" "}
+              <strong>tracker de candidatures</strong>.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      {/* 2. HEADER PROFIL + MON CV + RADAR */}
+      <header
+        id="infos-personnelles"
+        className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 flex flex-col lg:flex-row gap-4 md:items-stretch"
+      >
+        {/* Colonne gauche : identité, résumé, CV, infos clés */}
+        <div className="flex flex-col flex-1 gap-3">
+          {/* Identité */}
+          <div className="flex items-center gap-3 sm:gap-4">
+            <div className="flex h-14 w-14 sm:h-16 sm:w-16 items-center justify-center rounded-full bg-[var(--bg-soft)] border border-[var(--border)] text-base sm:text-lg font-semibold">
+              {getInitials(profile?.fullName || userEmail || "")}
+            </div>
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <h2 className="text-base sm:text-lg font-semibold">
+                  {profile?.fullName || "Ton profil candidat"}
+                </h2>
+                {userEmail && (
+                  <span className="rounded-full border border-[var(--border)] px-2 py-[2px] text-[10px] text-[var(--muted)]">
+                    Connecté·e en tant que{" "}
+                    <span className="font-medium text-[11px] text-white">
+                      {userEmail}
+                    </span>
+                  </span>
+                )}
+              </div>
+              <p className="text-[12px] text-[var(--muted)] line-clamp-2">
+                {headline}
+              </p>
+              {(profile?.address || profile?.city) && (
+                <p className="text-[11px] text-[var(--muted)]">
+                  {profile.address || profile.city}
+                </p>
+              )}
+              <p className="text-[11px] text-[var(--muted)]">{updatedLabel}</p>
+            </div>
+          </div>
+
+          {/* Mon CV */}
+          <section className="rounded-xl border border-[var(--border)]/80 bg-[var(--bg-soft)] p-3 sm:p-3.5 flex flex-col md:flex-row gap-3 md:items-center">
+            <div className="flex-1 space-y-1">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="inline-flex items-center rounded-full border border-[var(--border)] bg-[var(--bg)] px-2 py-[2px] text-[11px]">
+                  Mon CV
+                </span>
+                <p className="text-[11px] text-[var(--muted)]">
+                  {profile
+                    ? "Ton CV a été analysé et ton profil est sauvegardé."
+                    : "Aucun CV analysé pour le moment."}
+                </p>
+              </div>
+              {loadingProfileFromDb && (
+                <p className="text-[11px] text-[var(--muted)]">
+                  Chargement de ton profil sauvegardé...
+                </p>
+              )}
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center md:ml-auto">
+              <label className="flex-1 cursor-pointer">
+                <div className="w-full rounded-lg border border-dashed border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 text-[12px] text-[var(--muted)] hover:border-[var(--brand)]/80 hover:bg-[var(--bg-soft)] transition-colors">
+                  {file ? (
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate">{file.name}</span>
+                      <span className="text-[11px] text-[var(--muted)]">
+                        {(file.size / 1024 / 1024).toFixed(2)} Mo
+                      </span>
+                    </div>
+                  ) : (
+                    <span>Choisir un CV (PDF)</span>
+                  )}
+                </div>
+                <input
+                  type="file"
+                  accept="application/pdf"
+                  className="hidden"
+                  onChange={handleFileChange}
+                />
+              </label>
+
+              <button
+                type="button"
+                onClick={handleUpload}
+                disabled={
+                  uploading ||
+                  !file ||
+                  loadingAccountProfile ||
+                  isBlocked ||
+                  remainingCredits <= 0
+                }
+                className="sm:w-[160px] inline-flex items-center justify-center rounded-lg bg-[var(--brand)] hover:bg-[var(--brandDark)] disabled:opacity-60 disabled:cursor-not-allowed text-[13px] font-medium text-white px-3 py-2 transition-colors"
+              >
+                {uploading
+                  ? "Analyse en cours..."
+                  : isBlocked
+                  ? "Compte bloqué"
+                  : remainingCredits <= 0
+                  ? "Plus de crédits"
+                  : "Analyser / Mettre à jour"}
+              </button>
+            </div>
+          </section>
+
+          {/* Informations clés */}
+          {profile && (
+            <div className="rounded-xl border border-[var(--border)]/60 bg-[var(--bg-soft)] p-3 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[11px] text-[var(--muted)] font-medium">
+                  Informations clés
+                </p>
+                <button
+                  type="button"
+                  onClick={openInfosModal}
+                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
+                >
+                  <span className="text-[13px]">✏️</span>
+                  <span>Modifier / ajouter</span>
+                </button>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2 text-[12px]">
+                <div>
+                  <p className="text-[11px] text-[var(--muted)]">Email</p>
+                  <p className="font-medium">
+                    {profile.email || userEmail || "—"}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[11px] text-[var(--muted)]">Téléphone</p>
+                  <p className="font-medium">{profile.phone || "—"}</p>
+                </div>
+                <div>
+                  <p className="text-[11px] text-[var(--muted)]">LinkedIn</p>
+                  <p className="font-medium break-all">
+                    {profile.linkedin || "—"}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[11px] text-[var(--muted)]">Adresse</p>
+                  <p className="font-medium line-clamp-2">
+                    {profile.address || profile.city || "—"}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[11px] text-[var(--muted)]">
+                    Contrat recherché
+                  </p>
+                  <p className="font-medium line-clamp-2">
+                    {profile.contractType || "Non renseigné"}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[11px] text-[var(--muted)]">
+                    Permis de conduire
+                  </p>
+                  <p className="font-medium">
+                    {profile.drivingLicense || "—"}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-[11px] text-[var(--muted)]">Véhicule</p>
+                  <p className="font-medium">{profile.vehicle || "—"}</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <div className="mt-1 w-full rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-[11px] text-red-100">
+              {error}
+            </div>
+          )}
+
+          {/* Visibilité */}
+          <div className="text-[11px] text-[var(--muted)]">
+            Visibilité :{" "}
+            <span className="font-medium text-[var(--text)]">
+              {visibilityLabel}
+            </span>
+          </div>
+        </div>
+
+        {/* Colonne droite : RADAR */}
+        <div className="md:w-[320px] lg:w-[360px] flex-shrink-0">
+          <div className="rounded-2xl bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-3 sm:p-4 h-full flex flex-col">
+            <p className="text-[11px] text-[var(--muted)] mb-2">
+              Radar de compétences estimé
+            </p>
+            <div className="relative flex-1 min-h-[210px]">
+              <canvas
+                id="skillsRadarChart"
+                ref={radarCanvasRef}
+                className="w-full h-full"
+              />
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* 3. CONTENU PRINCIPAL : NAV GAUCHE + SECTIONS */}
+      <div className="lg:grid lg:grid-cols-[220px,1fr] gap-4 sm:gap-5">
+        {/* Sidebar navigation */}
+        <aside className="mb-3 lg:mb-0">
+          <motion.nav
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.35 }}
+            className="glass border border-[var(--border)]/80 rounded-2xl py-3 text-[12px] sticky top-20 lg:top-24"
+          >
+            <p className="px-3 pb-1 text-[11px] text-[var(--muted)]">
+              Navigation rapide
+            </p>
+            <ul className="space-y-0.5">
+              {navItems.map((item, idx) => (
+                <motion.li
+                  key={item.id}
+                  initial={{ opacity: 0, x: -8 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ delay: 0.1 + idx * 0.05 }}
+                >
+                  <a
+                    href={`#${item.id}`}
+                    className="flex items-center justify-between px-3 py-2 hover:bg-[var(--bg-soft)] text-[12px] rounded-md transition-colors"
+                  >
+                    <span>{item.label}</span>
+                    <motion.span
+                      whileHover={{ x: 2 }}
+                      className="text-[10px] text-[var(--muted)]"
+                    >
+                      ↗
+                    </motion.span>
+                  </a>
+                </motion.li>
+              ))}
+            </ul>
+          </motion.nav>
+        </aside>
+
+        {/* Main content */}
+        <main className="space-y-4 sm:space-y-5">
+          {/* Compétences */}
+          {profile?.skills && (
+            <section
+              id="competences"
+              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4"
+            >
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <h2 className="text-sm sm:text-base font-semibold">
+                  Compétences &amp; Outils
+                </h2>
+                <button
+                  type="button"
+                  onClick={openSkillsModal}
+                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
+                >
+                  <span className="text-[13px]">✏️</span>
+                  <span>Modifier / ajouter</span>
+                </button>
+              </div>
+
+              {profile.skills.sections?.length > 0 && (
+                <div className="space-y-4">
+                  {profile.skills.sections.map((section, idx) => (
+                    <div key={idx} className="space-y-1">
+                      <p className="text-[11px] uppercase tracking-wide text-[var(--muted)]">
+                        {section.title}
+                      </p>
+                      <div className="flex flex-wrap gap-2 text-[12px]">
+                        {section.items.map((s, i) => (
+                          <span key={i} className="badge">
+                            {s}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {profile.skills.tools?.length > 0 && (
+                <div className="space-y-1 pt-2 border-t border-[var(--border)]/80">
+                  <p className="text-[11px] uppercase tracking-wide text-[var(--muted)]">
+                    Outils / logiciels
+                  </p>
+                  <div className="flex flex-wrap gap-2 text-[12px]">
+                    {profile.skills.tools.map((tool, idx) => (
+                      <span key={idx} className="badge">
+                        {tool}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* Expérience */}
+          {profile?.experiences?.length ? (
+            <section
+              id="experience"
+              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5"
+            >
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <h2 className="text-sm sm:text-base font-semibold">
+                  Expériences principales
+                </h2>
+                <button
+                  type="button"
+                  onClick={openExperienceModal}
+                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
+                >
+                  <span className="text-[13px]">✏️</span>
+                  <span>Modifier / ajouter</span>
+                </button>
+              </div>
+
+              <ul className="space-y-3 text-[12px]">
+                {profile.experiences.map((exp, idx) => (
+                  <li
+                    key={idx}
+                    className="rounded-lg bg-[var(--bg-soft)] border border-[var(--border)]/70 px-3 py-3"
+                  >
+                    <p className="font-medium">
+                      {exp.role || "Poste"} · {exp.company || "Entreprise"}
+                    </p>
+                    <p className="text-[11px] text-[var(--muted)]">
+                      {exp.dates || ""}
+                    </p>
+                    {exp.bullets?.length > 0 && (
+                      <ul className="mt-1 list-disc list-inside space-y-0.5">
+                        {exp.bullets.map((b, i) => (
+                          <li key={i}>{b}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ) : null}
+
+          {/* Formation & certifs */}
+          {profile && (profile.educationShort?.length || profile.certs) && (
+            <section
+              id="formation"
+              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4"
+            >
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <h2 className="text-sm sm:text-base font-semibold">
+                  Formation &amp; Certifications
+                </h2>
+                <button
+                  type="button"
+                  onClick={openEducationModal}
+                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
+                >
+                  <span className="text-[13px]">✏️</span>
+                  <span>Modifier / ajouter</span>
+                </button>
+              </div>
+
+              {profile?.educationShort?.length ? (
+                <div>
+                  <ul className="space-y-1.5 text-[12px]">
+                    {profile.educationShort.map((line, idx) => (
+                      <li key={idx}>{line}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              {profile?.certs && (
+                <div>
+                  <p className="text-[11px] text-[var(--muted)] mb-1">
+                    Certifications
+                  </p>
+                  <p className="text-[12px]">{profile.certs}</p>
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* Langues */}
+          {profile && (
+            <section
+              id="langues"
+              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3"
+            >
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <h2 className="text-sm sm:text-base font-semibold">Langues</h2>
+                <button
+                  type="button"
+                  onClick={openLanguagesModal}
+                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
+                >
+                  <span className="text-[13px]">✏️</span>
+                  <span>Modifier / ajouter</span>
+                </button>
+              </div>
+              {langDisplay.length > 0 ? (
+                <div className="flex flex-wrap gap-x-6 gap-y-3 text-[13px]">
+                  {langDisplay.map((lang, idx) => (
+                    <div key={idx} className="flex items-center gap-2">
+                      <span className="text-2xl">{lang.flag}</span>
+                      <span className="font-medium text-[var(--text)]">
+                        {lang.text}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-[12px] text-[var(--muted)]">
+                  Aucune langue renseignée pour le moment.
+                </p>
+              )}
+            </section>
+          )}
+
+          {/* Hobbies */}
+          {profile && (
+            <section
+              id="hobbies"
+              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5"
+            >
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <h2 className="text-sm sm:text-base font-semibold">
+                  Centres d&apos;intérêt
+                </h2>
+                <button
+                  type="button"
+                  onClick={openHobbiesModal}
+                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
+                >
+                  <span className="text-[13px]">✏️</span>
+                  <span>Modifier / ajouter</span>
+                </button>
+              </div>
+              {profile.hobbies?.length ? (
+                <div className="flex flex-wrap gap-2 text-[12px]">
+                  {profile.hobbies.map((hobby) => (
+                    <span
+                      key={hobby}
+                      className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-[3px]"
+                    >
+                      <span>{getHobbyEmoji(hobby)}</span>
+                      <span>{hobby}</span>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-[12px] text-[var(--muted)]">
+                  Aucun centre d&apos;intérêt renseigné pour le moment.
+                </p>
+              )}
+            </section>
+          )}
+        </main>
+      </div>
+
+      {/* Message si aucun profil */}
+      {!profile && !loadingProfileFromDb && (
+        <div className="text-center p-10 glass border border-[var(--border)]/80 rounded-2xl">
+          <h3 className="text-lg font-semibold mb-2">
+            Aucun profil enregistré ou analysé
+          </h3>
+          <p className="text-[13px] text-[var(--muted)]">
+            Veuille uploader un CV PDF dans le header ci-dessus pour initialiser
+            ton profil candidat IA.
+          </p>
+        </div>
+      )}
+
+      {/* --- MODALE GÉNÉRIQUE D'ÉDITION --- */}
+      {activeModal && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 px-3">
+          <motion.form
+            onSubmit={handleModalSave}
+            initial={{ opacity: 0, y: 16, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 16, scale: 0.97 }}
+            className="w-full max-w-lg rounded-2xl bg-[var(--bg)] border border-[var(--border)] shadow-xl p-4 sm:p-5 space-y-4"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-sm sm:text-base font-semibold">
+                {activeModal === "infos" && "Modifier tes informations clés"}
+                {activeModal === "skills" && "Modifier tes compétences & outils"}
+                {activeModal === "experience" &&
+                  "Modifier tes expériences principales"}
+                {activeModal === "education" &&
+                  "Modifier ta formation & tes certifications"}
+                {activeModal === "languages" && "Modifier tes langues"}
+                {activeModal === "hobbies" && "Modifier tes centres d’intérêt"}
+              </h3>
+              <button
+                type="button"
+                onClick={handleModalCancel}
+                className="rounded-full px-2 py-1 text-[11px] text-[var(--muted)] hover:bg-[var(--bg-soft)]"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-3 max-h-[60vh] overflow-auto pr-1">
+              {/* INFOS */}
+              {activeModal === "infos" && (
+                <>
+                  <div className="grid sm:grid-cols-2 gap-3 text-[12px]">
+                    <div>
+                      <label className="text-[11px] text-[var(--muted)]">
+                        Nom complet
+                      </label>
+                      <input
+                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                        value={infosDraft.fullName}
+                        onChange={(e) =>
+                          setInfosDraft((p) => ({
+                            ...p,
+                            fullName: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-[var(--muted)]">
+                        Email
+                      </label>
+                      <input
+                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                        value={infosDraft.email}
+                        onChange={(e) =>
+                          setInfosDraft((p) => ({
+                            ...p,
+                            email: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-[var(--muted)]">
+                        Téléphone
+                      </label>
+                      <input
+                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                        value={infosDraft.phone}
+                        onChange={(e) =>
+                          setInfosDraft((p) => ({
+                            ...p,
+                            phone: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-[var(--muted)]">
+                        LinkedIn
+                      </label>
+                      <input
+                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                        value={infosDraft.linkedin}
+                        onChange={(e) =>
+                          setInfosDraft((p) => ({
+                            ...p,
+                            linkedin: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-[var(--muted)]">
+                        Permis (ex : Permis B)
+                      </label>
+                      <input
+                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                        value={infosDraft.drivingLicense}
+                        onChange={(e) =>
+                          setInfosDraft((p) => ({
+                            ...p,
+                            drivingLicense: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-[var(--muted)]">
+                        Véhicule (ex : Véhiculé)
+                      </label>
+                      <input
+                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                        value={infosDraft.vehicle}
+                        onChange={(e) =>
+                          setInfosDraft((p) => ({
+                            ...p,
+                            vehicle: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                    <div className="sm:col-span-2">
+                      <label className="text-[11px] text-[var(--muted)]">
+                        Adresse (ville, code postal, etc.)
+                      </label>
+                      <input
+                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                        placeholder="Ex : 12 rue Exemple, 75000 Paris"
+                        value={infosDraft.address}
+                        onChange={(e) =>
+                          setInfosDraft((p) => ({
+                            ...p,
+                            address: e.target.value,
+                          }))
+                        }
+                      />
+                    </div>
+                  </div>
+                  <div className="text-[12px]">
+                    <label className="text-[11px] text-[var(--muted)]">
+                      Contrat recherché
+                    </label>
+                    <input
+                      list="contract-type-options"
+                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                      placeholder="Ex : CDI, Alternance, Stage, Freelance..."
+                      value={infosDraft.contractType}
+                      onChange={(e) =>
+                        setInfosDraft((p) => ({
+                          ...p,
+                          contractType: e.target.value,
+                        }))
+                      }
+                    />
+                    <datalist id="contract-type-options">
+                      {CONTRACT_TYPE_OPTIONS.map((c) => (
+                        <option key={c} value={c} />
+                      ))}
+                    </datalist>
+                  </div>
+                  <div className="text-[12px]">
+                    <label className="text-[11px] text-[var(--muted)]">
+                      Résumé de profil / Pitch
+                    </label>
+                    <textarea
+                      rows={4}
+                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
+                      value={infosDraft.profileSummary}
+                      onChange={(e) =>
+                        setInfosDraft((p) => ({
+                          ...p,
+                          profileSummary: e.target.value,
+                        }))
+                      }
+                    />
+                  </div>
+                </>
+              )}
+
+              {/* COMPÉTENCES */}
+              {activeModal === "skills" && (
+                <>
+                  <div className="text-[12px] space-y-1">
+                    <label className="text-[11px] text-[var(--muted)]">
+                      Sections de compétences
+                    </label>
+                    <p className="text-[11px] text-[var(--muted)]">
+                      Format conseillé : une ligne par section. Exemple :
+                      <br />
+                      <span className="italic">
+                        &quot;Compétences analytiques : Analyse financière,
+                        Reporting, Budget&quot;
+                      </span>
+                    </p>
+                    <textarea
+                      rows={5}
+                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
+                      value={skillsSectionsText}
+                      onChange={(e) => setSkillsSectionsText(e.target.value)}
+                    />
+                  </div>
+                  <div className="text-[12px] space-y-1">
+                    <label className="text-[11px] text-[var(--muted)]">
+                      Outils / logiciels (séparés par des virgules)
+                    </label>
+                    <textarea
+                      rows={2}
+                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
+                      value={skillsToolsText}
+                      onChange={(e) => setSkillsToolsText(e.target.value)}
+                    />
+                  </div>
+                </>
+              )}
+
+              {/* EXPÉRIENCE */}
+              {activeModal === "experience" && (
+                <div className="space-y-3 text-[12px]">
+                  {experiencesDraft.map((exp, idx) => (
+                    <div
+                      key={idx}
+                      className="rounded-lg border border-[var(--border)]/70 bg-[var(--bg-soft)] p-3 space-y-2"
+                    >
+                      <div className="grid sm:grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[11px] text-[var(--muted)]">
+                            Poste
+                          </label>
+                          <input
+                            className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                            value={exp.role}
+                            onChange={(e) =>
+                              updateExperienceDraft(idx, "role", e.target.value)
+                            }
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[11px] text-[var(--muted)]">
+                            Entreprise
+                          </label>
+                          <input
+                            className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                            value={exp.company}
+                            onChange={(e) =>
+                              updateExperienceDraft(
+                                idx,
+                                "company",
+                                e.target.value
+                              )
+                            }
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[11px] text-[var(--muted)]">
+                            Dates
+                          </label>
+                          <input
+                            className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                            value={exp.dates}
+                            onChange={(e) =>
+                              updateExperienceDraft(
+                                idx,
+                                "dates",
+                                e.target.value
+                              )
+                            }
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="text-[11px] text-[var(--muted)]">
+                          Missions / Réalisations (une par ligne)
+                        </label>
+                        <textarea
+                          rows={3}
+                          className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
+                          value={exp.bulletsText}
+                          onChange={(e) =>
+                            updateExperienceDraft(
+                              idx,
+                              "bulletsText",
+                              e.target.value
+                            )
+                          }
+                        />
+                      </div>
+                    </div>
+                  ))}
+
+                  <button
+                    type="button"
+                    onClick={addExperienceDraft}
+                    className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
+                  >
+                    <span className="text-[14px]">＋</span>
+                    <span>Ajouter une expérience</span>
+                  </button>
+                </div>
+              )}
+
+              {/* FORMATION & CERTIFS */}
+              {activeModal === "education" && (
+                <>
+                  <div className="space-y-3 text-[12px]">
+                    {educationDrafts.map((edu, idx) => (
+                      <div
+                        key={idx}
+                        className="rounded-lg border border-[var(--border)]/70 bg-[var(--bg-soft)] p-3 space-y-2"
+                      >
+                        <div className="grid sm:grid-cols-2 gap-2">
+                          <div>
+                            <label className="text-[11px] text-[var(--muted)]">
+                              Diplôme
+                            </label>
+                            <input
+                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                              value={edu.degree}
+                              onChange={(e) =>
+                                updateEducationDraft(
+                                  idx,
+                                  "degree",
+                                  e.target.value
+                                )
+                              }
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[11px] text-[var(--muted)]">
+                              École / Université
+                            </label>
+                            <input
+                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                              value={edu.school}
+                              onChange={(e) =>
+                                updateEducationDraft(
+                                  idx,
+                                  "school",
+                                  e.target.value
+                                )
+                              }
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[11px] text-[var(--muted)]">
+                              Lieu (optionnel)
+                            </label>
+                            <input
+                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                              value={edu.location}
+                              onChange={(e) =>
+                                updateEducationDraft(
+                                  idx,
+                                  "location",
+                                  e.target.value
+                                )
+                              }
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[11px] text-[var(--muted)]">
+                              Dates
+                            </label>
+                            <input
+                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                              placeholder="Ex : 2022–2024"
+                              value={edu.dates}
+                              onChange={(e) =>
+                                updateEducationDraft(
+                                  idx,
+                                  "dates",
+                                  e.target.value
+                                )
+                              }
+                            />
+                          </div>
+                        </div>
+                        {educationDrafts.length > 1 && (
+                          <div className="flex justify-end">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setEducationDrafts((prev) =>
+                                  prev.filter((_, i) => i !== idx)
+                                )
+                              }
+                              className="text-[11px] text-[var(--muted)] hover:text-red-400"
+                            >
+                              Supprimer cette formation
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+
+                    <button
+                      type="button"
+                      onClick={addEducationDraft}
+                      className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
+                    >
+                      <span className="text-[14px]">＋</span>
+                      <span>Ajouter une formation</span>
+                    </button>
+                  </div>
+
+                  {/* Certifications */}
+                  <div className="text-[12px] space-y-2 pt-3">
+                    <label className="text-[11px] text-[var(--muted)]">
+                      Certifications (avec auto-complétion)
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        list="certification-options"
+                        className="flex-1 rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                        placeholder="Ex : Tosa Excel, Azure AZ-900..."
+                        value={certInput}
+                        onChange={(e) => setCertInput(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const val = certInput.trim();
+                          if (!val) return;
+                          if (!certsList.includes(val)) {
+                            setCertsList((prev) => [...prev, val]);
+                          }
+                          setCertInput("");
+                        }}
+                        className="rounded-md bg-[var(--brand)] hover:bg-[var(--brandDark)] px-3 py-1.5 text-[12px] text-white"
+                      >
+                        Ajouter
+                      </button>
+                      <datalist id="certification-options">
+                        {CERTIFICATION_OPTIONS.map((c) => (
+                          <option key={c} value={c} />
+                        ))}
+                      </datalist>
+                    </div>
+
+                    {certsList.length > 0 && (
+                      <div className="flex flex-wrap gap-2 mt-1">
+                        {certsList.map((cert) => (
+                          <span
+                            key={cert}
+                            className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-[2px] text-[11px]"
+                          >
+                            {cert}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setCertsList((prev) =>
+                                  prev.filter((c) => c !== cert)
+                                )
+                              }
+                              className="text-[10px] text-[var(--muted)] hover:text-red-400"
+                            >
+                              ✕
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {/* LANGUES */}
+              {activeModal === "languages" && (
+                <div className="text-[12px] space-y-3">
+                  <p className="text-[11px] text-[var(--muted)]">
+                    Ajoute tes langues avec leur niveau. Tu peux choisir dans la
+                    liste ou taper manuellement.
+                  </p>
+                  {languagesDraft.map((lang, idx) => {
+                    const flag =
+                      lang.language.trim() !== ""
+                        ? getFlagEmoji(lang.language)
+                        : "🌐";
+                    return (
+                      <div
+                        key={idx}
+                        className="flex items-center gap-2 rounded-lg border border-[var(--border)]/70 bg-[var(--bg-soft)] px-2.5 py-2"
+                      >
+                        <span className="text-xl w-7 text-center">{flag}</span>
+                        <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <div>
+                            <label className="text-[11px] text-[var(--muted)]">
+                              Langue
+                            </label>
+                            <input
+                              list="language-options"
+                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                              value={lang.language}
+                              onChange={(e) =>
+                                setLanguagesDraft((prev) =>
+                                  prev.map((l, i) =>
+                                    i === idx
+                                      ? { ...l, language: e.target.value }
+                                      : l
+                                  )
+                                )
+                              }
+                            />
+                          </div>
+                          <div>
+                            <label className="text-[11px] text-[var(--muted)]">
+                              Niveau
+                            </label>
+                            <select
+                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                              value={lang.level}
+                              onChange={(e) =>
+                                setLanguagesDraft((prev) =>
+                                  prev.map((l, i) =>
+                                    i === idx
+                                      ? { ...l, level: e.target.value }
+                                      : l
+                                  )
+                                )
+                              }
+                            >
+                              <option value="">Sélectionner un niveau</option>
+                              {LANGUAGE_LEVEL_OPTIONS.map((lvl) => (
+                                <option key={lvl} value={lvl}>
+                                  {lvl}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+                        {languagesDraft.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setLanguagesDraft((prev) =>
+                                prev.filter((_, i) => i !== idx)
+                              )
+                            }
+                            className="ml-1 text-[11px] text-[var(--muted)] hover:text-red-400"
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  <datalist id="language-options">
+                    {LANGUAGE_OPTIONS.map((l) => (
+                      <option key={l} value={l} />
+                    ))}
+                  </datalist>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setLanguagesDraft((prev) => [
+                        ...prev,
+                        { language: "", level: "" },
+                      ])
+                    }
+                    className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
+                  >
+                    <span className="text-[14px]">＋</span>
+                    <span>Ajouter une langue</span>
+                  </button>
+                </div>
+              )}
+
+              {/* HOBBIES */}
+              {activeModal === "hobbies" && (
+                <div className="text-[12px] space-y-2">
+                  <label className="text-[11px] text-[var(--muted)]">
+                    Centres d&apos;intérêt (avec auto-complétion)
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      list="hobby-options"
+                      className="flex-1 rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
+                      placeholder="Ex : Voyage, Football, Lecture..."
+                      value={hobbyInput}
+                      onChange={(e) => setHobbyInput(e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const val = hobbyInput.trim();
+                        if (!val) return;
+                        if (!hobbiesList.includes(val)) {
+                          setHobbiesList((prev) => [...prev, val]);
+                        }
+                        setHobbyInput("");
+                      }}
+                      className="rounded-md bg-[var(--brand)] hover:bg-[var(--brandDark)] px-3 py-1.5 text-[12px] text-white"
+                    >
+                      Ajouter
+                    </button>
+                    <datalist id="hobby-options">
+                      {HOBBY_OPTIONS.map((h) => (
+                        <option key={h} value={h} />
+                      ))}
+                    </datalist>
+                  </div>
+
+                  {hobbiesList.length > 0 ? (
+                    <div className="flex flex-wrap gap-2 mt-2">
+                      {hobbiesList.map((hobby) => (
+                        <span
+                          key={hobby}
+                          className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-[2px] text-[11px]"
+                        >
+                          <span>{getHobbyEmoji(hobby)}</span>
+                          <span>{hobby}</span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setHobbiesList((prev) =>
+                                prev.filter((h) => h !== hobby)
+                              )
+                            }
+                            className="text-[10px] text-[var(--muted)] hover:text-red-400"
+                          >
+                            ✕
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-[var(--muted)] mt-1">
+                      Aucun centre d&apos;intérêt ajouté pour le moment.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={handleModalCancel}
+                className="inline-flex items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[12px] text-[var(--muted)] hover:bg-[var(--bg)] transition-colors"
+              >
+                Annuler
+              </button>
+              <button
+                type="submit"
+                className="inline-flex items-center justify-center rounded-lg bg-[var(--brand)] hover:bg-[var(--brandDark)] px-3 py-1.5 text-[12px] font-medium text-white transition-colors"
+              >
+                Enregistrer
+              </button>
+            </div>
+          </motion.form>
+        </div>
+      )}
+    </motion.div>
+  );
+}
+````
+
 ## File: app/layout.tsx
 ````typescript
 // app/layout.tsx
@@ -15685,39 +20551,6 @@ export default function RootLayout({
         </AuthProvider>
       </body>
     </html>
-  );
-}
-````
-
-## File: app/not-found.tsx
-````typescript
-"use client";
-
-import Link from "next/link";
-import { useAuth } from "@/context/AuthContext";
-
-export default function NotFound() {
-  const { user } = useAuth();
-
-  return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-[var(--bg)] text-[var(--ink)] px-4">
-      <div className="glass max-w-md w-full p-6 border border-[var(--border)]/80 text-center">
-        <h1 className="text-xl font-semibold mb-2">Page introuvable</h1>
-        <p className="text-sm text-[var(--muted)] mb-4">
-          Le lien que tu as suivi est invalide ou cette page n&apos;existe pas.
-        </p>
-        <div className="flex flex-wrap gap-3 justify-center">
-          <Link href="/" className="btn-secondary text-xs sm:text-sm">
-            Retour à l&apos;accueil
-          </Link>
-          {user && (
-            <Link href="/app" className="btn-primary text-xs sm:text-sm">
-              Aller au dashboard
-            </Link>
-          )}
-        </div>
-      </div>
-    </div>
   );
 }
 ````
@@ -16394,570 +21227,6 @@ export default function LandingPage() {
           </section>
         </main>
       </div>
-    </div>
-  );
-}
-````
-
-## File: components/layout/AppLayout.tsx
-````typescript
-"use client";
-
-import { ReactNode, useEffect, useState } from "react";
-import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
-import { useAuth } from "@/context/AuthContext";
-import { db } from "@/lib/firebase";
-import { doc, onSnapshot } from "firebase/firestore";
-
-const navLinks = [
-  { href: "/app", label: "Profil CV IA", icon: "📄" },
-  { href: "/app/lm", label: "Assistant candidature", icon: "✨" },
-  { href: "/app/tracker", label: "Suivi candidatures", icon: "📊" },
-  { href: "/app/interview", label: "Préparer entretien", icon: "🎤" },
-  { href: "/app/apply", label: "Postuler", icon: "📨" },
-  { href: "/app/history", label: "Historique IA", icon: "🕒" },
-  { href: "/app/credits", label: "Crédits", icon: "⚡" },
-];
-
-export default function UserAppLayout({ children }: { children: ReactNode }) {
-  const { user, loading, logout } = useAuth();
-  const router = useRouter();
-  const pathname = usePathname();
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-
-  // ✅ flag pour être sûr qu'on est côté client
-  const [clientReady, setClientReady] = useState(false);
-  useEffect(() => {
-    setClientReady(true);
-  }, []);
-
-  // ✅ Crédits utilisateur (Firestorm)
-  const [credits, setCredits] = useState<number | null>(null);
-
-  // 🔒 Protection des routes /app : login + email vérifié
-  useEffect(() => {
-    if (!clientReady) return;
-    if (loading) return;
-
-    if (!user) {
-      router.replace("/login");
-      return;
-    }
-
-    if (!user.emailVerified) {
-      router.replace("/auth/verify-email");
-      return;
-    }
-  }, [clientReady, user, loading, router]);
-
-  // 🛡 Surveillance du doc user : blocage + crédits
-  useEffect(() => {
-    if (!clientReady) return;
-    if (!user) return;
-
-    const ref = doc(db, "users", user.uid);
-
-    const unsub = onSnapshot(
-      ref,
-      (snap) => {
-        const data = snap.data() as any | undefined;
-
-        // blocage
-        if (data?.blocked) {
-          logout()
-            .catch((e) =>
-              console.error("Erreur déconnexion après blocage :", e)
-            )
-            .finally(() => {
-              router.replace("/login?blocked=1");
-            });
-          return;
-        }
-
-        // crédits
-        if (typeof data?.credits === "number") {
-          setCredits(data.credits);
-        } else {
-          setCredits(0);
-        }
-      },
-      (err) => {
-        console.error("Erreur surveillance utilisateur :", err);
-      }
-    );
-
-    return () => {
-      unsub();
-    };
-  }, [clientReady, user, logout, router]);
-
-  // ferme le menu mobile au changement de page
-  useEffect(() => {
-    setSidebarOpen(false);
-  }, [pathname]);
-
-  // ⚠️ Tant qu'on n'est pas prêt ou pas autorisé → on ne rend PAS le dashboard
-  if (!clientReady || loading || !user || !user.emailVerified) {
-    return null;
-  }
-
-  const handleLogout = async () => {
-    try {
-      await logout();
-      router.replace("/login");
-    } catch (e) {
-      console.error("Erreur déconnexion :", e);
-    }
-  };
-
-  const currentNav = navLinks.find(
-    (link) =>
-      pathname === link.href || pathname.startsWith(link.href + "/")
-  );
-  const pageTitle = currentNav?.label ?? "Espace candidat";
-
-  const CreditsBadge =
-    credits === null ? null : (
-      <div className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--ink)]">
-        <span className="text-[13px]">⚡</span>
-        <span>
-          <span className="font-semibold">{credits}</span> crédits
-        </span>
-      </div>
-    );
-
-  return (
-    <div className="min-h-screen flex bg-[var(--bg)] text-[var(--ink)]">
-      {/* SIDEBAR DESKTOP */}
-      <aside className="hidden md:flex w-60 shrink-0 flex-col border-r border-[var(--border)] bg-[var(--bg-soft)]/60">
-        <div className="flex items-center gap-2 px-3 py-4 border-b border-[var(--border)]/70">
-          <Link href="/app" className="flex items-center gap-2">
-            <div className="w-9 h-9 rounded-2xl bg-[var(--brand)]/10 border border-[var(--brand)]/40 flex items-center justify-center text-lg">
-              ⚡
-            </div>
-            <div className="flex flex-col">
-              <span className="text-xs font-semibold">
-                Assistant Candidature IA
-              </span>
-              <span className="text-[10px] text-[var(--muted)]">
-                Espace candidat
-              </span>
-            </div>
-          </Link>
-        </div>
-
-        <nav className="flex-1 px-2 py-3 space-y-1 text-[13px] overflow-y-auto">
-          {navLinks.map((link) => {
-            const active =
-              pathname === link.href ||
-              pathname.startsWith(link.href + "/");
-            return (
-              <Link
-                key={link.href}
-                href={link.href}
-                className={[
-                  "flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors border border-transparent",
-                  active
-                    ? "bg-[var(--bg)] text-[var(--ink)] border-[var(--brand)]/60"
-                    : "text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)]",
-                ].join(" ")}
-              >
-                <span className="w-5 text-center text-[13px]">
-                  {link.icon}
-                </span>
-                <span>{link.label}</span>
-              </Link>
-            );
-          })}
-        </nav>
-
-        <div className="border-t border-[var(--border)]/70 px-3 py-3 text-[11px] flex flex-col gap-2">
-          {/* Badge crédits dans le bas de la sidebar */}
-          {CreditsBadge}
-
-          {user?.email && (
-            <p className="text-[var(--muted)]">
-              Connecté·e :{" "}
-              <span className="font-medium text-[var(--ink)]">
-                {user.email}
-              </span>
-            </p>
-          )}
-          <button
-            type="button"
-            onClick={handleLogout}
-            className="w-full text-[11px] rounded-full border border-[var(--border)] px-3 py-1.5 bg-[var(--bg)] hover:border-red-500 hover:text-red-300 transition-colors"
-          >
-            Se déconnecter
-          </button>
-        </div>
-      </aside>
-
-      {/* COLONNE CONTENU */}
-      <div className="flex-1 flex flex-col relative">
-        <div className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.16),_transparent_55%),radial-gradient(circle_at_bottom,_rgba(94,234,212,0.12),_transparent_55%)]" />
-
-        {/* TOPBAR */}
-        <header className="sticky top-0 z-30 border-b border-[var(--border)]/80 bg-[var(--bg)]/95 backdrop-blur">
-          <div className="flex items-center justify-between gap-3 px-3 sm:px-6 py-3">
-            <div className="flex items-center gap-3">
-              <button
-                type="button"
-                aria-label="Ouvrir la navigation"
-                onClick={() => setSidebarOpen(true)}
-                className="md:hidden rounded-full p-2 bg-[var(--bg-soft)] border border-[var(--border)]/80 shadow-sm focus:outline-none focus:ring-2 focus:ring-[var(--brand)]/60"
-              >
-                <div className={`menu-icon1 ${sidebarOpen ? "is-open" : ""}`}>
-                  <div className="menu-icon1_line-top"></div>
-                  <div className="menu-icon1_line-middle">
-                    <div className="menu-icon1_line-middle-inner"></div>
-                  </div>
-                  <div className="menu-icon1_line-bottom"></div>
-                </div>
-              </button>
-
-              <div className="flex flex-col">
-                <span className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted)]">
-                  Tableau de bord
-                </span>
-                <span className="text-sm font-semibold">{pageTitle}</span>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-3">
-              {/* Badge crédits visible dans la topbar */}
-              {CreditsBadge}
-
-              {user?.email && (
-                <span className="hidden sm:inline text-[11px] text-[var(--muted)]">
-                  {user.email}
-                </span>
-              )}
-              <button
-                type="button"
-                onClick={handleLogout}
-                className="text-[11px] rounded-full border border-[var(--border)] px-3 py-1.5 bg-[var(--bg-soft)] hover:border-red-500 hover:text-red-300 transition-colors"
-              >
-                Se déconnecter
-              </button>
-            </div>
-          </div>
-        </header>
-
-        <main className="flex-1 overflow-y-auto">
-          <div className="px-3 sm:px-6 lg:px-8 py-4 lg:py-6">
-            <div className="max-w-6xl mx-auto space-y-4">{children}</div>
-          </div>
-        </main>
-      </div>
-
-      {/* MENU MOBILE (DRAWER) */}
-      <div
-        className={`fixed inset-0 z-40 md:hidden transition ${
-          sidebarOpen ? "pointer-events-auto" : "pointer-events-none"
-        }`}
-      >
-        <div
-          className={`absolute inset-0 bg-black/50 transition-opacity ${
-            sidebarOpen ? "opacity-100" : "opacity-0"
-          }`}
-          onClick={() => setSidebarOpen(false)}
-        />
-
-        <div
-          className={`absolute left-0 top-0 h-full w-64 bg-[var(--bg)] border-r border-[var(--border)] shadow-xl transform transition-transform ${
-            sidebarOpen ? "translate-x-0" : "-translate-x-full"
-          }`}
-        >
-          <div className="flex items-center justify-between px-3 py-3 border-b border-[var(--border)]/80">
-            <div className="flex items-center gap-2">
-              <div className="menu-icon1">
-                <div className="menu-icon1_line-top"></div>
-                <div className="menu-icon1_line-middle">
-                  <div className="menu-icon1_line-middle-inner"></div>
-                </div>
-                <div className="menu-icon1_line-bottom"></div>
-              </div>
-              <div className="flex flex-col">
-                <span className="text-xs font-semibold">Menu</span>
-                <span className="text-[10px] text-[var(--muted)]">
-                  Navigation
-                </span>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => setSidebarOpen(false)}
-              className="text-[11px] rounded-full border border-[var(--border)] px-2 py-1 hover:bg-[var(--bg-soft)]"
-            >
-              ✕
-            </button>
-          </div>
-
-          <nav className="px-2 py-3 flex flex-col gap-1 text-[13px] overflow-y-auto">
-            {navLinks.map((link) => {
-              const active =
-                pathname === link.href ||
-                pathname.startsWith(link.href + "/");
-              return (
-                <Link
-                  key={link.href}
-                  href={link.href}
-                  className={[
-                    "flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors border border-transparent",
-                    active
-                      ? "bg-[var(--bg)] text-[var(--ink)] border-[var(--brand)]/60"
-                      : "text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)]",
-                  ].join(" ")}
-                >
-                  <span className="w-5 text-center text-[13px]">
-                    {link.icon}
-                  </span>
-                  <span>{link.label}</span>
-                </Link>
-              );
-            })}
-          </nav>
-
-          <div className="border-t border-[var(--border)]/70 px-3 py-3 text-[11px] space-y-2">
-            {/* Badge crédits aussi dans le menu mobile */}
-            {CreditsBadge}
-
-            {user?.email && (
-              <p className="mb-1 text-[var(--muted)]">
-                Connecté·e :{" "}
-                <span className="font-medium text-[var(--ink)]">
-                  {user.email}
-                </span>
-              </p>
-            )}
-            <button
-              type="button"
-              onClick={handleLogout}
-              className="w-full text-[11px] rounded-full border border-[var(--border)] px-3 py-1.5 bg-[var(--bg)] hover:border-red-500 hover:text-red-300 transition-colors"
-            >
-              Se déconnecter
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-````
-
-## File: components/user/CreditsBadge.tsx
-````typescript
-"use client";
-
-import { useUserCredits } from "@/hooks/useUserCredits";
-
-export function CreditsBadge() {
-  const { credits, loading } = useUserCredits();
-
-  return (
-    <div className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--ink)]">
-      <span className="text-[13px]">⚡</span>
-      {loading ? (
-        <span className="opacity-70">Chargement…</span>
-      ) : (
-        <span>
-          <span className="font-semibold">{credits}</span> crédits
-        </span>
-      )}
-    </div>
-  );
-}
-````
-
-## File: components/ActivityTracker.tsx
-````typescript
-// components/ActivityTracker.tsx
-"use client";
-
-import { useEffect } from "react";
-import { useAuth } from "@/context/AuthContext";
-import { updateLastActive } from "@/lib/userTracking";
-
-/**
- * Composant invisible qui met à jour lastActiveAt
- * toutes les 60 secondes tant que l'utilisateur est connecté.
- * On en profite pour envoyer:
- *  - la page actuelle (path)
- *  - le device (iPhone / iPad / macOS / etc.)
- *  - l’IP + pays + ville (via userTracking)
- */
-export default function ActivityTracker() {
-  const { user } = useAuth();
-
-  useEffect(() => {
-    if (!user) return;
-
-    let cancelled = false;
-
-    const tick = () => {
-      if (!user || cancelled) return;
-
-      const path =
-        typeof window !== "undefined"
-          ? window.location.pathname + window.location.search
-          : undefined;
-
-      updateLastActive(user, {
-        path,
-        action: "heartbeat",
-      });
-    };
-
-    // première mise à jour immédiate
-    tick();
-    const id = setInterval(tick, 60_000); // toutes les 60 secondes
-
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [user]);
-
-  return null;
-}
-````
-
-## File: components/AOSProvider.tsx
-````typescript
-"use client";
-
-import { useEffect } from "react";
-import AOS from "aos";
-import "aos/dist/aos.css";
-
-export default function AOSProvider({ children }: { children: React.ReactNode }) {
-  useEffect(() => {
-    AOS.init({
-      duration: 1000, // durée des animations
-      once: true,     // n’anime qu’une seule fois
-      easing: "ease-out-cubic",
-      offset: 60
-    });
-  }, []);
-
-  return <>{children}</>;
-}
-````
-
-## File: components/BlockedOverlay.tsx
-````typescript
-// components/BlockedOverlay.tsx
-"use client";
-
-import { useAuth } from "@/context/AuthContext";
-import { useUserProfile } from "@/hooks/useUserProfile";
-
-/**
- * Affiche un overlay pleine page si le user est marqué "blocked" dans Firestore.
- * Résultat : impossible de cliquer / utiliser l'app.
- */
-export default function BlockedOverlay() {
-  const { user } = useAuth();
-  const { profile, loading } = useUserProfile();
-
-  // pas connecté ou encore en chargement -> pas d'overlay
-  if (!user || loading) return null;
-
-  if (!profile?.blocked) return null;
-
-  return (
-    <div className="fixed inset-0 z-[9999] bg-black/80 backdrop-blur-sm flex items-center justify-center px-4">
-      <div className="max-w-md w-full glass border border-red-500/40 rounded-2xl p-6 text-center">
-        <h2 className="text-lg font-semibold mb-2 text-red-100">
-          Accès bloqué
-        </h2>
-        <p className="text-xs text-[var(--muted)] mb-4">
-          Ton compte a été temporairement bloqué par l&apos;administration.
-          Tu ne peux plus utiliser l&apos;assistant tant que le blocage est
-          actif.
-        </p>
-        <p className="text-[11px] text-[var(--muted)] mb-4">
-          Si tu penses qu&apos;il s&apos;agit d&apos;une erreur, contacte le
-          support ou l&apos;administrateur.
-        </p>
-        <p className="text-[10px] text-[var(--muted)]/70">
-          ID utilisateur :{" "}
-          <span className="font-mono">
-            {profile.id.slice(0, 8)}…
-          </span>
-        </p>
-      </div>
-    </div>
-  );
-}
-````
-
-## File: components/BuyCreditsButtons.tsx
-````typescript
-// src/components/BuyCreditsButtons.tsx
-"use client";
-
-import { useState } from "react";
-
-type CreditPackId = "10" | "20" | "30";
-
-interface BuyCreditsButtonsProps {
-  user: {
-    id: string;
-    email: string;
-  };
-}
-
-export function BuyCreditsButtons({ user }: BuyCreditsButtonsProps) {
-  const [loadingPack, setLoadingPack] = useState<CreditPackId | null>(null);
-
-  const handleBuy = async (packId: CreditPackId) => {
-    try {
-      setLoadingPack(packId);
-
-      const res = await fetch("/api/polar/checkout", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          packId,
-          email: user.email,
-          userId: user.id,
-        }),
-      });
-
-      const data = await res.json();
-
-      if (!data.ok || !data.url) {
-        console.error("Erreur réponse API Polar:", data);
-        alert("Erreur lors de la création du paiement.");
-        return;
-      }
-
-      // Redirection vers la page de paiement Polar
-      window.location.href = data.url;
-    } catch (error) {
-      console.error("Erreur handleBuy:", error);
-      alert("Une erreur est survenue.");
-    } finally {
-      setLoadingPack(null);
-    }
-  };
-
-  const isLoading = (pack: CreditPackId) => loadingPack === pack;
-
-  return (
-    <div className="flex flex-col gap-3">
-      <button onClick={() => handleBuy("10")} disabled={isLoading("10")}>
-        {isLoading("10") ? "Redirection..." : "Acheter 10 crédits"}
-      </button>
-      <button onClick={() => handleBuy("20")} disabled={isLoading("20")}>
-        {isLoading("20") ? "Redirection..." : "Acheter 20 crédits"}
-      </button>
-      <button onClick={() => handleBuy("30")} disabled={isLoading("30")}>
-        {isLoading("30") ? "Redirection..." : "Acheter 30 crédits"}
-      </button>
     </div>
   );
 }
@@ -18036,747 +22305,9 @@ export default function InterviewChat() {
 }
 ````
 
-## File: components/LandingFeatures.tsx
-````typescript
-"use client";
-
-import { motion } from "framer-motion";
-
-const features = [
-  {
-    title: "CV IA optimisé",
-    desc: "Importe ton CV PDF, laisse Gemini en extraire le profil et génère un CV optimisé."
-  },
-  {
-    title: "Lettres sur-mesure",
-    desc: "Colle une offre, obtiens une lettre adaptée à ton profil et à l'entreprise ciblée."
-  },
-  {
-    title: "Suivi simplifié",
-    desc: "Garde une trace de toutes tes candidatures avec un tracker clair et visuel."
-  }
-];
-
-export default function LandingFeatures() {
-  return (
-    <section className="px-4 sm:px-8 pb-6">
-      <div className="max-w-6xl mx-auto grid gap-3 md:grid-cols-3">
-        {features.map((f, idx) => (
-          <motion.div
-            key={f.title}
-            initial={{ opacity: 0, y: 8 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, amount: 0.4 }}
-            transition={{ duration: 0.2, delay: idx * 0.05 }}
-            className="glass p-4 text-sm"
-          >
-            <h3 className="text-sm font-semibold mb-1">{f.title}</h3>
-            <p className="text-xs text-[var(--muted)]">{f.desc}</p>
-          </motion.div>
-        ))}
-      </div>
-    </section>
-  );
-}
-````
-
-## File: components/LandingHero.tsx
-````typescript
-"use client";
-
-import { motion } from "framer-motion";
-import Link from "next/link";
-
-export default function LandingHero() {
-  return (
-    <section className="px-4 sm:px-8 pt-8 pb-6">
-      <div className="max-w-6xl mx-auto flex flex-col gap-6 md:flex-row md:items-center">
-        <motion.div
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.25 }}
-          className="flex-1"
-        >
-          <p className="badge-muted mb-3">
-            <span className="w-1 h-1 rounded-full bg-emerald-400" />
-            <span>IA appliquée aux candidatures</span>
-          </p>
-          <h1 className="text-2xl sm:text-3xl md:text-4xl font-semibold leading-tight mb-3">
-            Ton bureau de candidature, piloté par l&apos;IA.
-          </h1>
-          <p className="text-sm sm:text-base text-[var(--muted)] max-w-xl mb-4">
-            Importe ton CV, génère des lettres de motivation ciblées, prépare ton pitch oral
-            et suis toutes tes candidatures depuis un seul espace, pensé pour les profils tech
-            et cybersécurité.
-          </p>
-          <div className="flex flex-wrap gap-2">
-            <Link href="/signup" className="btn-primary text-xs sm:text-sm">
-              Essayer gratuitement
-            </Link>
-            <Link href="/login" className="btn-secondary text-xs sm:text-sm">
-              Se connecter
-            </Link>
-          </div>
-        </motion.div>
-
-        <motion.div
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.25, delay: 0.05 }}
-          className="flex-1"
-        >
-          <div className="glass p-4 text-xs text-[var(--muted)]">
-            <p className="mb-2 text-[11px] uppercase tracking-[0.18em]">
-              Aperçu temps réel
-            </p>
-            <p>
-              Un tableau de bord unique pour ton CV, tes LM, ton pitch et ton suivi de
-              candidatures. Design inspiré de ton interface actuelle, en Next.js + Tailwind CSS
-              + Framer Motion.
-            </p>
-          </div>
-        </motion.div>
-      </div>
-    </section>
-  );
-}
-````
-
-## File: components/LandingStack.tsx
-````typescript
-"use client";
-
-import { motion } from "framer-motion";
-import Link from "next/link";
-
-export default function LandingStack() {
-  return (
-    <section className="px-4 sm:px-8 pb-10">
-      <div className="max-w-6xl mx-auto glass p-4 sm:p-5">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
-          <div>
-            <p className="badge-muted mb-1">
-              <span>Stack technique</span>
-            </p>
-            <h2 className="text-sm sm:text-base font-semibold">
-              Une stack moderne pour une expérience fluide
-            </h2>
-          </div>
-          <Link href="/tech" className="text-[11px] text-[var(--brand)] underline">
-            Voir les détails techniques
-          </Link>
-        </div>
-        <div className="grid gap-3 sm:grid-cols-3 text-xs sm:text-sm">
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true }}
-            transition={{ duration: 0.2 }}
-          >
-            <p className="font-semibold mb-1">Frontend · React / Next.js</p>
-            <p className="text-[var(--muted)]">
-              Framework JavaScript moderne pour construire une interface rapide,
-              SEO-friendly et bien routée.
-            </p>
-          </motion.div>
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true }}
-            transition={{ duration: 0.2, delay: 0.05 }}
-          >
-            <p className="font-semibold mb-1">Styling · Tailwind CSS</p>
-            <p className="text-[var(--muted)]">
-              Un framework utilitaire qui permet de décliner ton design sombre actuel
-              dans une grille cohérente et responsive.
-            </p>
-          </motion.div>
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true }}
-            transition={{ duration: 0.2, delay: 0.1 }}
-          >
-            <p className="font-semibold mb-1">Animations · Framer Motion</p>
-            <p className="text-[var(--muted)]">
-              Des transitions douces et maîtrisées pour donner vie aux cartes,
-              modales et panneaux comme dans ton design original.
-            </p>
-          </motion.div>
-        </div>
-      </div>
-    </section>
-  );
-}
-````
-
-## File: components/PaymentHeader.jsx
-````javascript
-"use client";
-
-import { useEffect } from "react";
-
-export default function PaymentHeader({ onClose, autoCloseMs = 0 }) {
-  useEffect(() => {
-    if (!autoCloseMs) return;
-    const t = setTimeout(() => onClose?.(), autoCloseMs);
-    return () => clearTimeout(t);
-  }, [autoCloseMs, onClose]);
-
-  return (
-    <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)]/70 bg-[var(--bg-soft)]/80">
-      <div className="flex flex-col">
-        <span className="text-[12px] font-semibold text-[var(--ink)]">
-          Paiement sécurisé
-        </span>
-        <span className="text-[11px] text-[var(--muted)]">
-          Transaction gérée par Polar (Stripe)
-        </span>
-      </div>
-
-      <button
-        type="button"
-        onClick={onClose}
-        className="text-[11px] rounded-full border border-[var(--border)] px-2 py-1 hover:bg-[var(--bg)]"
-        aria-label="Fermer"
-      >
-        ✕
-      </button>
-    </div>
-  );
-}
-````
-
-## File: components/PolarCheckoutModal.jsx
-````javascript
-"use client";
-
-import { useEffect } from "react";
-import PaymentHeader from "./PaymentHeader";
-
-export default function PolarCheckoutModal({ open, url, onClose, onDone }) {
-  useEffect(() => {
-    if (!open) return;
-
-    function handleMessage(e) {
-      // On accepte uniquement les messages venant de NOTRE domaine
-      if (e.origin !== window.location.origin) return;
-
-      const data = e.data;
-      if (!data || typeof data !== "object") return;
-      if (data.type !== "POLAR_CHECKOUT_DONE") return;
-
-      onDone?.(data.status);
-      onClose?.();
-    }
-
-    window.addEventListener("message", handleMessage);
-    return () => window.removeEventListener("message", handleMessage);
-  }, [open, onClose, onDone]);
-
-  if (!open) return null;
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="w-full max-w-3xl overflow-hidden rounded-2xl bg-white shadow-xl">
-        <PaymentHeader onClose={onClose} />
-
-        <div className="h-[80vh] bg-white">
-          {url ? (
-            <iframe
-              title="Polar checkout"
-              src={url}
-              className="h-full w-full"
-              allow="payment *"
-            />
-          ) : (
-            <div className="p-4 text-sm">Chargement…</div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-````
-
-## File: components/SidebarUser.tsx
-````typescript
-"use client";
-
-import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { useState } from "react";
-
-type AppLink = {
-  href: string;
-  label: string;
-  icon?: string;
-};
-
-// Liens principaux
-const MAIN_LINKS: AppLink[] = [
-  { href: "/app", label: "Profil CV IA", icon: "📄" },
-  { href: "/app/lm", label: "Assistant candidature", icon: "✨" },
-  { href: "/app/tracker", label: "Suivi candidatures", icon: "📊" },
-  { href: "/app/interview", label: "Préparer entretien", icon: "🎤" },
-  { href: "/app/apply", label: "Postuler", icon: "📨" },
-  { href: "/app/history", label: "Historique IA", icon: "🕒" },
-  { href: "/app/credits", label: "Crédits", icon: "⚡" },
-];
-
-const SETTINGS_LINK: AppLink = {
-  href: "/app/settings",
-  label: "Paramètres",
-  icon: "⚙️",
-};
-
-export default function SidebarUser() {
-  const pathname = usePathname();
-
-  // Desktop collapse
-  const [collapsed, setCollapsed] = useState(false);
-
-  // Mobile sidebar
-  const [mobileOpen, setMobileOpen] = useState(false);
-
-  const baseItem =
-    "flex items-center gap-2 rounded-lg px-2 py-1.5 text-[11px] transition-colors";
-
-  const isLinkActive = (href: string) =>
-    pathname === href || pathname.startsWith(href + "/");
-
-  return (
-    <>
-      {/* === BOUTON HAMBURGER MOBILE === */}
-      <button
-        className="menu-icon1 md:hidden fixed top-3 left-3 z-50"
-        onClick={() => setMobileOpen((o) => !o)}
-      >
-        <div className="menu-icon1_line-top"></div>
-        <div className="menu-icon1_line-middle">
-          <div className="menu-icon1_line-middle-inner"></div>
-        </div>
-        <div className="menu-icon1_line-bottom"></div>
-      </button>
-
-      {/* === OVERLAY MOBILE (clic pour fermer) === */}
-      {mobileOpen && (
-        <div
-          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40 md:hidden"
-          onClick={() => setMobileOpen(false)}
-        ></div>
-      )}
-
-      {/* === SIDEBAR === */}
-      <aside
-        className={`
-          bg-[var(--bg-soft)]
-          border-r border-[var(--border)]/80
-          h-screen
-          flex flex-col
-          sticky top-0
-          z-50
-          transition-all duration-300
-
-          md:w-[210px] md:relative md:translate-x-0
-          ${collapsed ? "md:w-[60px]" : "md:w-[210px]"}
-          
-          /* Mobile offcanvas */
-          fixed top-0 left-0 w-[230px]
-          md:static
-          ${mobileOpen ? "translate-x-0" : "-translate-x-full"}
-        `}
-      >
-        {/* Header Desktop (bouton collapse) */}
-        <div className="hidden md:flex items-center justify-start px-2 py-3 border-b border-[var(--border)]/70">
-          <button
-            type="button"
-            onClick={() => setCollapsed((c) => !c)}
-            aria-label={collapsed ? "Déplier navigation" : "Replier navigation"}
-            className="menu-icon1 inline-flex items-center justify-center w-7 h-7 rounded-lg border border-[var(--border)] bg-[var(--bg)] text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)] text-[11px]"
-          >
-            {collapsed ? "»" : "«"}
-          </button>
-        </div>
-
-        {/* Mobile : petit espace en haut */}
-        <div className="md:hidden h-[60px]"></div>
-
-        {/* Liens */}
-        <nav className="flex-1 px-2 py-3 flex flex-col gap-1 overflow-y-auto">
-          {MAIN_LINKS.map((link) => {
-            const active = isLinkActive(link.href);
-            return (
-              <Link
-                key={link.href}
-                href={link.href}
-                onClick={() => setMobileOpen(false)} // fermer sidebar mobile
-                className={
-                  active
-                    ? `${baseItem} bg-[var(--bg)] text-[var(--ink)] border border-[var(--brand)]/60`
-                    : `${baseItem} text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg)]`
-                }
-              >
-                <span className="w-5 text-center text-[12px]">
-                  {link.icon ?? "•"}
-                </span>
-                {!collapsed && <span>{link.label}</span>}
-              </Link>
-            );
-          })}
-        </nav>
-
-        {/* Paramètres */}
-        <div className="px-2 py-3 border-t border-[var(--border)]/70">
-          <Link
-            href={SETTINGS_LINK.href}
-            onClick={() => setMobileOpen(false)}
-            className={
-              isLinkActive(SETTINGS_LINK.href)
-                ? `${baseItem} bg-[var(--bg)] text-[var(--ink)] border border-[var(--brand)]/60`
-                : `${baseItem} text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg)]`
-            }
-          >
-            <span className="w-5 text-center text-[12px]">
-              {SETTINGS_LINK.icon}
-            </span>
-            {!collapsed && <span>{SETTINGS_LINK.label}</span>}
-          </Link>
-        </div>
-      </aside>
-    </>
-  );
-}
-````
-
-## File: components/TopbarUser.tsx
-````typescript
-"use client";
-
-import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useAuth } from "@/context/AuthContext";
-
-export default function TopbarUser() {
-  const router = useRouter();
-  const { user, logout } = useAuth();
-
-  const handleLogout = async () => {
-    try {
-      await logout(); // ou ton signOut(auth) dans le contexte
-      router.push("/login");
-    } catch (err) {
-      console.error("Erreur déconnexion :", err);
-    }
-  };
-
-  // On privilégie le displayName (Prénom Nom)
-  const displayName =
-    user?.displayName ||
-    (user?.email ? user.email.split("@")[0] : "Utilisateur");
-
-  return (
-    <header className="sticky top-0 z-30 bg-[var(--bg)]/90 backdrop-blur-xl border-b border-[var(--border)]/70">
-      <div className="max-w-6xl mx-auto px-4 sm:px-8 h-14 flex items-center justify-between gap-4">
-        {/* Logo + mini titre à gauche */}
-        <Link href="/app" className="flex items-center gap-2 shrink-0">
-          <div className="w-8 h-8 rounded-2xl bg-gradient-to-br from-[var(--brand)] to-[var(--brandDark)] shadow-lg shadow-[var(--brand)]/30 flex items-center justify-center text-[11px] font-semibold">
-            AI
-          </div>
-          <div className="hidden sm:flex flex-col leading-tight">
-            <span className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)]">
-              Assistant candidatures
-            </span>
-            <span className="text-xs font-medium">Espace connecté</span>
-          </div>
-        </Link>
-
-        {/* À droite : connecté en tant que + bouton déconnexion */}
-        <div className="flex items-center gap-3 ml-auto">
-          {user && (
-            <div className="flex flex-col items-end leading-tight text-[10px] sm:text-[11px]">
-              <span className="text-[var(--muted)] hidden sm:inline">
-                Connecté·e en tant que
-              </span>
-              <span className="text-[var(--ink)] font-medium max-w-[160px] truncate">
-                {displayName}
-              </span>
-            </div>
-          )}
-
-          <button
-            type="button"
-            onClick={handleLogout}
-            className="inline-flex items-center justify-center text-[11px] sm:text-[12px] px-3 py-1.5 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] hover:bg-[var(--bg)] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
-          >
-            Se déconnecter
-          </button>
-        </div>
-      </div>
-    </header>
-  );
-}
-````
-
-## File: context/AuthContext.tsx
-````typescript
-"use client";
-
-import {
-  createContext,
-  useContext,
-  useEffect,
-  useState,
-  type ReactNode,
-} from "react";
-import {
-  onIdTokenChanged,
-  signOut,
-  type User,
-  getIdTokenResult,
-} from "firebase/auth";
-import { auth, db } from "@/lib/firebase";
-import { doc, getDoc } from "firebase/firestore";
-
-type AuthContextType = {
-  user: User | null;
-  loading: boolean;
-  isAdmin: boolean;
-  blocked: boolean;
-  logout: () => Promise<void>;
-};
-
-const AuthContext = createContext<AuthContextType>({
-  user: null,
-  loading: true,
-  isAdmin: false,
-  blocked: false,
-  logout: async () => {},
-});
-
-export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [isAdmin, setIsAdmin] = useState(false);
-  const [blocked, setBlocked] = useState(false);
-
-  useEffect(() => {
-    const unsub = onIdTokenChanged(auth, async (firebaseUser) => {
-      setLoading(true);
-
-      // Déconnecté
-      if (!firebaseUser) {
-        setUser(null);
-        setIsAdmin(false);
-        // IMPORTANT: on ne force pas blocked=false ici,
-        // comme ça si un compte vient d’être rejeté car bloqué,
-        // la page /login peut garder le message.
-        setLoading(false);
-        return;
-      }
-
-      // 1) ✅ Vérif Firestore AVANT d’exposer user
-      try {
-        const ref = doc(db, "users", firebaseUser.uid);
-        const snap = await getDoc(ref);
-        const data = snap.data() as any | undefined;
-
-        if (data?.blocked) {
-          // 🔒 Compte bloqué : on rejette la session AVANT toute redirection / rendu /app
-          setBlocked(true);
-          setUser(null);
-          setIsAdmin(false);
-          setLoading(false);
-
-          try {
-            await signOut(auth);
-          } catch (e) {
-            console.error("Erreur signOut (blocked):", e);
-          }
-          return;
-        }
-
-        // Compte OK → on reset blocked
-        setBlocked(false);
-      } catch (e) {
-        // 🔐 Par sécurité + pour éviter le flash,
-        // si la vérif Firestore plante, on refuse la session.
-        console.error("Erreur vérification blocked:", e);
-
-        setBlocked(true);
-        setUser(null);
-        setIsAdmin(false);
-        setLoading(false);
-
-        try {
-          await signOut(auth);
-        } catch (err) {
-          console.error("Erreur signOut (firestore check failed):", err);
-        }
-        return;
-      }
-
-      // 2) ✅ Admin claims (après validation blocked)
-      try {
-        const tokenResult = await getIdTokenResult(firebaseUser, true);
-        const claims = tokenResult.claims || {};
-        const adminFlag =
-          claims.isAdmin === true || claims.email === "aakane0105@gmail.com";
-        setIsAdmin(adminFlag);
-      } catch (e) {
-        console.error("Erreur récupération des custom claims:", e);
-        setIsAdmin(false);
-      }
-
-      // 3) ✅ On expose user seulement maintenant
-      setUser(firebaseUser);
-      setLoading(false);
-    });
-
-    return () => unsub();
-  }, []);
-
-  const logout = async () => {
-    // logout volontaire => on efface le statut blocked UI
-    setBlocked(false);
-    await signOut(auth);
-  };
-
-  return (
-    <AuthContext.Provider value={{ user, loading, isAdmin, blocked, logout }}>
-      {children}
-    </AuthContext.Provider>
-  );
-}
-
-export function useAuth() {
-  return useContext(AuthContext);
-}
-````
-
-## File: context/CreditsContext.tsx
-````typescript
-"use client";
-
-import { createContext, useContext, useEffect, useState } from "react";
-import { useAuth } from "@/context/AuthContext";
-// TODO: brancher Firestore pour écouter les crédits en temps réel
-
-interface CreditsContextValue {
-  credits: number | null;
-}
-
-const CreditsContext = createContext<CreditsContextValue>({
-  credits: null
-});
-
-export function CreditsProvider({ children }: { children: React.ReactNode }) {
-  const { user } = useAuth();
-  const [credits, setCredits] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (!user) {
-      setCredits(null);
-      return;
-    }
-    // TODO: écouter doc Firestore "users/{uid}" et lire le champ credits
-  }, [user]);
-
-  return (
-    <CreditsContext.Provider value={{ credits }}>
-      {children}
-    </CreditsContext.Provider>
-  );
-}
-
-export const useCredits = () => useContext(CreditsContext);
-````
-
-## File: context/LangContext.tsx
-````typescript
-"use client";
-
-import { createContext, useContext, useEffect, useState } from "react";
-
-type LangCode =
-  | "fr"
-  | "en"
-  | "es"
-  | "de"
-  | "pt"
-  | "it"
-  | "ru"
-  | "zh"
-  | "ar"
-  | "ja";
-
-type LangContextValue = {
-  lang: LangCode;
-  setLang: (l: LangCode) => void;
-};
-
-const LangContext = createContext<LangContextValue | undefined>(undefined);
-
-export function LangProvider({ children }: { children: React.ReactNode }) {
-  const [lang, setLangState] = useState<LangCode>("fr");
-
-  useEffect(() => {
-    // 1) récupérer la langue du localStorage si dispo
-    const stored = typeof window !== "undefined"
-      ? (localStorage.getItem("lang") as LangCode | null)
-      : null;
-    if (stored) {
-      setLangState(stored);
-      return;
-    }
-
-    // 2) sinon essayer de détecter la langue du navigateur
-    if (typeof window !== "undefined") {
-      const navLang = window.navigator.language.slice(0, 2).toLowerCase();
-      const supported: LangCode[] = [
-        "fr",
-        "en",
-        "es",
-        "de",
-        "pt",
-        "it",
-        "ru",
-        "zh",
-        "ar",
-        "ja",
-      ];
-      if (supported.includes(navLang as LangCode)) {
-        setLangState(navLang as LangCode);
-        localStorage.setItem("lang", navLang);
-      }
-    }
-  }, []);
-
-  const setLang = (l: LangCode) => {
-    setLangState(l);
-    if (typeof window !== "undefined") {
-      localStorage.setItem("lang", l);
-    }
-  };
-
-  return (
-    <LangContext.Provider value={{ lang, setLang }}>
-      {children}
-    </LangContext.Provider>
-  );
-}
-
-export function useLang() {
-  const ctx = useContext(LangContext);
-  if (!ctx) {
-    throw new Error("useLang must be used inside LangProvider");
-  }
-  return ctx;
-}
-````
-
 ## File: functions/index.js
 ````javascript
+// functions/index.js
 "use strict";
 
 /**
@@ -18794,7 +22325,7 @@ const admin = require("firebase-admin");
 const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
 const JSZip = require("jszip");
 const { Polar } = require("@polar-sh/sdk");
-const { validateEvent, WebhookVerificationError } = require("@polar-sh/sdk/webhooks");
+// const { validateEvent, WebhookVerificationError } = require("@polar-sh/sdk/webhooks"); // (signature optionnelle)
 const { RecaptchaEnterpriseServiceClient } = require("@google-cloud/recaptcha-enterprise");
 
 // Initialisation Firebase Admin (pour Firestore + auth + callable)
@@ -19014,6 +22545,113 @@ function setCors(req, res) {
     "Access-Control-Allow-Headers",
     "Content-Type, Authorization, Polar-Signature, polar-signature, X-Recaptcha-Token, x-recaptcha-token"
   );
+}
+
+// =============================
+//  ✅ AUTH + CREDITS (serveur) : débit crédits + logs
+// =============================
+function getBearerToken(req) {
+  const h = req.headers["authorization"] || req.headers["Authorization"] || "";
+  const s = typeof h === "string" ? h : Array.isArray(h) ? h[0] : "";
+  if (!s) return "";
+  if (s.startsWith("Bearer ")) return s.slice(7).trim();
+  return "";
+}
+
+async function requireFirebaseUser(req) {
+  const token = getBearerToken(req);
+  if (!token) {
+    const err = new Error("MISSING_AUTH");
+    err.code = "MISSING_AUTH";
+    throw err;
+  }
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    return { uid: decoded.uid, email: decoded.email || "" };
+  } catch (e) {
+    const err = new Error("INVALID_AUTH");
+    err.code = "INVALID_AUTH";
+    throw err;
+  }
+}
+
+function getReqPath(req) {
+  try {
+    return (req.originalUrl || req.path || "") + "";
+  } catch {
+    return "";
+  }
+}
+
+async function debitCreditsAndLog({
+  uid,
+  email,
+  cost,
+  tool,
+  docType,
+  docsGenerated,
+  cvGenerated,
+  lmGenerated,
+  req,
+  meta,
+}) {
+  const userRef = db.collection("users").doc(uid);
+  const usageRef = db.collection("usageLogs").doc();
+  const now = Date.now();
+  const ip = getClientIp(req);
+  const userAgent = String(req.headers["user-agent"] || "");
+  const path = getReqPath(req);
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const data = snap.exists ? snap.data() || {} : {};
+    const currentCredits = typeof data.credits === "number" ? data.credits : 0;
+
+    if (currentCredits < cost) {
+      const err = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      throw err;
+    }
+
+    const updates = {
+      credits: currentCredits - cost,
+      totalIaCalls: admin.firestore.FieldValue.increment(1),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    // documents
+    if (docsGenerated && docsGenerated > 0) {
+      updates.totalDocumentsGenerated = admin.firestore.FieldValue.increment(docsGenerated);
+    }
+    if (cvGenerated && cvGenerated > 0) {
+      updates.totalCvGenerated = admin.firestore.FieldValue.increment(cvGenerated);
+    }
+    if (lmGenerated && lmGenerated > 0) {
+      updates.totalLmGenerated = admin.firestore.FieldValue.increment(lmGenerated);
+    }
+
+    tx.set(userRef, updates, { merge: true });
+
+    tx.set(
+      usageRef,
+      {
+        userId: uid,
+        email: email || "",
+        action: "generate_document",
+        docType: docType || "other",
+        eventType: "generate",
+        tool: tool || null,
+        creditsDelta: -cost,
+        meta: meta || null,
+        path: path || null,
+        createdAt: now, // number (ms)
+        createdAtServer: admin.firestore.FieldValue.serverTimestamp(),
+        ip: ip || null,
+        userAgent: userAgent || null,
+      },
+      { merge: true }
+    );
+  });
 }
 
 // =============================
@@ -20039,7 +23677,7 @@ async function createLetterPdf(coverLetter, meta) {
 }
 
 // =============================
-//  HTTPS: generateLetterAndPitch
+//  HTTPS: generateLetterAndPitch  ✅ (débit crédits -1)
 // =============================
 function buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang) {
   const p = profile || {};
@@ -20103,6 +23741,16 @@ exports.generateLetterAndPitch = functions
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_letter_pitch");
     if (deny) return;
 
+    // ✅ Auth obligatoire + débit crédits
+    let authUser = null;
+    try {
+      authUser = await requireFirebaseUser(req);
+    } catch (e) {
+      const code = e?.code || e?.message;
+      if (code === "MISSING_AUTH") return res.status(401).json({ error: "unauthenticated" });
+      return res.status(401).json({ error: "invalid_auth" });
+    }
+
     try {
       const body = req.body || {};
       const profile = body.profile;
@@ -20117,6 +23765,28 @@ exports.generateLetterAndPitch = functions
         return res.status(400).json({
           error: "Ajoute au moins l'intitulé du poste ou un extrait de la description.",
         });
+
+      // ✅ Débit -1 crédit (LM)
+      try {
+        await debitCreditsAndLog({
+          uid: authUser.uid,
+          email: authUser.email,
+          cost: 1,
+          tool: "generateLetterAndPitch",
+          docType: "lm",
+          docsGenerated: 1,
+          cvGenerated: 0,
+          lmGenerated: 1,
+          req,
+          meta: { jobTitle, companyName, lang },
+        });
+      } catch (e) {
+        if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
+          return res.status(402).json({ error: "NO_CREDITS" });
+        }
+        console.error("Débit crédits (LM) error:", e);
+        return res.status(500).json({ error: "credits_error" });
+      }
 
       const GEMINI_API_KEY =
         process.env.GEMINI_API_KEY || (functions.config().gemini && functions.config().gemini.key);
@@ -20371,7 +24041,7 @@ ${cvText}`;
   });
 
 // =============================
-//  HTTPS: generateCvPdf
+//  HTTPS: generateCvPdf ✅ (débit crédits -1)
 // =============================
 exports.generateCvPdf = functions
   .region("europe-west1")
@@ -20387,6 +24057,16 @@ exports.generateCvPdf = functions
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_cv_pdf");
     if (deny) return;
 
+    // ✅ Auth obligatoire + débit crédits
+    let authUser = null;
+    try {
+      authUser = await requireFirebaseUser(req);
+    } catch (e) {
+      const code = e?.code || e?.message;
+      if (code === "MISSING_AUTH") return res.status(401).json({ error: "unauthenticated" });
+      return res.status(401).json({ error: "invalid_auth" });
+    }
+
     try {
       const body = req.body || {};
       const profile = body.profile;
@@ -20398,6 +24078,28 @@ exports.generateCvPdf = functions
       const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
 
       if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
+
+      // ✅ Débit -1 crédit (CV)
+      try {
+        await debitCreditsAndLog({
+          uid: authUser.uid,
+          email: authUser.email,
+          cost: 1,
+          tool: "generateCvPdf",
+          docType: "cv",
+          docsGenerated: 1,
+          cvGenerated: 1,
+          lmGenerated: 0,
+          req,
+          meta: { targetJob, lang },
+        });
+      } catch (e) {
+        if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
+          return res.status(402).json({ error: "NO_CREDITS" });
+        }
+        console.error("Débit crédits (CV) error:", e);
+        return res.status(500).json({ error: "credits_error" });
+      }
 
       const pdfBuffer = await createSimpleCvPdf(profile, {
         targetJob,
@@ -20417,7 +24119,7 @@ exports.generateCvPdf = functions
   });
 
 // =============================
-//  HTTPS: generateCvLmZip
+//  HTTPS: generateCvLmZip ✅ (débit crédits -2)
 // =============================
 exports.generateCvLmZip = functions
   .region("europe-west1")
@@ -20432,6 +24134,16 @@ exports.generateCvLmZip = functions
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_cv_lm_zip");
     if (deny) return;
 
+    // ✅ Auth obligatoire + débit crédits
+    let authUser = null;
+    try {
+      authUser = await requireFirebaseUser(req);
+    } catch (e) {
+      const code = e?.code || e?.message;
+      if (code === "MISSING_AUTH") return res.status(401).json({ error: "unauthenticated" });
+      return res.status(401).json({ error: "invalid_auth" });
+    }
+
     try {
       const body = req.body || {};
       const profile = body.profile;
@@ -20445,6 +24157,28 @@ exports.generateCvLmZip = functions
       const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
 
       if (!profile) return res.status(400).json({ error: "Champ 'profile' manquant." });
+
+      // ✅ Débit -2 crédits (ZIP = CV + LM)
+      try {
+        await debitCreditsAndLog({
+          uid: authUser.uid,
+          email: authUser.email,
+          cost: 2,
+          tool: "generateCvLmZip",
+          docType: "other",
+          docsGenerated: 2,
+          cvGenerated: 1,
+          lmGenerated: 1,
+          req,
+          meta: { targetJob, lang },
+        });
+      } catch (e) {
+        if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
+          return res.status(402).json({ error: "NO_CREDITS" });
+        }
+        console.error("Débit crédits (ZIP) error:", e);
+        return res.status(500).json({ error: "credits_error" });
+      }
 
       const cvBuffer = await createSimpleCvPdf(profile, {
         targetJob,
@@ -20562,6 +24296,7 @@ RÈGLES :
 
 // =============================
 //  HTTPS: generateLetterPdf
+//  (pas de débit ici : sinon double facturation avec generateLetterAndPitch)
 // =============================
 exports.generateLetterPdf = functions
   .region("europe-west1")
@@ -21050,6 +24785,35 @@ exports.polarWebhook = functions
           });
         }
 
+        // ✅ NOUVEAU : Historique des recharges
+        const rechargeId = orderId ? String(orderId) : `${event.type}_${Date.now()}`;
+        const rechargeRef = db
+          .collection("users")
+          .doc(userId)
+          .collection("rechargeHistory")
+          .doc(rechargeId);
+
+        tx.set(
+          rechargeRef,
+          {
+            provider: "polar",
+            orderId: orderId ? String(orderId) : null,
+            checkoutId: deepFindByKey(data, ["checkout_id", "checkoutId"]) || null,
+
+            creditsAdded: creditsToAdd,
+            productIds,
+            priceIds,
+
+            amount: deepFindByKey(data, ["amount", "price_amount", "total_amount"]) || null,
+            currency: deepFindByKey(data, ["currency", "price_currency"]) || null,
+            status: deepFindByKey(data, ["status", "payment_status"]) || null,
+
+            eventType: event.type,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
         console.log(`Crédits ajoutés: +${creditsToAdd} (total=${newCredits}) userId=${userId}`);
       });
 
@@ -21079,7 +24843,7 @@ exports.polarWebhook = functions
     "busboy": "^1.6.0",
     "cors": "^2.8.5",
     "firebase-admin": "^12.7.0",
-    "firebase-functions": "^5.0.0",
+    "firebase-functions": "^5.1.1",
     "jszip": "^3.10.1",
     "node-fetch": "^3.3.2",
     "nodemailer": "^7.0.10",
@@ -21088,459 +24852,6 @@ exports.polarWebhook = functions
     "pdfjs-dist": "^5.4.394",
     "pdfmake": "^0.2.21"
   }
-}
-````
-
-## File: hooks/useAdminGuard.ts
-````typescript
-// src/hooks/useAdminGuard.ts
-"use client";
-
-import { useEffect } from "react";
-import { useRouter, usePathname } from "next/navigation";
-import type { User } from "firebase/auth";
-import { useAuth } from "@/context/AuthContext";
-
-// 👉 Emails qui sont admin "hardcodés" en plus du custom claim isAdmin
-const ADMIN_EMAILS = ["aakane0105@gmail.com"];
-
-export type UseAdminGuardResult = {
-  loading: boolean;
-  isAdmin: boolean;
-  user: User | null;
-};
-
-export function useAdminGuard(): UseAdminGuardResult {
-  const { user, loading, isAdmin: isAdminFromContext } = useAuth();
-  const router = useRouter();
-  const pathname = usePathname();
-
-  // fallback : si jamais le claim n'est pas encore set, mais que l'email est dans la whitelist
-  const email = (user?.email || "").toLowerCase();
-  const hasAdminEmail = ADMIN_EMAILS.includes(email);
-
-  const isAdmin = isAdminFromContext || hasAdminEmail;
-
-  useEffect(() => {
-    if (loading) return;
-
-    const onAdminRoute = pathname?.startsWith("/admin");
-
-    // Pas connecté et route /admin → renvoie vers /admin/login
-    if (!user && onAdminRoute) {
-      router.push("/admin/login");
-      return;
-    }
-
-    // Connecté mais pas admin et route /admin (hors /admin/login) → renvoie vers /
-    if (
-      user &&
-      !isAdmin &&
-      onAdminRoute &&
-      pathname !== "/admin/login"
-    ) {
-      router.push("/");
-    }
-  }, [user, loading, isAdmin, pathname, router]);
-
-  return { loading, isAdmin, user };
-}
-````
-
-## File: hooks/useUserCredits.ts
-````typescript
-"use client";
-
-import { useEffect, useState } from "react";
-import { doc, onSnapshot } from "firebase/firestore";
-import { db } from "@/lib/firebase";
-import { useAuth } from "@/context/AuthContext";
-
-type CreditsState = {
-  credits: number;
-  loading: boolean;
-  error: string | null;
-};
-
-export function useUserCredits(): CreditsState {
-  const { user } = useAuth();
-  const [credits, setCredits] = useState<number>(0);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    // reset à chaque changement d'user
-    setError(null);
-
-    if (!user?.uid) {
-      setCredits(0);
-      setLoading(false);
-      return;
-    }
-
-    setLoading(true);
-
-    const ref = doc(db, "users", user.uid);
-
-    const unsub = onSnapshot(
-      ref,
-      (snap) => {
-        const data = snap.exists() ? (snap.data() as any) : {};
-        const value = typeof data?.credits === "number" ? data.credits : 0;
-
-        setCredits(value);
-        setLoading(false);
-      },
-      (err) => {
-        console.error("Erreur Firestore (credits):", err);
-        setError("Impossible de charger les crédits.");
-        setLoading(false);
-      }
-    );
-
-    return () => unsub();
-  }, [user?.uid]);
-
-  return { credits, loading, error };
-}
-````
-
-## File: hooks/useUserProfile.ts
-````typescript
-"use client";
-
-import { useEffect, useState } from "react";
-import { doc, onSnapshot } from "firebase/firestore";
-import { db } from "@/lib/firebase";
-import { useAuth } from "@/context/AuthContext";
-
-export interface UserProfile {
-  id: string;
-  email?: string | null;
-  displayName?: string | null;
-  credits?: number;
-  blocked?: boolean;
-  ip?: string | null;
-  city?: string | null;
-  country?: string | null;
-  emailVerified?: boolean;
-  lastLoginAt?: Date | null;
-  lastActiveAt?: Date | null;
-}
-
-export function useUserProfile() {
-  const { user } = useAuth();
-  const [profile, setProfile] = useState<UserProfile | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    if (!user) {
-      setProfile(null);
-      setLoading(false);
-      return;
-    }
-
-    const ref = doc(db, "users", user.uid);
-
-    const unsub = onSnapshot(
-      ref,
-      (snap) => {
-        if (!snap.exists()) {
-          setProfile({
-            id: user.uid,
-            email: user.email ?? null,
-            displayName: user.displayName ?? null,
-          });
-          setLoading(false);
-          return;
-        }
-
-        const data = snap.data() as any;
-
-        const lastLoginAt =
-          data.lastLoginAt?.toDate?.() &&
-          typeof data.lastLoginAt.toDate === "function"
-            ? data.lastLoginAt.toDate()
-            : null;
-
-        const lastActiveAt =
-          data.lastActiveAt?.toDate?.() &&
-          typeof data.lastActiveAt.toDate === "function"
-            ? data.lastActiveAt.toDate()
-            : null;
-
-        const profile: UserProfile = {
-          id: snap.id,
-          email: data.email ?? user.email ?? null,
-          displayName: data.displayName ?? user.displayName ?? null,
-          credits:
-            typeof data.credits === "number"
-              ? data.credits
-              : data.credits
-              ? Number(data.credits)
-              : undefined,
-          blocked: data.blocked === true,
-          ip: data.ip ?? null,
-          city: data.city ?? null,
-          country: data.country ?? null,
-          emailVerified:
-            typeof data.emailVerified === "boolean"
-              ? data.emailVerified
-              : user.emailVerified ?? false,
-          lastLoginAt,
-          lastActiveAt,
-        };
-
-        setProfile(profile);
-        setLoading(false);
-      },
-      (error) => {
-        console.error("Erreur onSnapshot user profile:", error);
-        setProfile(null);
-        setLoading(false);
-      }
-    );
-
-    return () => unsub();
-  }, [user]);
-
-  return { profile, loading };
-}
-````
-
-## File: lib/server/credits.ts
-````typescript
-// lib/server/credits.ts
-//
-// VERSION DEV SANS FIRESTORE
-// --------------------------
-// On simule juste des crédits illimités pour tous les utilisateurs.
-// Ça évite les erreurs Firebase Admin en local.
-// Quand tu voudras brancher Firestore côté serveur, tu pourras
-// rétablir la logique avec firebase-admin ici.
-
-type DevUser = {
-  id: string;
-  credits: number;
-};
-
-export async function verifyUserAndCredits(
-  userId: string
-): Promise<DevUser | null> {
-  if (!userId) return null;
-
-  // En DEV : tous les users sont autorisés, avec beaucoup de crédits.
-  return {
-    id: userId,
-    credits: 9999,
-  };
-}
-
-export async function consumeCredit(
-  userId: string,
-  amount = 1
-): Promise<void> {
-  // En DEV : on ne fait rien, on log juste.
-  console.log(
-    `[DEV][credits] Consommation simulée de ${amount} crédit(s) pour l'utilisateur ${userId}`
-  );
-}
-````
-
-## File: lib/auth.ts
-````typescript
-"use client";
-
-import { auth } from "./firebase";
-import {
-  createUserWithEmailAndPassword,
-  signInWithEmailAndPassword,
-  signOut,
-  updateProfile,
-  sendEmailVerification,
-} from "firebase/auth";
-
-export async function signupWithEmail(
-  firstName: string,
-  lastName: string,
-  email: string,
-  password: string
-) {
-  const cred = await createUserWithEmailAndPassword(auth, email, password);
-
-  await updateProfile(cred.user, {
-    displayName: `${firstName} ${lastName}`.trim(),
-  });
-
-  // 👉 ICI : on laisse Firebase envoyer son email standard
-  await sendEmailVerification(cred.user);
-
-  return cred;
-}
-
-export async function loginWithEmail(email: string, password: string) {
-  return signInWithEmailAndPassword(auth, email, password);
-}
-
-export async function logout() {
-  return signOut(auth);
-}
-````
-
-## File: lib/credits.ts
-````typescript
-// src/lib/credits.ts
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  increment,
-  query,
-  setDoc,
-  updateDoc,
-  where,
-} from "firebase/firestore";
-import { db } from "@/lib/firebase";
-
-/**
- * Ajoute des crédits à un utilisateur identifié par son userId (document users/{userId}).
- */
-export async function addCreditsToUserById(
-  userId: string,
-  creditsToAdd: number
-): Promise<void> {
-  if (!userId) {
-    console.error("[credits] userId manquant");
-    return;
-  }
-  if (!creditsToAdd || creditsToAdd <= 0) {
-    console.warn("[credits] creditsToAdd <= 0, rien à ajouter", {
-      userId,
-      creditsToAdd,
-    });
-    return;
-  }
-
-  const ref = doc(db, "users", userId);
-  const snap = await getDoc(ref);
-
-  if (!snap.exists()) {
-    console.warn(
-      "[credits] Doc user inexistant, création avec crédits initiaux",
-      { userId, creditsToAdd }
-    );
-    await setDoc(ref, {
-      credits: creditsToAdd,
-      createdAt: new Date(),
-    });
-    return;
-  }
-
-  console.log("[credits] Ajout de crédits par userId", { userId, creditsToAdd });
-
-  await updateDoc(ref, {
-    credits: increment(creditsToAdd),
-  });
-}
-
-/**
- * Ajoute des crédits à (tous) les utilisateurs qui ont cet email.
- * Fallback si on n’a pas externalId dans l’event Polar.
- */
-export async function addCreditsToUserByEmail(
-  email: string,
-  creditsToAdd: number
-): Promise<void> {
-  if (!email) {
-    console.error("[credits] email manquant");
-    return;
-  }
-  if (!creditsToAdd || creditsToAdd <= 0) {
-    console.warn("[credits] creditsToAdd <= 0, rien à ajouter", {
-      email,
-      creditsToAdd,
-    });
-    return;
-  }
-
-  const usersCol = collection(db, "users");
-  const q = query(usersCol, where("email", "==", email));
-  const qs = await getDocs(q);
-
-  if (qs.empty) {
-    console.warn(
-      "[credits] Aucun user trouvé avec cet email, création impossible",
-      { email, creditsToAdd }
-    );
-    return;
-  }
-
-  console.log(
-    "[credits] Ajout de crédits par email (tous les users trouvés)",
-    { email, creditsToAdd, count: qs.size }
-  );
-
-  const promises: Promise<any>[] = [];
-  qs.forEach((docSnap) => {
-    promises.push(
-      updateDoc(docSnap.ref, {
-        credits: increment(creditsToAdd),
-      })
-    );
-  });
-
-  await Promise.all(promises);
-}
-
-/**
- * Consomme des crédits pour un utilisateur.
- *
- * Pour être flexible avec ton code existant, cette fonction accepte :
- *  - consumeCredits(userId, 3)
- *  - consumeCredits({ userId: "xxx", amount: 3 })
- *  - consumeCredits({ userId: "xxx", credits: 3 })
- */
-export async function consumeCredits(arg1: any, arg2?: any): Promise<void> {
-  let userId: string | undefined;
-  let toConsume = 0;
-
-  if (typeof arg1 === "string") {
-    userId = arg1;
-    toConsume = typeof arg2 === "number" ? arg2 : 0;
-  } else if (typeof arg1 === "object" && arg1 !== null) {
-    userId = arg1.userId || arg1.uid;
-    toConsume =
-      arg1.amount ?? arg1.credits ?? arg1.count ?? arg1.nb ?? 0;
-  }
-
-  if (!userId || !toConsume || toConsume <= 0) {
-    console.warn(
-      "[credits] consumeCredits appelé sans paramètres valides",
-      { arg1, arg2 }
-    );
-    return;
-  }
-
-  const ref = doc(db, "users", userId);
-  const snap = await getDoc(ref);
-
-  if (!snap.exists()) {
-    console.warn(
-      "[credits] user inexistant pour consumeCredits, aucun débit",
-      { userId }
-    );
-    return;
-  }
-
-  console.log("[credits] Consommation de crédits", {
-    userId,
-    toConsume,
-  });
-
-  await updateDoc(ref, {
-    credits: increment(-toConsume),
-  });
 }
 ````
 
@@ -21576,70 +24887,6 @@ export const functions = getFunctions(app, "europe-west1");
 // Provider Google (pour popup)
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
-````
-
-## File: lib/firebaseAdmin.ts
-````typescript
-// lib/firebaseAdmin.ts
-import admin from "firebase-admin";
-
-if (!admin.apps.length) {
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const rawPrivateKey = process.env.FIREBASE_PRIVATE_KEY;
-
-  if (projectId && clientEmail && rawPrivateKey) {
-    const privateKey = rawPrivateKey.replace(/\\n/g, "\n");
-    try {
-      admin.initializeApp({
-        credential: admin.credential.cert({
-          projectId,
-          clientEmail,
-          privateKey,
-        }),
-      });
-      console.log("[firebaseAdmin] Initialisé avec les variables d'env");
-    } catch (err) {
-      console.error("[firebaseAdmin] Erreur d'initialisation :", err);
-    }
-  } else {
-    console.warn(
-      "[firebaseAdmin] Variables d'env manquantes. Admin ne sera pas initialisé (OK en DEV)."
-    );
-  }
-}
-
-export default admin;
-````
-
-## File: lib/firestore.ts
-````typescript
-import { db } from "./firebase";
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  updateDoc,
-  addDoc,
-  query,
-  where
-} from "firebase/firestore";
-
-// Placeholders pour tes futures fonctions Firestore (users, candidatures, etc.)
-export {
-  db,
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  updateDoc,
-  addDoc,
-  query,
-  where
-};
 ````
 
 ## File: lib/gemini.ts
@@ -22009,702 +25256,6 @@ export async function callGenerateLetterPdf(params: {
 }
 ````
 
-## File: lib/interviewPrompt.ts
-````typescript
-// lib/interviewPrompt.ts
-
-// Canal de l'entretien : écrit (chat) ou oral (avec micro + TTS plus tard)
-export type InterviewChannel = "written" | "oral";
-
-// Niveau de difficulté / séniorité
-export type InterviewLevel = "junior" | "intermediate" | "senior";
-
-// Élément d'historique échangé pendant l'entretien
-export type HistoryItem = {
-  role: "interviewer" | "candidate";
-  text: string;
-  createdAt?: string; // <-- IMPORTANT pour ne plus avoir createdAt en rouge
-  analysis?: string | null;
-};
-
-export type BuildPromptArgs = {
-  cvSummary: string;
-  jobDesc: string;
-  mode: string; // "mixed" | "tech" | "rh" | "hard" etc.
-  level: InterviewLevel;
-  channel: InterviewChannel;
-  history: HistoryItem[];
-  step: number;
-};
-
-/**
- * Construit le prompt envoyé à Gemini pour générer :
- * - la prochaine question
- * - l'analyse rapide de la réponse précédente
- * - le résumé final + score quand l'IA estime avoir assez d'informations
- */
-export function buildPrompt({
-  cvSummary,
-  jobDesc,
-  mode,
-  level,
-  channel,
-  history,
-  step,
-}: BuildPromptArgs): string {
-  const historyText =
-    history.length === 0
-      ? "Aucun échange pour le moment (début d'entretien)."
-      : history
-          .map((h) => {
-            const who =
-              h.role === "interviewer" ? "INTERVIEWER" : "CANDIDAT";
-            return `- [${who}] ${h.text}`;
-          })
-          .join("\n");
-
-  let modeDescription = "";
-  switch (mode) {
-    case "tech":
-      modeDescription =
-        "Pose principalement des questions techniques (cloud, sécurité, réseau, etc.).";
-      break;
-    case "rh":
-      modeDescription =
-        "Pose surtout des questions RH, motivation, soft-skills, culture d'entreprise.";
-      break;
-    case "hard":
-      modeDescription =
-        "Sois très exigeant, avec des questions difficiles, de relance et de mise en situation.";
-      break;
-    default:
-      modeDescription =
-        "Mélange de questions techniques et RH/motivation.";
-  }
-
-  let levelDescription = "";
-  switch (level) {
-    case "junior":
-      levelDescription =
-        "Considère un profil plutôt junior : évalue le potentiel, la motivation et les bases techniques.";
-      break;
-    case "intermediate":
-      levelDescription =
-        "Considère un profil intermédiaire : quelques années d'expérience, autonomie moyenne.";
-      break;
-    case "senior":
-      levelDescription =
-        "Considère un profil senior : forte expertise, autonomie, leadership possible.";
-      break;
-  }
-
-  const channelDescription =
-    channel === "oral"
-      ? "Le candidat répond à l'oral. Les questions doivent être plutôt courtes, conversationnelles, comme dans un vrai échange vocal."
-      : "Le candidat répond à l'écrit via un chat. Tu peux poser des questions un peu plus détaillées mais reste concis.";
-
-  return `
-Tu joues le rôle d'un recruteur humain qui fait passer un entretien d'embauche en français.
-
-Contexte candidat (résumé de CV) :
-${cvSummary || "Non renseigné."}
-
-Contexte poste (fiche de poste / offre) :
-${jobDesc || "Non renseigné."}
-
-Mode d'entretien : ${mode}
-${modeDescription}
-
-Niveau d'entretien : ${level}
-${levelDescription}
-
-Canal : ${channel}
-${channelDescription}
-
-Étape actuelle de l'entretien : ${step}
-Historique des échanges (du plus ancien au plus récent) :
-${historyText}
-
-OBJECTIF :
-- Poser des questions pertinentes par rapport au poste et au profil.
-- Être honnête et exigeant sur la compatibilité avec la fiche de poste.
-- Quand tu estimes avoir assez d'informations, produire un résumé final détaillé + un score global de compatibilité sur 100.
-
-⚠️ TRÈS IMPORTANT : FORMAT DE RÉPONSE OBLIGATOIRE ⚠️
-Tu dois répondre STRICTEMENT en JSON valide, sans texte autour, sans Markdown, sans commentaires, sans \`\`\`.
-
-Format exact attendu :
-
-{
-  "next_question": string | null,
-  "short_analysis": string | null,
-  "final_summary": string | null,
-  "final_score": number | null
-}
-
-Règles :
-- Tant que l'entretien continue :
-  - "next_question" = la prochaine question à poser au candidat (en français).
-  - "short_analysis" = une analyse très courte (2-3 phrases max) de la dernière réponse du candidat.
-  - "final_summary" = null
-  - "final_score" = null
-- Quand tu estimes que l'entretien est terminé :
-  - "next_question" = null
-  - "short_analysis" = une courte phrase de conclusion si tu veux
-  - "final_summary" = un résumé structuré de la performance du candidat, points forts / points faibles, recommandation (oui / non / à voir).
-  - "final_score" = un nombre entier de 0 à 100 représentant la compatibilité globale avec la fiche de poste.
-
-Ta réponse DOIT être un JSON pur, directement parsable par JSON.parse en JavaScript.
-  `.trim();
-}
-````
-
-## File: lib/ipLocation.ts
-````typescript
-// lib/ipLocation.ts
-// Récupère IP + pays + ville côté client, avec un petit cache en sessionStorage
-
-export type ClientLocation = {
-  ip: string | null;
-  country: string | null;
-  city: string | null;
-};
-
-let inMemoryLocation: ClientLocation | null = null;
-let inFlightPromise: Promise<ClientLocation | null> | null = null;
-
-function loadFromSession(): ClientLocation | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = window.sessionStorage.getItem("smartcv_location_cache");
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      "ip" in parsed &&
-      "country" in parsed &&
-      "city" in parsed
-    ) {
-      return parsed as ClientLocation;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
-function saveToSession(loc: ClientLocation) {
-  if (typeof window === "undefined") return;
-  try {
-    window.sessionStorage.setItem(
-      "smartcv_location_cache",
-      JSON.stringify(loc)
-    );
-  } catch {
-    // ignore
-  }
-}
-
-export async function getClientLocation(): Promise<ClientLocation | null> {
-  if (typeof window === "undefined") return null;
-
-  if (inMemoryLocation) return inMemoryLocation;
-
-  const cached = loadFromSession();
-  if (cached) {
-    inMemoryLocation = cached;
-    return cached;
-  }
-
-  if (inFlightPromise) return inFlightPromise;
-
-  inFlightPromise = (async () => {
-    try {
-      const res = await fetch("https://ipapi.co/json/");
-      if (!res.ok) throw new Error("IP API error");
-      const data = await res.json();
-
-      const loc: ClientLocation = {
-        ip: data.ip || null,
-        country: data.country_name || data.country || null,
-        city: data.city || null,
-      };
-
-      inMemoryLocation = loc;
-      saveToSession(loc);
-      return loc;
-    } catch (e) {
-      console.error("Erreur getClientLocation:", e);
-      const loc: ClientLocation = {
-        ip: null,
-        country: null,
-        city: null,
-      };
-      inMemoryLocation = loc;
-      saveToSession(loc);
-      return loc;
-    }
-  })();
-
-  return inFlightPromise;
-}
-````
-
-## File: lib/linkedin.ts
-````typescript
-// Fichier : lib/auth.ts
-
-// Vous devez vous assurer que ces imports sont valides dans votre structure
-import { auth } from "@/lib/firebase"; // Import de l'instance d'authentification Firebase
-import { signInWithCustomToken, UserCredential } from "firebase/auth";
-
-// 👉 Login via LinkedIn
-// idToken ici est le Custom Token Firebase généré par votre Cloud Function.
-export async function loginWithLinkedInIdToken(idToken: string): Promise<UserCredential> {
-  console.log(
-    "[auth] Tentative de connexion via Custom Token LinkedIn...",
-    idToken
-  );
-
-  try {
-    // 1. Utilisez le Custom Token pour connecter l'utilisateur Firebase.
-    const credential = await signInWithCustomToken(auth, idToken);
-    
-    console.log("[auth] Connexion LinkedIn réussie:", credential.user.uid);
-    
-    // Le Custom Token est échangé contre une session utilisateur complète.
-    return credential; 
-    
-  } catch (error) {
-    console.error("[auth] Erreur lors de la connexion via Custom Token:", error);
-    throw new Error("Impossible de se connecter à Firebase avec le Custom Token fourni.");
-  }
-}
-````
-
-## File: lib/logAuthFailed.ts
-````typescript
-// src/lib/logAuthFailed.ts
-import { addDoc, collection, serverTimestamp } from "firebase/firestore";
-import { db } from "@/lib/firebase";
-
-export interface LogAuthFailedParams {
-  email?: string;
-  provider?: string;
-  errorCode?: string;
-  errorMessage?: string;
-}
-
-/**
- * Détection OS / device / navigateur à partir du userAgent
- */
-function parseUserAgent(uaRaw: string | null | undefined) {
-  const ua = (uaRaw ?? "").toLowerCase();
-
-  let deviceType: string | null = null;
-  let os: string | null = null;
-  let browser: string | null = null;
-
-  // --- Device ---
-  if (ua.includes("iphone")) {
-    deviceType = "iphone";
-  } else if (ua.includes("ipad")) {
-    deviceType = "ipad";
-  } else if (ua.includes("android") && ua.includes("mobile")) {
-    deviceType = "mobile";
-  } else if (ua.includes("android")) {
-    deviceType = "tablet";
-  } else if (ua.includes("macintosh") || ua.includes("mac os x")) {
-    deviceType = "desktop";
-  } else if (ua.includes("windows")) {
-    deviceType = "desktop";
-  } else {
-    deviceType = "desktop";
-  }
-
-  // --- OS ---
-  if (ua.includes("iphone") || ua.includes("ipad") || ua.includes("ipod")) {
-    os = "iOS";
-  } else if (ua.includes("android")) {
-    os = "Android";
-  } else if (ua.includes("mac os x") || ua.includes("macintosh")) {
-    os = "macOS";
-  } else if (ua.includes("windows nt")) {
-    os = "Windows";
-  } else if (ua.includes("linux")) {
-    os = "Linux";
-  }
-
-  // --- Navigateur ---
-  if (ua.includes("safari") && !ua.includes("chrome") && !ua.includes("crios")) {
-    browser = "Safari";
-  } else if (
-    (ua.includes("chrome") || ua.includes("crios")) &&
-    !ua.includes("edge") &&
-    !ua.includes("edg/")
-  ) {
-    browser = "Chrome";
-  } else if (ua.includes("firefox") || ua.includes("fxios")) {
-    browser = "Firefox";
-  } else if (ua.includes("edg/")) {
-    browser = "Edge";
-  } else if (ua.includes("opera") || ua.includes("opr/")) {
-    browser = "Opera";
-  }
-
-  return { deviceType, os, browser };
-}
-
-/**
- * Récupère l'IP + ville + pays via un petit service public
- * (tu peux changer pour ton propre endpoint si tu veux).
- */
-async function fetchIpInfo() {
-  if (typeof window === "undefined") return null;
-
-  try {
-    const res = await fetch("https://ipapi.co/json/");
-    if (!res.ok) return null;
-    const json: any = await res.json();
-
-    return {
-      ip: json.ip || null,
-      country: json.country_name || null,
-      city: json.city || null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Log d'une tentative de connexion échouée (auth_failed)
- * → écrit dans la collection "usageLogs"
- * → enrichi avec IP, pays, ville, device, OS, navigateur, path
- */
-export async function logAuthFailed(params: LogAuthFailedParams) {
-  try {
-    const ua =
-      typeof window !== "undefined"
-        ? window.navigator.userAgent || ""
-        : "";
-
-    const path =
-      typeof window !== "undefined"
-        ? window.location.pathname + window.location.search
-        : "";
-
-    const { deviceType, os, browser } = parseUserAgent(ua);
-
-    const geo = await fetchIpInfo();
-
-    await addDoc(collection(db, "usageLogs"), {
-      action: "auth_failed",
-      userId: null, // pas connecté
-      email: params.email || "",
-      provider: params.provider || "password",
-      errorCode: params.errorCode || "",
-      errorMessage: params.errorMessage || "",
-
-      // contexte technique
-      ua,
-      path,
-      deviceType: deviceType ?? null,
-      os: os ?? null,
-      browser: browser ?? null,
-
-      // géoloc basique
-      ip: geo?.ip ?? null,
-      country: geo?.country ?? null,
-      city: geo?.city ?? null,
-
-      createdAt: serverTimestamp(),
-    });
-  } catch (e) {
-    // On ne bloque pas l'utilisateur si le log plante
-    console.error("Erreur logAuthFailed:", e);
-  }
-}
-````
-
-## File: lib/logUsage.ts
-````typescript
-// src/lib/logUsage.ts
-import {
-  addDoc,
-  collection,
-  doc,
-  updateDoc,
-  increment,
-} from "firebase/firestore";
-import { db } from "@/lib/firebase";
-import type { User } from "firebase/auth";
-
-export type UsageDocType = "lm" | "cv" | "other";
-
-interface LogUsageOptions {
-  user: User;
-  action: string;      // ex: "generate_document", "download_document"
-  docType?: UsageDocType; // "lm" | "cv" | "other"
-  eventType?: string;  // ex: "generate", "download"
-  tool?: string;       // ex: "generateLetterAndPitch", "generateCvPdf"
-  creditsDelta?: number; // ex: -1 si tu consommes 1 crédit
-  path?: string;       // path courant (optionnel)
-}
-
-/**
- * Log d'usage IA côté client :
- * - crée un document dans "usageLogs"
- * - met à jour les compteurs dans "users/{uid}"
- *
- * → Permet à ton admin d'afficher :
- *   - LM générées (logs) : docType = "lm"
- *   - CV générés (logs) : docType = "cv"
- *   - totalIaCalls, totalDocumentsGenerated, totalLmGenerated, totalCvGenerated
- */
-export async function logUsage(options: LogUsageOptions) {
-  const {
-    user,
-    action,
-    docType = "other",
-    eventType,
-    tool,
-    creditsDelta,
-  } = options;
-
-  try {
-    const now = Date.now();
-    const path =
-      options.path ||
-      (typeof window !== "undefined"
-        ? window.location.pathname + window.location.search
-        : "");
-
-    // 1) LOG dans usageLogs
-    await addDoc(collection(db, "usageLogs"), {
-      userId: user.uid,
-      email: user.email ?? "",
-      action,         // ex: "generate_document"
-      docType,        // "lm" | "cv" | "other"
-      eventType: eventType ?? null, // ex: "generate"
-      tool: tool ?? null,           // ex: "generateCvPdf"
-
-      creditsDelta: typeof creditsDelta === "number" ? creditsDelta : null,
-
-      path,
-      createdAt: now, // number → ton admin new Date(createdAt)
-
-      ip: null,
-      country: null,
-      city: null,
-      deviceType: null,
-      os: null,
-      browser: null,
-    });
-
-    // 2) Mise à jour des compteurs dans users/{uid}
-    const userRef = doc(db, "users", user.uid);
-
-    const updates: Record<string, any> = {
-      totalIaCalls: increment(1),
-    };
-
-    // Document IA → compteur global
-    if (docType === "lm" || docType === "cv") {
-      updates.totalDocumentsGenerated = increment(1);
-    }
-
-    if (docType === "lm") {
-      updates.totalLmGenerated = increment(1);
-    }
-    if (docType === "cv") {
-      updates.totalCvGenerated = increment(1);
-    }
-
-    if (typeof creditsDelta === "number" && creditsDelta !== 0) {
-      updates.credits = increment(creditsDelta);
-    }
-
-    await updateDoc(userRef, updates);
-  } catch (err) {
-    console.error("Erreur logUsage:", err);
-    // on ne bloque JAMAIS l'utilisateur si le log plante
-  }
-}
-````
-
-## File: lib/polar-checkout.ts
-````typescript
-// src/lib/polar-checkout.ts
-import { polar } from "@/lib/polar";
-
-// Mappe les packs utilisés dans ton app vers les Product IDs Polar
-// Ici on suppose trois packs : 10, 20, 30 crédits
-const PACK_TO_PRODUCT_ID: Record<string, string> = {
-  "10": process.env.POLAR_PRODUCT_10_ID || "",
-  "20": process.env.POLAR_PRODUCT_20_ID || "",
-  "30": process.env.POLAR_PRODUCT_30_ID || "",
-};
-
-const APP_URL =
-  process.env.NEXT_PUBLIC_APP_URL ?? "https://assistant-ia-v4.web.app";
-
-export type CreditPackId = "10" | "20" | "30";
-
-export interface CreateCheckoutOptions {
-  customerEmail?: string;
-  externalCustomerId?: string; // ex: id utilisateur (Firebase, Supabase, etc.)
-}
-
-/**
- * Crée une session de paiement Polar pour un pack donné.
- *
- * @param packId - "10", "20" ou "30" (nombre de crédits du pack)
- * @param opts - infos client (email, id externe)
- */
-export async function createPolarCheckout(
-  packId: CreditPackId,
-  opts?: CreateCheckoutOptions
-) {
-  const productId = PACK_TO_PRODUCT_ID[packId];
-
-  if (!productId) {
-    throw new Error(
-      `Pack inconnu côté Polar : "${packId}". Vérifie PACK_TO_PRODUCT_ID dans src/lib/polar-checkout.ts`
-    );
-  }
-
-  // Polar remplace {CHECKOUT_ID} par l'id réel du checkout
-  const successUrl = `${APP_URL}/paiement/success?checkout_id={CHECKOUT_ID}`;
-  const returnUrl = `${APP_URL}/paiement/canceled`;
-
-  const checkout = await polar.checkouts.create({
-    products: [productId],
-    successUrl,
-    returnUrl,
-    customerEmail: opts?.customerEmail,
-    externalCustomerId: opts?.externalCustomerId,
-  });
-
-  if (!checkout.url) {
-    throw new Error("Polar n'a pas renvoyé d'URL de checkout");
-  }
-
-  return { url: checkout.url };
-}
-````
-
-## File: lib/polar.ts
-````typescript
-// src/lib/polar.ts
-import { Polar } from "@polar-sh/sdk";
-
-const server =
-  process.env.POLAR_ENV === "production" ? "production" : "sandbox";
-
-if (!process.env.POLAR_ACCESS_TOKEN) {
-  throw new Error("POLAR_ACCESS_TOKEN manquant dans .env");
-}
-
-// Instance Polar
-export const polar = new Polar({
-  accessToken: process.env.POLAR_ACCESS_TOKEN,
-  // @ts-ignore : selon la version du SDK, server peut être optionnel
-  server,
-});
-
-// ⚠️ Packs alignés avec ton UI : 20 / 50 / 100 crédits
-export type CreditPackId = "20" | "50" | "100";
-
-// ✅ IDs produits liés aux packs, alimentés par tes variables d'env
-const PACK_TO_PRODUCT_ID: Record<CreditPackId, string> = {
-  "20": process.env.POLAR_PRODUCT_20_ID ?? "",
-  "50": process.env.POLAR_PRODUCT_50_ID ?? "",
-  "100": process.env.POLAR_PRODUCT_100_ID ?? "",
-};
-
-function getProductIdForPack(packId: CreditPackId): string {
-  const productId = PACK_TO_PRODUCT_ID[packId];
-  if (!productId) {
-    throw new Error(
-      `Aucun POLAR_PRODUCT_${packId}_ID configuré dans les variables d'env pour le pack "${packId}".`
-    );
-  }
-  return productId;
-}
-
-interface CreateCheckoutOptions {
-  packId: CreditPackId;
-  userId: string;
-  email: string;
-}
-
-/**
- * Crée un checkout Polar pour un pack de crédits et renvoie l'URL de paiement.
- * Fonctionne autant en sandbox qu'en production (selon POLAR_ENV + les IDs).
- * Cette URL sera utilisée dans l'Embedded Checkout (pop-up dans ton site).
- */
-export async function createPolarCheckout(options: CreateCheckoutOptions) {
-  const { packId, userId, email } = options;
-
-  const productId = getProductIdForPack(packId);
-
-  const baseAppUrl =
-    process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
-
-  // 👉 utilisé pour la redirection *si tu laisses Polar rediriger*
-  const successUrl = `${baseAppUrl}/app/credits?status=success&pack=${packId}`;
-  const returnUrl = `${baseAppUrl}/app/credits?status=cancel`;
-
-  // 👉 très important pour l'Embedded Checkout
-  // Polar docs : embed_origin = origin de la page qui intègre le checkout :contentReference[oaicite:1]{index=1}
-  const embedOrigin = baseAppUrl; // NEXT_PUBLIC_APP_URL doit être du style https://mon-site.com
-
-  console.log("[Polar] Création checkout", {
-    env: process.env.POLAR_ENV,
-    packId,
-    productId,
-    userId,
-    email,
-    successUrl,
-    returnUrl,
-    embedOrigin,
-  });
-
-  const payload: any = {
-    products: [productId],
-    success_url: successUrl,
-    return_url: returnUrl,
-    embed_origin: embedOrigin,
-    customer_email: email, // ⚠️ vrai email
-    external_customer_id: userId,
-
-    allow_discount_codes: true,
-    require_billing_address: false,
-    allow_trial: true,
-    is_business_customer: false,
-  };
-
-  const checkout = await (polar as any).checkouts.create(payload);
-
-  if (!checkout?.url) {
-    console.error(
-      "[Polar] Checkout créé mais pas d'URL dans la réponse:",
-      checkout
-    );
-    throw new Error("Checkout Polar créé mais URL manquante.");
-  }
-
-  console.log("[Polar] Checkout URL:", checkout.url);
-
-  return {
-    url: checkout.url as string,
-    checkout,
-  };
-}
-````
-
 ## File: lib/recaptcha.ts
 ````typescript
 // lib/recaptcha.ts
@@ -22956,611 +25507,6 @@ export async function verifyRecaptcha(token: string, action: string): Promise<Ve
 }
 ````
 
-## File: lib/userTracking.ts
-````typescript
-// lib/userTracking.ts
-import { User } from "firebase/auth";
-import {
-  collection,
-  addDoc,
-  doc,
-  setDoc,
-  increment,
-} from "firebase/firestore";
-import { db } from "@/lib/firebase";
-
-/**
- * Infos IP / localisation
- */
-type IpInfo = {
-  ip: string;
-  country: string;
-  city: string;
-};
-
-// Cache en mémoire pour éviter d'appeler l'API à chaque fois
-let ipInfoCache: IpInfo | null = null;
-let ipInfoPromise: Promise<IpInfo | null> | null = null;
-
-async function getIpInfo(): Promise<IpInfo | null> {
-  if (ipInfoCache) return ipInfoCache;
-  if (typeof window === "undefined") return null;
-
-  if (ipInfoPromise) return ipInfoPromise;
-
-  ipInfoPromise = (async () => {
-    try {
-      // API publique simple, tu peux la changer si besoin
-      const res = await fetch("https://ipapi.co/json/");
-      if (!res.ok) throw new Error("IP API error");
-      const data = await res.json();
-      const info: IpInfo = {
-        ip: data.ip,
-        country: data.country_name,
-        city: data.city,
-      };
-      ipInfoCache = info;
-      return info;
-    } catch (e) {
-      console.error("Erreur getIpInfo:", e);
-      return null;
-    } finally {
-      ipInfoPromise = null;
-    }
-  })();
-
-  return ipInfoPromise;
-}
-
-/**
- * Infos device / OS / navigateur
- * ➜ différencie iPhone / iPad / macOS / Android / Windows…
- */
-type DeviceInfo = {
-  deviceType: string; // "iphone" | "ipad" | "mac" | "mobile" | "tablet" | "desktop" | "unknown"
-  os: string;
-  browser: string;
-};
-
-function detectDeviceInfo(): DeviceInfo {
-  if (typeof navigator === "undefined") {
-    return { deviceType: "unknown", os: "unknown", browser: "unknown" };
-  }
-
-  const ua = navigator.userAgent || "";
-  const lower = ua.toLowerCase();
-
-  let deviceType = "unknown";
-  let os = "unknown";
-  let browser = "unknown";
-
-  // --- OS + device ---
-  if (/iphone/i.test(ua)) {
-    deviceType = "iphone";
-    os = "iOS";
-  } else if (/ipad/i.test(ua)) {
-    deviceType = "ipad";
-    os = "iPadOS";
-  } else if (/android/i.test(ua)) {
-    os = "Android";
-    deviceType = /mobile/i.test(ua) ? "mobile" : "tablet";
-  } else if (/macintosh|mac os x/i.test(ua)) {
-    os = "macOS";
-    deviceType = "mac";
-  } else if (/windows/i.test(ua)) {
-    os = "Windows";
-    deviceType = "desktop";
-  } else if (/linux/i.test(ua)) {
-    os = "Linux";
-    deviceType = "desktop";
-  }
-
-  // --- navigateur ---
-  if (lower.includes("edg/")) {
-    browser = "Edge";
-  } else if (lower.includes("opr/") || lower.includes("opera")) {
-    browser = "Opera";
-  } else if (lower.includes("firefox")) {
-    browser = "Firefox";
-  } else if (lower.includes("chrome") && !lower.includes("edge") && !lower.includes("opr")) {
-    browser = "Chrome";
-  } else if (lower.includes("safari") && !lower.includes("chrome")) {
-    browser = "Safari";
-  }
-
-  return { deviceType, os, browser };
-}
-
-/**
- * Mise à jour du doc "users/{uid}" pour suivre :
- * - dernière activité
- * - dernière page
- * - IP / pays / ville
- * - device / OS / navigateur
- */
-export async function updateLastActive(
-  user: User,
-  extra?: { path?: string; action?: string }
-) {
-  if (!user) return;
-
-  try {
-    const [ipInfo, device] = await Promise.all([
-      getIpInfo(),
-      Promise.resolve(detectDeviceInfo()),
-    ]);
-
-    const ref = doc(db, "users", user.uid);
-
-    const path =
-      extra?.path ??
-      (typeof window !== "undefined"
-        ? window.location.pathname + window.location.search
-        : null);
-
-    const now = Date.now();
-
-    const payload: any = {
-      email: user.email ?? null,
-      displayName: user.displayName ?? null,
-      lastSeenAt: now,
-      lastSeenPage: path,
-      lastDeviceType: device.deviceType,
-      lastOs: device.os,
-      lastBrowser: device.browser,
-    };
-
-    if (user.metadata?.lastSignInTime) {
-      payload.lastLoginAt = new Date(
-        user.metadata.lastSignInTime
-      ).getTime();
-    }
-
-    if (ipInfo) {
-      payload.lastSeenIp = ipInfo.ip;
-      payload.lastSeenCountry = ipInfo.country;
-      payload.lastSeenCity = ipInfo.city;
-    }
-
-    if (extra?.action) {
-      payload.lastAction = extra.action;
-      payload.lastActionAt = now;
-    }
-
-    await setDoc(ref, payload, { merge: true });
-  } catch (e) {
-    console.error("Erreur updateLastActive:", e);
-  }
-}
-
-/**
- * Options pour les logs d’usage
- * - action = nom de l’évènement (ex: "lm_generate", "lm_download", "cv_generate")
- * - docType = "lm" | "cv" | "pitch"...
- * - eventType = "generate" | "download" | "view"...
- * - tool = comment tu catégorises ton outil (ex: "lm", "cv", "assistant")
- * - creditsDelta = variation de crédits (ex: -1 quand tu consommes 1 crédit)
- *
- * ➜ grâce à [key: string]: any, tu peux passer
- *    feature, template, lang, contract, targetJob, companyName, etc.
- */
-export type LogUsageOptions = {
-  tool?: string;
-  docType?: "lm" | "cv" | "pitch" | string;
-  eventType?: "generate" | "download" | "view" | "auth" | string;
-  creditsDelta?: number;
-  path?: string;
-  meta?: Record<string, any>;
-  // pour autoriser des clés libres (feature, template, lang, etc.)
-  [key: string]: any;
-};
-
-/**
- * Log d’un événement important (appel IA, génération LM/CV, téléchargement…)
- * ➜ crée un doc dans usageLogs
- * ➜ met à jour les compteurs dans users
- *
- * Tous les champs supplémentaires (feature, template, lang, jobTitle, etc.)
- * sont rangés dans log.meta.
- */
-export async function logUsage(
-  user: User | null,
-  action: string,
-  options?: LogUsageOptions
-) {
-  if (!user) return;
-
-  try {
-    const [ipInfo, device] = await Promise.all([
-      getIpInfo(),
-      Promise.resolve(detectDeviceInfo()),
-    ]);
-
-    const now = Date.now();
-
-    // On extrait les options "connues" et on met le reste dans `rest`
-    const {
-      tool,
-      docType,
-      eventType,
-      creditsDelta,
-      path: optPath,
-      meta,
-      ...rest
-    } = options ?? {};
-
-    const path =
-      optPath ??
-      (typeof window !== "undefined"
-        ? window.location.pathname + window.location.search
-        : null);
-
-    // --- 1) Créer un document dans usageLogs ---
-    const log: any = {
-      userId: user.uid,
-      email: user.email ?? null,
-      action,
-      tool: tool ?? null,
-      docType: docType ?? null,
-      eventType: eventType ?? null,
-      createdAt: now,
-      path,
-      creditsDelta:
-        typeof creditsDelta === "number" ? creditsDelta : null,
-      deviceType: device.deviceType,
-      os: device.os,
-      browser: device.browser,
-    };
-
-    if (ipInfo) {
-      log.ip = ipInfo.ip;
-      log.country = ipInfo.country;
-      log.city = ipInfo.city;
-    }
-
-    // Fusionne meta + toutes les autres clés libres (feature, template, ...)
-    if (meta || Object.keys(rest).length > 0) {
-      log.meta = {
-        ...(meta || {}),
-        ...rest,
-      };
-    }
-
-    const logsRef = collection(db, "usageLogs");
-    await addDoc(logsRef, log);
-
-    // --- 2) Mettre à jour les compteurs dans users/{uid} ---
-    const userRef = doc(db, "users", user.uid);
-
-    const update: any = {
-      lastSeenAt: now,
-      lastSeenPage: path,
-      lastDeviceType: device.deviceType,
-      lastOs: device.os,
-      lastBrowser: device.browser,
-    };
-
-    if (ipInfo) {
-      update.lastSeenIp = ipInfo.ip;
-      update.lastSeenCountry = ipInfo.country;
-      update.lastSeenCity = ipInfo.city;
-    }
-
-    const inc: any = {};
-
-    // Appels IA
-    if (tool) {
-      inc.totalIaCalls = increment(1);
-    }
-
-    // Documents générés
-    if (docType) {
-      inc.totalDocumentsGenerated = increment(1);
-      if (docType === "lm") {
-        inc.totalLmGenerated = increment(1);
-      }
-      if (docType === "cv") {
-        inc.totalCvGenerated = increment(1);
-      }
-    }
-
-    // Crédits consommés / ajoutés
-    if (typeof creditsDelta === "number") {
-      inc.credits = increment(creditsDelta);
-    }
-
-    Object.assign(update, inc);
-
-    await setDoc(userRef, update, { merge: true });
-  } catch (e) {
-    console.error("Erreur logUsage:", e);
-  }
-}
-````
-
-## File: public/manifest.webmanifest
-````
-{
-  "name": "SmartCV",
-  "short_name": "SmartCV",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#020617",
-  "theme_color": "#0ea5e9",
-  "icons": []
-}
-````
-
-## File: types/cv.ts
-````typescript
-// types/cv.ts
-
-export type CvSkills = {
-  // Compétences métier (finance, RH, IT, marketing, etc.)
-  domain?: string[];
-  // Outils / logiciels (Excel, Word, PowerPoint, SAP, Canva, etc.)
-  tools?: string[];
-};
-
-export type CvExperience = {
-  company?: string;
-  role?: string;
-  location?: string;
-  dates?: string;
-  bullets?: string[];
-};
-
-export type CvProfile = {
-  fullName?: string;
-  email?: string;
-  phone?: string;
-  linkedin?: string;
-  contractType?: string;
-
-  // Résumé court du profil (max 3 phrases)
-  profileSummary?: string;
-
-  // Ligne compacte pour les langues : "Français (natif) · Anglais (B2 – TOEIC) · ..."
-  langLine?: string;
-
-  skills?: CvSkills;
-
-  // Formation courte, lignes prêtes à afficher
-  // ex: "2022–2024 · MSc Expert Financier – ESAM, Paris"
-  educationShort?: string[];
-
-  // Certifications principales
-  certifications?: string[];
-
-  // Centres d'intérêt détaillés
-  interests?: string[];
-
-  // Centres d'intérêt sur une seule ligne : "Musique, piano, voyages, ..."
-  interestsLine?: string;
-
-  // Expériences détaillées (utile plus tard pour les LM, pitch, etc.)
-  experiences?: CvExperience[];
-};
-
-export type CvApiResponse = {
-  success: boolean;
-  profile?: CvProfile;
-  error?: string;
-};
-````
-
-## File: .firebaserc
-````
-{
-  "projects": {
-    "a": "assistant-ia-v4"
-  },
-  "targets": {},
-  "etags": {}
-}
-````
-
-## File: .gitignore
-````
-node_modules/
-.next/
-out/
-.env
-.env.*
-serviceAccountKey.json
-*.log
-.DS_Store
-serviceAccountKey*.json
-````
-
-## File: api.txt
-````
-SMTP et API
-Serveur SMTP
-smtp-relay.brevo.com
-Port
-587
-Connexion
-9c1210001@smtp-brevo.com
-STARTTLS
-key: bskt8NcPaWFVZUh
-
-firebase functions:config:set smtp.host="smtp-relay.brevo.com"
-firebase functions:config:set smtp.port="587"
-firebase functions:config:set smtp.secure="false"
-firebase functions:config:set smtp.user="9c1210001@smtp-brevo.com"
-firebase functions:config:set smtp.pass="bskt8NcPaWFVZUh"
-firebase functions:config:set smtp.from='"Assistant IA" <aakane0105@gmail.com>'
-firebase functions:config:set smtp.from='"Assistant IA" <no-reply@tondomaine.com>'
-firebase functions:config:set smtp.from='"Assistant IA" <no-reply@assistant-ia-v4.com>'
-````
-
-## File: firebase.json
-````json
-{
-  "hosting": {
-    "site": "assistant-ia-v4",
-    "public": "out",
-    "ignore": [
-      "firebase.json",
-      "**/.*",
-      "**/node_modules/**"
-    ],
-    "rewrites": [
-      {
-        "source": "/api/interview",
-        "function": "interview"
-      },
-      {
-        "source": "/api/extractProfile",
-        "function": "extractProfile"
-      },
-      {
-        "source": "/api/polar/webhook",
-        "function": "polarWebhook"
-      },
-      {
-        "source": "/api/jobs",
-        "function": "jobs"
-      },
-      {
-        "source": "**",
-        "destination": "/index.html"
-      }
-    ],
-    "cleanUrls": true,
-    "trailingSlash": false
-  },
-  "firestore": {
-    "rules": "firestore.rules",
-    "indexes": "firestore.indexes.json"
-  },
-  "functions": {
-    "source": "functions"
-  }
-}
-````
-
-## File: firestore.indexes.json
-````json
-{
-  "indexes": [
-    {
-      "collectionGroup": "applications",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "userId", "order": "ASCENDING" },
-        { "fieldPath": "createdAt", "order": "DESCENDING" }
-      ]
-    }
-  ],
-  "fieldOverrides": []
-}
-````
-
-## File: firestore.rules
-````
-rules_version = '2';
-
-service cloud.firestore {
-  match /databases/{database}/documents {
-
-    // --- Helpers ---
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
-    function isAdmin() {
-      return isSignedIn() && (
-        request.auth.token.isAdmin == true ||
-        request.auth.token.email == "aakane0105@gmail.com"
-      );
-    }
-
-    // --- COLLECTION users ---
-    match /users/{userId} {
-      // L'utilisateur peut lire/écrire uniquement SON doc
-      allow read, write: if isSignedIn() && request.auth.uid == userId;
-
-      // L'admin peut tout lire/écrire
-      allow read, write: if isAdmin();
-    }
-
-    // --- COLLECTION profiles ---
-    match /profiles/{userId} {
-      // L'utilisateur gère son profil
-      allow read, write: if isSignedIn() && request.auth.uid == userId;
-
-      // Admin peut tout lire/écrire
-      allow read, write: if isAdmin();
-    }
-
-    // --- COLLECTION applications ---
-    match /applications/{appId} {
-      // Création d'une candidature : userId dans le doc = auth.uid
-      allow create: if isSignedIn()
-        && request.resource.data.userId == request.auth.uid;
-
-      // Lecture / update / delete par le propriétaire
-      allow read, update, delete: if isSignedIn()
-        && resource.data.userId == request.auth.uid;
-
-      // Admin : lecture/écriture si besoin (stats, corrections, etc.)
-      allow read, write: if isAdmin();
-    }
-
-    // --- COLLECTION usageLogs ---
-    match /usageLogs/{logId} {
-      // 1) logs normaux d'un user connecté (LM, CV, etc.)
-      // 2) logs d'échec de connexion (auth_failed) AVANT login (pas d'auth)
-      allow create: if
-        (
-          isSignedIn() &&
-          request.resource.data.userId == request.auth.uid
-        )
-        ||
-        (
-          !isSignedIn() &&
-          request.resource.data.action == "auth_failed"
-        );
-
-      // lecture / modif / suppression : admin uniquement
-      allow read, update, delete: if isAdmin();
-    }
-
-    // --- CATCH-ALL ADMIN ---
-    match /{document=**} {
-      allow read, write: if isAdmin();
-    }
-  }
-}
-````
-
-## File: next-env.d.ts
-````typescript
-/// <reference types="next" />
-/// <reference types="next/image-types/global" />
-
-// NOTE: This file should not be edited
-// see https://nextjs.org/docs/app/building-your-application/configuring/typescript for more information.
-````
-
-## File: next.config.mjs
-````javascript
-/** @type {import('next').NextConfig} */
-const nextConfig = {
-  // On demande à Next de générer un site statique dans `out/`
-  output: "export",
-
-  // Utile si tu utilises `next/image` (sinon tu peux enlever)
-  images: {
-    unoptimized: true,
-  },
-};
-
-export default nextConfig;
-````
-
 ## File: package.json
 ````json
 {
@@ -23582,6 +25528,7 @@ export default nextConfig;
     "firebase-admin": "^13.6.0",
     "firebase-functions": "^7.0.2",
     "framer-motion": "^11.0.0",
+    "jszip": "^3.10.1",
     "next": "^14.2.35",
     "next-intl": "^4.5.5",
     "node-fetch": "^3.3.2",
@@ -23593,6 +25540,7 @@ export default nextConfig;
   },
   "devDependencies": {
     "@types/aos": "^3.0.7",
+    "@types/jszip": "^3.4.0",
     "@types/node": "^20.12.7",
     "@types/pdfmake": "^0.2.12",
     "@types/react": "^18.2.66",
@@ -23601,180 +25549,5 @@ export default nextConfig;
     "tailwindcss": "^3.4.4",
     "typescript": "^5.5.0"
   }
-}
-````
-
-## File: postcss.config.js
-````javascript
-module.exports = {
-  plugins: {
-    tailwindcss: {},
-    autoprefixer: {}
-  }
-};
-````
-
-## File: setAdmin.js
-````javascript
-// setAdmin.js
-const admin = require("firebase-admin");
-const serviceAccount = require("./serviceAccountKey.json");
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
-async function main() {
-  // 👉 Mets ici l'email EXACT utilisé dans Firebase Authentication
-  const email = "aakane0105@gmail.com"; // <--- NE PAS OUBLIER LE GUILLEMET DE FIN
-
-  try {
-    // On récupère l'utilisateur via son email
-    const userRecord = await admin.auth().getUserByEmail(email);
-    console.log("Utilisateur trouvé ✅");
-    console.log("UID :", userRecord.uid);
-    console.log("Email :", userRecord.email);
-
-    // On lui ajoute le rôle admin
-    await admin.auth().setCustomUserClaims(userRecord.uid, { isAdmin: true });
-
-    console.log("✅ isAdmin = true pour :", userRecord.uid);
-  } catch (err) {
-    console.error("Erreur setAdmin:", err);
-  }
-}
-
-main();
-````
-
-## File: syncAuthUsersToFirestore.js
-````javascript
-// syncAuthUsersToFirestore.js
-//
-// Script une fois pour toutes : synchronise tous les comptes Firebase Auth
-// vers la collection Firestore "users", pour qu'ils apparaissent dans ton admin.
-
-const admin = require("firebase-admin");
-const serviceAccount = require("./serviceAccountKey.json");
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
-const db = admin.firestore();
-
-function toMillis(str) {
-  if (!str) return null;
-  const t = Date.parse(str);
-  return Number.isNaN(t) ? null : t;
-}
-
-async function syncAllUsers(nextPageToken) {
-  const result = await admin.auth().listUsers(1000, nextPageToken);
-
-  for (const user of result.users) {
-    const uid = user.uid;
-    const ref = db.collection("users").doc(uid);
-    const snap = await ref.get();
-
-    const baseData = {
-      email: user.email || null,
-      displayName: user.displayName || null,
-      emailVerified: user.emailVerified || false,
-      provider:
-        (user.providerData[0] && user.providerData[0].providerId) ||
-        "password",
-      createdAt: toMillis(user.metadata.creationTime) || Date.now(),
-      lastLoginAt: toMillis(user.metadata.lastSignInTime) || null,
-    };
-
-    if (!snap.exists) {
-      // Nouveau doc user créé
-      await ref.set({
-        ...baseData,
-        credits: 0,
-        blocked: false,
-      });
-      console.log("✅ Créé doc users pour", uid, baseData.email);
-    } else {
-      // Doc déjà existant → on ne touche pas aux crédits / blocked
-      await ref.set(baseData, { merge: true });
-      console.log("🔁 Mis à jour doc users pour", uid, baseData.email);
-    }
-  }
-
-  if (result.pageToken) {
-    await syncAllUsers(result.pageToken);
-  }
-}
-
-async function main() {
-  await syncAllUsers();
-  console.log("🎉 Sync terminé");
-  process.exit(0);
-}
-
-main().catch((err) => {
-  console.error("Erreur syncAllUsers:", err);
-  process.exit(1);
-});
-````
-
-## File: tailwind.config.js
-````javascript
-/** @type {import('tailwindcss').Config} */
-module.exports = {
-  content: [
-    "./app/**/*.{js,ts,jsx,tsx}",
-    "./components/**/*.{js,ts,jsx,tsx}"
-  ],
-  theme: {
-    extend: {}
-  },
-  plugins: []
-}
-````
-
-## File: tsconfig.json
-````json
-{
-  "compilerOptions": {
-    "target": "ESNext",
-    "lib": [
-      "DOM",
-      "DOM.Iterable",
-      "ESNext"
-    ],
-    "allowJs": false,
-    "skipLibCheck": true,
-    "strict": true,
-    "noEmit": true,
-    "esModuleInterop": true,
-    "module": "ESNext",
-    "moduleResolution": "Node",
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "jsx": "preserve",
-    "paths": {
-      "@/*": [
-        "./*"
-      ]
-    },
-    "incremental": true,
-    "plugins": [
-      {
-        "name": "next"
-      }
-    ]
-  },
-  "include": [
-    "next-env.d.ts",
-    "**/*.ts",
-    "**/*.tsx",
-    ".next/types/**/*.ts"
-  ],
-  "exclude": [
-    "node_modules"
-  ]
 }
 ````

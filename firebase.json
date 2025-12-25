@@ -8,26 +8,23 @@
       "**/node_modules/**"
     ],
     "rewrites": [
-      {
-        "source": "/api/interview",
-        "function": "interview"
-      },
-      {
-        "source": "/api/extractProfile",
-        "function": "extractProfile"
-      },
-      {
-        "source": "/api/polar/webhook",
-        "function": "polarWebhook"
-      },
-      {
-        "source": "/api/jobs",
-        "function": "jobs"
-      },
-      {
-        "source": "**",
-        "destination": "/index.html"
-      }
+      { "source": "/api/recaptchaVerify", "function": "recaptchaVerify" },
+
+      { "source": "/api/interview", "function": "interview" },
+      { "source": "/api/extractProfile", "function": "extractProfile" },
+
+      { "source": "/api/generateLetterAndPitch", "function": "generateLetterAndPitch" },
+      { "source": "/api/generateInterviewQA", "function": "generateInterviewQA" },
+      { "source": "/api/generateCvPdf", "function": "generateCvPdf" },
+      { "source": "/api/generateCvLmZip", "function": "generateCvLmZip" },
+      { "source": "/api/generateLetterPdf", "function": "generateLetterPdf" },
+
+      { "source": "/api/jobs", "function": "jobs" },
+
+      { "source": "/api/polar/checkout", "function": "polarCheckout" },
+      { "source": "/api/polar/webhook", "function": "polarWebhook" },
+
+      { "source": "**", "destination": "/index.html" }
     ],
     "cleanUrls": true,
     "trailingSlash": false

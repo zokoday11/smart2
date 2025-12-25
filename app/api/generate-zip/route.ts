@@ -1,3 +1,5 @@
+// app/api/generate-zip/route.ts
+
 import { NextResponse } from "next/server";
 import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
@@ -5,7 +7,11 @@ import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import JSZip from "jszip";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 
+// ⚠️ Pour typer proprement le cast à la fin
+type BodyInitCompat = BodyInit | null | undefined;
+
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 function getAdminApp() {
   if (getApps().length) return getApps()[0];
@@ -148,7 +154,12 @@ Certifications: ${p.certs || ""}
 Langues: ${p.langLine || p.lang || ""}`.trim();
 }
 
-async function callGeminiText(prompt: string, apiKey: string, temperature = 0.65, maxOutputTokens = 1400) {
+async function callGeminiText(
+  prompt: string,
+  apiKey: string,
+  temperature = 0.65,
+  maxOutputTokens = 1400
+) {
   const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
   const body = {
@@ -180,7 +191,6 @@ async function callGeminiText(prompt: string, apiKey: string, temperature = 0.65
 
 function buildFallbackLetterBody(profile: any, jobTitle: string, companyName: string, lang: string) {
   const p = profile || {};
-  const name = p.fullName || "";
   const primaryDomain = p.primaryDomain || "";
   const summary = p.profileSummary || "";
   const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
@@ -590,19 +600,20 @@ RÈGLES :
     return NextResponse.json({ ok: false, error: e?.message || "LM_PDF_ERROR" }, { status: 500 });
   }
 
-  // ZIP
+  // ZIP ✅ (avec cast pour calmer TypeScript)
   try {
     const zip = new JSZip();
     zip.file("cv-ia.pdf", cvBuffer);
     zip.file(lmLang === "en" ? "cover-letter.pdf" : "lettre-motivation.pdf", lmBuffer);
 
-    const zipContent = await zip.generateAsync({ type: "nodebuffer" });
+    const zipContent = await zip.generateAsync({ type: "uint8array" });
 
-    return new NextResponse(zipContent, {
+    return new NextResponse(zipContent as unknown as BodyInitCompat, {
       status: 200,
       headers: {
         "Content-Type": "application/zip",
         "Content-Disposition": 'attachment; filename="cv-lm-ia.zip"',
+        "Content-Length": String(zipContent.byteLength),
       },
     });
   } catch (e: any) {
