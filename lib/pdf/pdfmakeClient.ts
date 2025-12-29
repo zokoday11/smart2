@@ -1,10 +1,13 @@
-// src/lib/pdf/pdfmakeClient.ts
+"use client";
+
+import pdfMakeMod from "pdfmake/build/pdfmake";
+import pdfFontsMod from "pdfmake/build/vfs_fonts";
+
 let cached: any | null = null;
 
 function buildVfsFromModule(mod: any) {
   if (!mod) return null;
 
-  // Cas classique: { pdfMake: { vfs: {...} } }
   const classic =
     mod?.pdfMake?.vfs ??
     mod?.default?.pdfMake?.vfs ??
@@ -13,8 +16,6 @@ function buildVfsFromModule(mod: any) {
 
   if (classic && typeof classic === "object") return classic;
 
-  // ✅ Ton cas: le module expose directement les fichiers Roboto-*.ttf
-  // Ex: { "Roboto-Regular.ttf": "base64...", ..., default: {...} }
   const candidate = typeof mod === "object" ? mod : null;
   if (!candidate) return null;
 
@@ -27,7 +28,6 @@ function buildVfsFromModule(mod: any) {
     vfs[k] = v;
   }
 
-  // Certains bundlers mettent les .ttf dans default
   const def = candidate?.default;
   if (def && typeof def === "object") {
     for (const [k, v] of Object.entries(def)) {
@@ -43,19 +43,17 @@ function buildVfsFromModule(mod: any) {
 export async function getPdfMake() {
   if (cached) return cached;
 
-  const pdfMakeMod: any = await import("pdfmake/build/pdfmake");
-  const pdfMake = pdfMakeMod.default ?? pdfMakeMod;
-
-  const fontsMod: any = await import("pdfmake/build/vfs_fonts");
-  const vfs = buildVfsFromModule(fontsMod);
+  const pdfMake = (pdfMakeMod as any).default ?? (pdfMakeMod as any);
+  const vfs = buildVfsFromModule(pdfFontsMod);
 
   if (!vfs) {
-    console.error("vfs_fonts module keys:", Object.keys(fontsMod || {}));
-    console.error("vfs_fonts.default keys:", Object.keys(fontsMod?.default || {}));
+    console.error("vfs_fonts module keys:", Object.keys((pdfFontsMod as any) || {}));
+    console.error("vfs_fonts.default keys:", Object.keys((pdfFontsMod as any)?.default || {}));
     throw new Error("pdfmake vfs_fonts introuvable (vfs).");
   }
 
-  pdfMake.vfs = vfs;
+  // injecte vfs une seule fois
+  if (!pdfMake.vfs) pdfMake.vfs = vfs;
 
   pdfMake.fonts = {
     Roboto: {
@@ -72,7 +70,13 @@ export async function getPdfMake() {
 
 export async function pdfMakeToBlob(docDef: any): Promise<Blob> {
   const pdfMake = await getPdfMake();
-  return new Promise((resolve) => pdfMake.createPdf(docDef).getBlob(resolve));
+  return new Promise((resolve, reject) => {
+    try {
+      pdfMake.createPdf(docDef).getBlob((blob: Blob) => resolve(blob));
+    } catch (e) {
+      reject(e);
+    }
+  });
 }
 
 export function downloadBlob(blob: Blob, filename: string) {
@@ -83,5 +87,5 @@ export function downloadBlob(blob: Blob, filename: string) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 15000);
+  setTimeout(() => URL.revokeObjectURL(url), 2500);
 }

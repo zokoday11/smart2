@@ -23,10 +23,13 @@ export async function generateAndDownloadCvLmPdf(params: {
   );
 
   // 2) LM -> fit 1 page
-  const lmFit = await fitOnePage((scale) => {
-    if (params.lm) return buildLmStyledPdf(params.lm, colors, scale);
-    return buildLmFallbackPdf(params.lmTextFallback || "", colors, scale);
-  }, { min: 0.85, max: 1.6, iterations: 6, initial: 1.0 });
+  const lmFit = await fitOnePage(
+    (scale) => {
+      if (params.lm) return buildLmStyledPdf(params.lm, colors, scale);
+      return buildLmFallbackPdf(params.lmTextFallback || "", colors, scale);
+    },
+    { min: 0.85, max: 1.6, iterations: 6, initial: 1.0 }
+  );
 
   // 3) fusion (2 pages)
   const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
