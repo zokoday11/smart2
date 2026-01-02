@@ -2,10 +2,27 @@
 const nextConfig = {
   reactStrictMode: true,
 
-  // pdfjs-dist est ESM et peut poser souci sans transpilation selon ton setup
+  // 🔴 IMPORTANT : active le mode export statique
+  // => `next build` va générer un dossier `out/`
+  output: "export",
+
+  // 🔴 IMPORTANT pour un hébergement statique (Firebase Hosting)
+  // Pas d'image optimizer côté serveur
+  images: {
+    unoptimized: true,
+  },
+
+  // Tu l'avais déjà pour pdfjs
   transpilePackages: ["pdfjs-dist"],
 
-  // ⚠️ IMPORTANT: supprime "experimental.serverRuntime" (clé invalide)
+  webpack: (config, { dev, isServer }) => {
+    // Workaround qui était déjà dans ton projet
+    if (dev && !isServer) {
+      config.devtool = "source-map"; // ou "cheap-module-source-map"
+    }
+    return config;
+  },
+
   experimental: {},
 };
 

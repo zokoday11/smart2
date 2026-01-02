@@ -18,6 +18,7 @@ export type PdfColorsLike = Record<string, string | undefined> & {
   ink?: string;
   muted?: string;
   line?: string;
+  bg?: string;
   bgSoft?: string;
   white?: string;
 };
@@ -27,958 +28,642 @@ export type CvTemplateMeta = {
   label: string;
   description: string;
   previewSrc: string; // ex: "/cv-templates/cv-template-modern.png"
+  badge?: string;
 };
 
+// ----------------------------------------------------
+// Liste des templates disponibles (UI)
+// ----------------------------------------------------
+
+export const CV_TEMPLATES: CvTemplateMeta[] = [
+  {
+    id: "ats",
+    label: "ATS (Standard)",
+    description: "Template 1 colonne très lisible, optimisé pour les ATS.",
+    previewSrc: "/cv-templates/cv-template-ats.png",
+    badge: "Recommandé",
+  },
+  {
+    id: "classic",
+    label: "Classic (Sidebar)",
+    description: "Colonne latérale, structure pro et lisible.",
+    previewSrc: "/cv-templates/cv-template-classic.png",
+  },
+  {
+    id: "modern",
+    label: "Modern (Design)",
+    description: "Header moderne, blocs aérés, idéal profils tech/produit.",
+    previewSrc: "/cv-templates/cv-template-modern.png",
+  },
+  {
+    id: "minimalist",
+    label: "Minimalist",
+    description: "CV ultra épuré, typographie clean, parfait pour cabinets.",
+    previewSrc: "/cv-templates/cv-template-minimalist.png",
+  },
+  {
+    id: "creative",
+    label: "Creative",
+    description: "Mise en page en cartes / blocs, look plus dynamique.",
+    previewSrc: "/cv-templates/cv-template-creative.png",
+  },
+  {
+    id: "elegant",
+    label: "Elegant",
+    description: "Style plus premium, hiérarchie douce, très corporate.",
+    previewSrc: "/cv-templates/cv-template-elegant.png",
+  },
+  {
+    id: "tech",
+    label: "Tech (Dark)",
+    description: "Palette sombre, vibe engineering / cybersécurité.",
+    previewSrc: "/cv-templates/cv-template-tech.png",
+  },
+  {
+    id: "pro_max",
+    label: "Pro Max",
+    description: "Version premium inspirée des CV design (header fort, cartes).",
+    previewSrc: "/cv-templates/cv-template-pro-max.png",
+    badge: "Nouveau",
+  },
+];
+
+// utilisé par l’UI
 export function getCvTemplates(): CvTemplateMeta[] {
-  return [
-    { id: "ats", label: "ATS (Standard)", description: "Focus lecture machine, 1 colonne.", previewSrc: "/cv-templates/cv-template-ats.png" },
-    { id: "classic", label: "Classic (Sidebar)", description: "Colonne latérale + icônes, structure pro.", previewSrc: "/cv-templates/cv-template-classic.png" },
-    { id: "modern", label: "Modern (Design)", description: "Header dynamique, profil en carte, motifs + icônes.", previewSrc: "/cv-templates/cv-template-modern.png" },
-    { id: "minimalist", label: "Minimalist", description: "Épuré premium, lignes fines + typographie.", previewSrc: "/cv-templates/cv-template-minimalist.png" },
-    { id: "creative", label: "Creative", description: "Cartes / blocs, look portfolio dynamique.", previewSrc: "/cv-templates/cv-template-creative.png" },
-    { id: "elegant", label: "Elegant", description: "Style premium, détails soignés, timeline légère.", previewSrc: "/cv-templates/cv-template-elegant.png" },
-    { id: "tech", label: "Tech (Dark)", description: "Sidebar sombre, vibe engineering/IT, icônes.", previewSrc: "/cv-templates/cv-template-tech.png" },
-    { id: "pro_max", label: "Pro Max", description: "Ultra premium : motifs, cartes, badges + flags langues.", previewSrc: "/cv-templates/cv-template-pro-max.png" },
-  ];
+  return CV_TEMPLATES;
 }
 
-// ----------------------
-// DESIGN KIT : SVG ICONS & FLAGS
-// ----------------------
+// ----------------------------------------------------
+// Helpers génériques
+// ----------------------------------------------------
 
-const svgWrap = (inner: string, viewBox = "0 0 24 24") =>
-  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}">${inner}</svg>`;
-
-const ICONS = {
-  user: (c: string) =>
-    svgWrap(
-      `<path fill="${c}" d="M12 12c2.76 0 5-2.24 5-5S14.76 2 12 2 7 4.24 7 7s2.24 5 5 5zm0 2c-3.33 0-10 1.67-10 5v3h20v-3c0-3.33-6.67-5-10-5z"/>`
-    ),
-  calendar: (c: string) =>
-    svgWrap(
-      `<path fill="${c}" d="M19 4h-1V2h-2v2H8V2H6v2H5c-1.11 0-1.99.9-1.99 2L3 20c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V10h14v10z"/>`
-    ),
-  pin: (c: string) =>
-    svgWrap(
-      `<path fill="${c}" d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5a2.5 2.5 0 0 1 0-5 2.5 2.5 0 0 1 0 5z"/>`
-    ),
-  cap: (c: string) =>
-    svgWrap(
-      `<path fill="${c}" d="M12 3L1 9l11 6 9-4.91V17h2V9L12 3zM5 13.18v2.81c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2v-2.81l-7 3.82-7-3.82z"/>`
-    ),
-  medal: (c: string) =>
-    svgWrap(
-      `<path fill="${c}" d="M12 2l3 7h7l-5.6 4.1L18.8 20 12 15.8 5.2 20l2.4-6.9L2 9h7z"/>`
-    ),
-  globe: (c: string) =>
-    svgWrap(
-      `<path fill="${c}" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm7.93 9h-3.18c-.12-2.19-.75-4.2-1.73-5.74A8.03 8.03 0 0 1 19.93 11zM12 4c1.4 1.77 2.28 4.07 2.45 7H9.55C9.72 8.07 10.6 5.77 12 4zM4.07 13h3.18c.12 2.19.75 4.2 1.73 5.74A8.03 8.03 0 0 1 4.07 13zm3.18-2H4.07A8.03 8.03 0 0 1 9 5.26C8 6.8 7.37 8.81 7.25 11zM12 20c-1.4-1.77-2.28-4.07-2.45-7h4.9C14.28 15.93 13.4 18.23 12 20zm3.02-1.26c.98-1.54 1.61-3.55 1.73-5.74h3.18a8.03 8.03 0 0 1-4.91 5.74z"/>`
-    ),
-};
-
-function detectLangCode(label: string) {
-  const s = safeText(label).toLowerCase();
-
-  // FR
-  if (/(français|francais|french|\bfr\b)/i.test(s)) return "fr";
-  // EN
-  if (/(anglais|english|\ben\b|\buk\b|\bus\b)/i.test(s)) return "en";
-  // ES
-  if (/(espagnol|spanish|\bes\b)/i.test(s)) return "es";
-  // DE
-  if (/(allemand|german|\bde\b)/i.test(s)) return "de";
-  // IT
-  if (/(italien|italian|\bit\b)/i.test(s)) return "it";
-  // PT
-  if (/(portugais|portuguese|\bpt\b)/i.test(s)) return "pt";
-  // AR
-  if (/(arabe|arabic|\bar\b)/i.test(s)) return "ar";
-  // ZH
-  if (/(chinois|mandarin|chinese|\bzh\b)/i.test(s)) return "zh";
-
-  return "xx";
+function normLang(lang: Lang): Lang {
+  return lang === "en" ? "en" : "fr";
 }
 
-function flagSvg(code: string) {
-  // flags simplifiés (lisibles en petit)
-  switch (code) {
-    case "fr":
-      return svgWrap(
-        `<rect width="24" height="16" fill="#fff"/>
-         <rect width="8" height="16" x="0" fill="#0055A4"/>
-         <rect width="8" height="16" x="16" fill="#EF4135"/>
-         <rect x="0.5" y="0.5" width="23" height="15" rx="2" ry="2" fill="none" stroke="#cbd5e1" stroke-width="1"/>`,
-        "0 0 24 16"
-      );
-    case "en":
-      // UK-ish (simplifié)
-      return svgWrap(
-        `<rect width="24" height="16" fill="#0A3D91"/>
-         <path d="M0 0 L24 16 M24 0 L0 16" stroke="#fff" stroke-width="3"/>
-         <path d="M0 0 L24 16 M24 0 L0 16" stroke="#D40000" stroke-width="1.5"/>
-         <rect x="10" y="0" width="4" height="16" fill="#fff"/>
-         <rect x="0" y="6" width="24" height="4" fill="#fff"/>
-         <rect x="10.8" y="0" width="2.4" height="16" fill="#D40000"/>
-         <rect x="0" y="6.8" width="24" height="2.4" fill="#D40000"/>
-         <rect x="0.5" y="0.5" width="23" height="15" rx="2" ry="2" fill="none" stroke="#cbd5e1" stroke-width="1"/>`,
-        "0 0 24 16"
-      );
-    case "es":
-      return svgWrap(
-        `<rect width="24" height="16" fill="#AA151B"/>
-         <rect y="4" width="24" height="8" fill="#F1BF00"/>
-         <rect x="0.5" y="0.5" width="23" height="15" rx="2" ry="2" fill="none" stroke="#cbd5e1" stroke-width="1"/>`,
-        "0 0 24 16"
-      );
-    case "de":
-      return svgWrap(
-        `<rect width="24" height="16" fill="#000"/>
-         <rect y="5.33" width="24" height="5.33" fill="#D00"/>
-         <rect y="10.66" width="24" height="5.34" fill="#FFCE00"/>
-         <rect x="0.5" y="0.5" width="23" height="15" rx="2" ry="2" fill="none" stroke="#cbd5e1" stroke-width="1"/>`,
-        "0 0 24 16"
-      );
-    case "it":
-      return svgWrap(
-        `<rect width="24" height="16" fill="#fff"/>
-         <rect width="8" height="16" x="0" fill="#009246"/>
-         <rect width="8" height="16" x="16" fill="#CE2B37"/>
-         <rect x="0.5" y="0.5" width="23" height="15" rx="2" ry="2" fill="none" stroke="#cbd5e1" stroke-width="1"/>`,
-        "0 0 24 16"
-      );
-    case "pt":
-      return svgWrap(
-        `<rect width="24" height="16" fill="#D40000"/>
-         <rect width="10" height="16" x="0" fill="#006600"/>
-         <rect x="0.5" y="0.5" width="23" height="15" rx="2" ry="2" fill="none" stroke="#cbd5e1" stroke-width="1"/>`,
-        "0 0 24 16"
-      );
-    default:
-      // fallback “badge”
-      return svgWrap(
-        `<rect width="24" height="16" rx="2" ry="2" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
-         <circle cx="8" cy="8" r="3" fill="#94a3b8"/>
-         <rect x="12" y="5" width="9" height="6" rx="1.5" fill="#cbd5e1"/>`,
-        "0 0 24 16"
-      );
-  }
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
-function getFlag(label: string) {
-  return flagSvg(detectLangCode(label));
+function safeText(v: unknown): string {
+  return String(v ?? "")
+    .replace(/\u00A0/g, " ")
+    .trim();
 }
 
-// ----------------------
-// HELPERS & RENDERING
-// ----------------------
-
-function normLang(lang: any): Lang {
-  return String(lang || "fr").toLowerCase().startsWith("en") ? "en" : "fr";
+function pick(colors: PdfColorsLike | undefined, key: keyof PdfColorsLike, fallback: string): string {
+  if (!colors) return fallback;
+  const v = colors[key];
+  return typeof v === "string" && v ? v : fallback;
 }
 
-function pick(colors: PdfColorsLike | undefined, key: keyof PdfColorsLike, fallback: string) {
-  const v = colors?.[key];
-  return typeof v === "string" && v.trim() ? v.trim() : fallback;
-}
+function joinDot(list: string[] | undefined, maxChars = 80): string {
+  const arr = Array.isArray(list)
+    ? list.map((s: string) => safeText(s)).filter(Boolean)
+    : [];
 
-function safeText(v: any) {
-  return String(v ?? "").replace(/\u00A0/g, " ").trim();
-}
+  if (!arr.length) return "—";
 
-function clamp(n: number, a: number, b: number) {
-  return Math.max(a, Math.min(b, n));
-}
-
-function hexToRgb(hex: string) {
-  const h = hex.replace("#", "").trim();
-  if (h.length === 3) {
-    const r = parseInt(h[0] + h[0], 16);
-    const g = parseInt(h[1] + h[1], 16);
-    const b = parseInt(h[2] + h[2], 16);
-    return { r, g, b };
-  }
-  const r = parseInt(h.slice(0, 2), 16);
-  const g = parseInt(h.slice(2, 4), 16);
-  const b = parseInt(h.slice(4, 6), 16);
-  return { r, g, b };
-}
-
-function rgbToHex(r: number, g: number, b: number) {
-  const to = (x: number) => clamp(Math.round(x), 0, 255).toString(16).padStart(2, "0");
-  return `#${to(r)}${to(g)}${to(b)}`;
-}
-
-function mixHex(a: string, b: string, t: number) {
-  const A = hexToRgb(a);
-  const B = hexToRgb(b);
-  return rgbToHex(A.r + (B.r - A.r) * t, A.g + (B.g - A.g) * t, A.b + (B.b - A.b) * t);
-}
-
-function uniq(arr: string[]) {
-  const seen = new Set<string>();
   const out: string[] = [];
-  for (const x of arr) {
-    const s = safeText(x);
-    const k = s.toLowerCase();
-    if (!s || seen.has(k)) continue;
-    seen.add(k);
-    out.push(s);
+  let used = 0;
+
+  for (const item of arr) {
+    const extra = (out.length ? 3 : 0) + item.length; // " • "
+    if (out.length && used + extra > maxChars) break;
+    out.push(item);
+    used += extra;
   }
+
+  return out.join(" • ");
+}
+
+function hr(scale: number, color: string) {
+  return {
+    canvas: [
+      {
+        type: "line",
+        x1: 0,
+        y1: 0,
+        x2: 515,
+        y2: 0,
+        lineWidth: 0.6,
+        lineColor: color,
+      },
+    ],
+    margin: [0, 4 * scale, 0, 4 * scale],
+  };
+}
+
+function sectionTitle(label: string, scale: number, color: string) {
+  return {
+    text: label,
+    fontSize: 10.5 * scale,
+    bold: true,
+    color,
+    margin: [0, 4 * scale, 0, 3 * scale],
+  };
+}
+
+function collectSkills(model: CvDocModel): string[] {
+  const s: any = (model as any).skills || {};
+  const keys = ["cloud", "sec", "sys", "auto", "tools", "soft"];
+  const out: string[] = [];
+
+  for (const key of keys) {
+    const value = s[key];
+    if (Array.isArray(value)) {
+      for (const item of value as string[]) {
+        const txt = safeText(item);
+        if (txt) out.push(txt);
+      }
+    }
+  }
+
   return out;
 }
 
-function joinDot(items: string[], max = 18) {
-  return uniq(items).slice(0, max).join(" · ");
-}
+function renderXp(model: CvDocModel, scale: number, ink: string, muted: string) {
+  const xpRaw: unknown = (model as any).xp;
+  const xpArr: CvDocModel["xp"] = Array.isArray(xpRaw) ? (xpRaw as CvDocModel["xp"]) : [];
 
-function dotsBar(level: number, scale: number, fill: string, empty: string) {
-  const canvas: any[] = [];
-  for (let i = 0; i < 5; i++) {
-    canvas.push({
-      type: "ellipse",
-      x: i * 7 * scale,
-      y: 3 * scale,
-      r1: 2.2 * scale,
-      r2: 2.2 * scale,
-      color: i < level ? fill : empty,
-    });
+  if (!xpArr.length) {
+    return [
+      {
+        text: "—",
+        fontSize: 9 * scale,
+        color: muted,
+      },
+    ];
   }
-  return { canvas, width: 35 * scale };
-}
 
-function splitLangLine(langLine: string) {
-  // ✅ FIX : support aussi "|", retours ligne, etc.
-  return safeText(langLine)
-    .split(/[\n,;|]+/g)
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
+  return xpArr.map((x: CvDocModel["xp"][number]) => {
+    const titleParts: string[] = [];
+    if (x.role) titleParts.push(safeText(x.role));
+    if (x.company) titleParts.push(safeText(x.company));
+    const title = titleParts.join(" — ") || "—";
 
-function inferLangLevel(label: string) {
-  const s = label.toLowerCase();
-  // 5
-  if (/(natif|native|bilingue|expert|c2|c1)/i.test(s)) return 5;
-  // 4
-  if (/(courant|fluent|b2)/i.test(s)) return 4;
-  // 3
-  if (/(interm|intermediate|b1)/i.test(s)) return 3;
-  // 2
-  if (/(a2|débutant|debutant|beginner)/i.test(s)) return 2;
-  return 3;
-}
+    const metaParts: string[] = [];
+    if (x.city) metaParts.push(safeText(x.city));
+    if (x.dates) metaParts.push(safeText(x.dates));
+    const meta = metaParts.join(" • ");
 
-function renderLanguages(langLine: string, scale: number, brand: string, line: string, ink: string, muted: string) {
-  const items = splitLangLine(langLine);
-  if (!items.length) return [{ text: "—", fontSize: 9 * scale, color: muted }];
+    const bulletsRaw: unknown = x.bullets;
+    const bullets: string[] = Array.isArray(bulletsRaw)
+      ? (bulletsRaw as string[]).map((b: string) => safeText(b)).filter(Boolean)
+      : [];
 
-  return items.map((it) => {
-    const level = inferLangLevel(it);
-    return {
-      columns: [
-        { svg: getFlag(it), width: 14 * scale, margin: [0, 2 * scale, 6 * scale, 0] },
-        { text: it, fontSize: 9 * scale, color: ink, width: "*" },
-        dotsBar(level, scale, brand, line),
-      ],
-      margin: [0, 0, 0, 5 * scale],
-    };
-  });
-}
+    const stack: any[] = [
+      {
+        text: title,
+        fontSize: 9.8 * scale,
+        bold: true,
+        color: ink,
+        margin: [0, 0, 0, 1.5 * scale],
+      },
+    ];
 
-function sectionTitle(text: string, scale: number, color: string, iconSvg?: string) {
-  const label = safeText(text).toUpperCase();
-  return {
-    columns: iconSvg
-      ? [
-          { svg: iconSvg, width: 12 * scale, margin: [0, 1 * scale, 6 * scale, 0] },
-          { text: label, fontSize: 10 * scale, bold: true, color, letterSpacing: 0.5 },
-        ]
-      : [{ text: label, fontSize: 10 * scale, bold: true, color, letterSpacing: 0.5 }],
-    margin: [0, 12 * scale, 0, 8 * scale],
-  };
-}
+    if (meta) {
+      stack.push({
+        text: meta,
+        fontSize: 9 * scale,
+        color: muted,
+        margin: [0, 0, 0, 2 * scale],
+      });
+    }
 
-function hr(scale: number, color: string, width = 515) {
-  return {
-    canvas: [{ type: "line", x1: 0, y1: 0, x2: width, y2: 0, lineWidth: 1, lineColor: color }],
-    margin: [0, 8 * scale, 0, 8 * scale],
-  };
-}
+    if (bullets.length) {
+      stack.push({
+        ul: bullets,
+        fontSize: 9 * scale,
+        color: ink,
+        margin: [0, 0, 0, 4 * scale],
+      });
+    }
 
-/** Card pdfmake propre (padding via layout) */
-function card(scale: number, fill: string, border: string, stack: any[], pad = 12) {
-  const p = pad * scale;
-  return {
-    table: { widths: ["*"], body: [[{ stack, fillColor: fill }]] },
-    layout: {
-      hLineWidth: () => 1,
-      vLineWidth: () => 1,
-      hLineColor: () => border,
-      vLineColor: () => border,
-      paddingLeft: () => p,
-      paddingRight: () => p,
-      paddingTop: () => p,
-      paddingBottom: () => p,
-    },
-  };
-}
-
-function renderXp(model: CvDocModel, scale: number, ink: string, muted: string, brand: string) {
-  const xp: any[] = Array.isArray((model as any).xp) ? (model as any).xp : [];
-  if (!xp.length) return [{ text: "—", fontSize: 9 * scale, color: muted }];
-
-  return xp.slice(0, 4).map((x) => {
-    const role = safeText(x?.role);
-    const company = safeText(x?.company);
-    const dates = safeText(x?.dates);
-    const city = safeText(x?.city);
-    const bullets = Array.isArray(x?.bullets) ? x.bullets.map(safeText).filter(Boolean).slice(0, 4) : [];
-
-    return {
-      stack: [
-        { text: [role, company].filter(Boolean).join(" — ") || "—", fontSize: 10.3 * scale, bold: true, color: ink, margin: [0, 0, 0, 2 * scale] },
-        {
-          columns: [
-            dates
-              ? { columns: [{ svg: ICONS.calendar(muted), width: 10 * scale, margin: [0, 1 * scale, 4 * scale, 0] }, { text: dates, fontSize: 8.6 * scale, color: muted }], width: "*" }
-              : { text: "", width: "*" },
-            city
-              ? { columns: [{ svg: ICONS.pin(muted), width: 10 * scale, margin: [0, 1 * scale, 4 * scale, 0] }, { text: city, fontSize: 8.6 * scale, color: muted }], width: "auto" }
-              : null,
-          ].filter(Boolean),
-          margin: [0, 0, 0, 3 * scale],
-        },
-        bullets.length
-          ? { ul: bullets.map((b: string) => ({ text: b, fontSize: 9 * scale, color: ink })), margin: [0, 0, 0, 8 * scale] }
-          : { canvas: [{ type: "line", x1: 0, y1: 0, x2: 60 * scale, y2: 0, lineWidth: 2, lineColor: mixHex(brand, "#ffffff", 0.25) }], margin: [0, 3 * scale, 0, 10 * scale] },
-      ],
-    };
+    return { stack };
   });
 }
 
 function renderEducation(model: CvDocModel, scale: number, ink: string, muted: string) {
-  const edu = Array.isArray((model as any).education) ? (model as any).education : [];
-  if (!edu.length) return [{ text: "—", fontSize: 9 * scale, color: muted }];
-  return edu.slice(0, 3).map((line) => ({ text: safeText(line), fontSize: 9.2 * scale, color: ink, margin: [0, 0, 0, 4 * scale] }));
+  const eduRaw: unknown = (model as any).education;
+  let eduArr: string[] = [];
+
+  if (Array.isArray(eduRaw)) {
+    eduArr = (eduRaw as unknown as string[]).map((v: string) => safeText(v)).filter(Boolean);
+  } else {
+    const one = safeText(eduRaw);
+    if (one) {
+      eduArr = one
+        .split("\n")
+        .map((l: string) => l.trim())
+        .filter(Boolean);
+    }
+  }
+
+  if (!eduArr.length) {
+    return [
+      {
+        text: "—",
+        fontSize: 9 * scale,
+        color: muted,
+      },
+    ];
+  }
+
+  return eduArr.slice(0, 4).map((line: string) => ({
+    text: line,
+    fontSize: 9 * scale,
+    color: ink,
+    margin: [0, 0, 0, 4 * scale],
+  }));
 }
 
-function renderSkillsCompact(model: CvDocModel, scale: number, muted: string) {
-  const s: any = (model as any).skills || {};
-  const all = [
-    ...((Array.isArray(s.cloud) ? s.cloud : []) as string[]),
-    ...((Array.isArray(s.sec) ? s.sec : []) as string[]),
-    ...((Array.isArray(s.sys) ? s.sys : []) as string[]),
-    ...((Array.isArray(s.auto) ? s.auto : []) as string[]),
-    ...((Array.isArray(s.tools) ? s.tools : []) as string[]),
-  ];
-  const txt = joinDot(all, 22);
-  return txt ? { text: txt, fontSize: 9 * scale, color: muted, lineHeight: 1.2 } : { text: "—", fontSize: 9 * scale, color: muted };
-}
+// ----------------------------------------------------
+// Base docDefinition
+// ----------------------------------------------------
 
-// ----------------------
-// TEMPLATE BUILDERS
-// ----------------------
-
-function buildClassic(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  const brand = pick(colors, "brand", "#ef4444");
+function baseDocDefinition(
+  _model: CvDocModel,
+  colors: PdfColorsLike,
+  scale: number,
+  pageMargins: [number, number, number, number]
+) {
+  const brand = pick(colors, "brand", "#2563eb");
   const ink = pick(colors, "ink", "#111827");
   const muted = pick(colors, "muted", "#6b7280");
   const line = pick(colors, "line", "#e5e7eb");
   const bgSoft = pick(colors, "bgSoft", "#f3f4f6");
   const white = pick(colors, "white", "#ffffff");
 
-  const leftW = 185 * scale;
-
   return {
     pageSize: "A4",
-    pageMargins: [34 * scale, 28 * scale, 34 * scale, 24 * scale],
-    content: [
+    pageMargins,
+    defaultStyle: { font: "Roboto", fontSize: 10 * scale, color: ink },
+    styles: {
+      name: { fontSize: 18 * scale, bold: true, color: ink },
+      title: { fontSize: 11 * scale, bold: true, color: brand },
+      contact: { fontSize: 9 * scale, color: muted },
+      section: { fontSize: 10.5 * scale, bold: true, color: ink },
+      small: { fontSize: 9 * scale, color: muted },
+    },
+    _palette: { brand, ink, muted, line, bgSoft, white },
+    content: [] as any[],
+  } as any;
+}
+
+// ----------------------------------------------------
+// Templates
+// ----------------------------------------------------
+
+function buildClassic(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  const L = normLang(lang);
+  const brand = pick(colors, "brand", "#ef4444");
+  const ink = pick(colors, "ink", "#111827");
+  const muted = pick(colors, "muted", "#6b7280");
+  const line = pick(colors, "line", "#e5e7eb");
+
+  const doc = baseDocDefinition(model, colors, scale, [
+    34 * scale,
+    30 * scale,
+    34 * scale,
+    26 * scale,
+  ]);
+
+  const leftWidth = 170 * scale;
+
+  const skills = collectSkills(model);
+
+  (doc.content as any[]).push({
+    columns: [
       {
-        columns: [
+        width: leftWidth,
+        stack: [
           {
-            width: leftW,
-            stack: [
-              { canvas: [{ type: "rect", x: 0, y: 0, w: leftW, h: 780, color: bgSoft, r: 12 * scale }] },
-              {
-                stack: [
-                  { text: safeText((model as any).name), fontSize: 17 * scale, bold: true, color: ink, margin: [14 * scale, -760, 12 * scale, 2 * scale] },
-                  (model as any).title ? { text: safeText((model as any).title), fontSize: 9.8 * scale, color: muted, margin: [14 * scale, 0, 12 * scale, 8 * scale] } : null,
-                  (model as any).contactLine ? { text: safeText((model as any).contactLine), fontSize: 8.6 * scale, color: muted, margin: [14 * scale, 0, 12 * scale, 10 * scale] } : null,
-
-                  sectionTitle(normLang(lang) === "en" ? "Skills" : "Compétences", scale, brand, ICONS.globe(brand)),
-                  { ...renderSkillsCompact(model, scale, muted), margin: [14 * scale, -6 * scale, 12 * scale, 8 * scale] },
-
-                  sectionTitle("Certifications", scale, brand, ICONS.medal(brand)),
-                  {
-                    text: safeText((model as any).certs) || "—",
-                    fontSize: 9 * scale,
-                    color: muted,
-                    margin: [14 * scale, -6 * scale, 12 * scale, 8 * scale],
-                  },
-
-                  sectionTitle(normLang(lang) === "en" ? "Languages" : "Langues", scale, brand, ICONS.globe(brand)),
-                  {
-                    stack: renderLanguages(safeText((model as any).langLine), scale, brand, line, ink, muted),
-                    margin: [14 * scale, -6 * scale, 12 * scale, 0],
-                  },
-                ].filter(Boolean),
-              },
-            ],
+            text: safeText(model.name),
+            style: "name",
           },
           {
-            width: "*",
-            stack: [
-              // petit accent
-              { canvas: [{ type: "rect", x: 0, y: 0, w: 14 * scale, h: 14 * scale, color: brand, r: 3 * scale }], margin: [0, 0, 0, 6 * scale] },
+            text: safeText((model as any).title),
+            style: "title",
+            margin: [0, 2 * scale, 0, 0],
+          },
+          {
+            text: safeText((model as any).contactLine ?? (model as any).contact),
+            style: "contact",
+            margin: [0, 6 * scale, 0, 8 * scale],
+          },
+          hr(scale, line),
 
-              (model as any).profile
-                ? card(scale, white, line, [
-                    { text: normLang(lang) === "en" ? "PROFILE" : "PROFIL", fontSize: 8.8 * scale, bold: true, color: brand, margin: [0, 0, 0, 4 * scale] },
-                    { text: safeText((model as any).profile), fontSize: 9.5 * scale, color: ink, lineHeight: 1.25 },
-                  ])
-                : null,
+          sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
+          {
+            text: joinDot(skills, 120),
+            fontSize: 9 * scale,
+            color: muted,
+            margin: [0, 2 * scale, 0, 6 * scale],
+          },
 
-              hr(scale, line, 320),
+          sectionTitle(L === "en" ? "Languages" : "Langues", scale, ink),
+          {
+            text: safeText((model as any).langLine),
+            fontSize: 9 * scale,
+            color: muted,
+            margin: [0, 2 * scale, 0, 6 * scale],
+          },
 
-              sectionTitle(normLang(lang) === "en" ? "Experience" : "Expérience", scale, brand, ICONS.calendar(brand)),
-              { stack: renderXp(model, scale, ink, muted, brand) },
-
-              hr(scale, line, 320),
-
-              sectionTitle(normLang(lang) === "en" ? "Education" : "Formation", scale, brand, ICONS.cap(brand)),
-              { stack: renderEducation(model, scale, ink, muted) },
-            ].filter(Boolean),
+          sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
+          {
+            text: joinDot((model as any).hobbies as string[] | undefined, 120),
+            fontSize: 9 * scale,
+            color: muted,
+            margin: [0, 2 * scale, 0, 0],
           },
         ],
-        columnGap: 18 * scale,
+      },
+      {
+        width: "*",
+        stack: [
+          sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
+          {
+            text: safeText((model as any).profile),
+            fontSize: 9.5 * scale,
+            color: ink,
+            margin: [0, 2 * scale, 0, 8 * scale],
+            alignment: "justify",
+          },
+
+          hr(scale, line),
+
+          sectionTitle(L === "en" ? "Experience" : "Expérience professionnelle", scale, ink),
+          {
+            stack: renderXp(model, scale, ink, muted),
+          },
+
+          hr(scale, line),
+
+          sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
+          {
+            stack: renderEducation(model, scale, ink, muted),
+          },
+
+          sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
+          {
+            text: safeText((model as any).certs),
+            fontSize: 9 * scale,
+            color: ink,
+            margin: [0, 2 * scale, 0, 0],
+          },
+        ],
       },
     ],
-  } as any;
+    columnGap: 18 * scale,
+  });
+
+  return doc;
 }
 
 function buildModern(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  const brand = pick(colors, "brand", "#ef4444");
+  const L = normLang(lang);
+  const brand = pick(colors, "brand", "#2563eb");
   const ink = pick(colors, "ink", "#0f172a");
-  const muted = pick(colors, "muted", "#64748b");
-  const line = pick(colors, "line", "#e2e8f0");
-  const bgSoft = pick(colors, "bgSoft", "#f8fafc");
-  const white = pick(colors, "white", "#ffffff");
+  const muted = pick(colors, "muted", "#6b7280");
+  const line = pick(colors, "line", "#e5e7eb");
+  const bgSoft = pick(colors, "bgSoft", "#eff6ff");
 
-  const headerH = 132 * scale;
-  const rightW = 178 * scale;
+  const doc = baseDocDefinition(model, colors, scale, [
+    30 * scale,
+    28 * scale,
+    30 * scale,
+    28 * scale,
+  ]);
 
-  return {
-    pageSize: "A4",
-    pageMargins: [34 * scale, 28 * scale, 34 * scale, 24 * scale],
-    background: (currentPage: number, pageSize: any) => {
-      if (currentPage !== 1) return null;
-      const w = pageSize?.width ?? 595;
-      return [
-        // header band
-        { canvas: [{ type: "rect", x: 0, y: 0, w, h: headerH, color: brand }] },
-        // dot motif (léger)
-        {
-          canvas: Array.from({ length: 64 }).map((_, i) => {
-            const x = (w - 40) - (i % 8) * 18;
-            const y = 18 + Math.floor(i / 8) * 14;
-            return { type: "ellipse", x, y, r1: 1.5, r2: 1.5, color: mixHex("#ffffff", brand, 0.85), opacity: 0.25 };
-          }),
-        },
-        // bottom border
-        { canvas: [{ type: "rect", x: 0, y: pageSize?.height - 10, w, h: 10, color: brand }] },
-      ];
+  const skills = collectSkills(model);
+
+  (doc.content as any[]).push(
+    {
+      // Header bande colorée
+      table: {
+        widths: ["*", "*"],
+        body: [
+          [
+            {
+              stack: [
+                {
+                  text: safeText(model.name),
+                  fontSize: 20 * scale,
+                  bold: true,
+                  color: ink,
+                },
+                {
+                  text: safeText((model as any).title),
+                  fontSize: 11 * scale,
+                  bold: true,
+                  color: brand,
+                  margin: [0, 2 * scale, 0, 0],
+                },
+              ],
+            },
+            {
+              stack: [
+                {
+                  text: safeText((model as any).contactLine ?? (model as any).contact),
+                  fontSize: 9 * scale,
+                  color: muted,
+                  alignment: "right",
+                },
+                {
+                  text: safeText((model as any).langLine),
+                  fontSize: 9 * scale,
+                  color: muted,
+                  alignment: "right",
+                  margin: [0, 2 * scale, 0, 0],
+                },
+              ],
+            },
+          ],
+        ],
+      },
+      layout: "noBorders",
+      fillColor: bgSoft,
+      margin: [-6 * scale, -6 * scale, -6 * scale, 10 * scale],
     },
-    content: [
-      // Header texts
-      {
-        columns: [
-          {
-            width: "*",
-            stack: [
-              { text: safeText((model as any).name), fontSize: 22 * scale, bold: true, color: "#ffffff" },
-              (model as any).title ? { text: safeText((model as any).title), fontSize: 10.5 * scale, color: "#ffffff", opacity: 0.95, margin: [0, 4 * scale, 0, 0] } : null,
-              (model as any).contactLine ? { text: safeText((model as any).contactLine), fontSize: 9 * scale, color: "#ffffff", opacity: 0.9, margin: [0, 8 * scale, 0, 0] } : null,
-            ].filter(Boolean),
-          },
-          {
-            width: 60 * scale,
-            stack: [
-              // badge carré (pseudo photo)
-              {
-                canvas: [
-                  { type: "rect", x: 0, y: 0, w: 60 * scale, h: 60 * scale, color: mixHex("#ffffff", brand, 0.92), r: 12 * scale },
-                  { type: "ellipse", x: 30 * scale, y: 30 * scale, r1: 18 * scale, r2: 18 * scale, color: "#ffffff", opacity: 0.35 },
-                ],
-              },
-            ],
-          },
-        ],
-        columnGap: 14 * scale,
-        margin: [0, 0, 0, 16 * scale],
-      },
 
-      // ✅ Profil card mieux lisible (ton point)
-      (model as any).profile
-        ? {
-            ...card(scale, white, line, [
-              {
-                columns: [
-                  { svg: ICONS.user(brand), width: 12 * scale, margin: [0, 1 * scale, 6 * scale, 0] },
-                  { text: normLang(lang) === "en" ? "PROFILE" : "PROFIL", fontSize: 9.3 * scale, bold: true, color: brand, letterSpacing: 0.3 },
-                ],
-                margin: [0, 0, 0, 4 * scale],
-              },
-              { text: safeText((model as any).profile), fontSize: 9.8 * scale, color: ink, lineHeight: 1.28 },
-            ]),
-            margin: [0, 0, 0, 10 * scale],
-          }
-        : null,
+    {
+      columns: [
+        {
+          width: "*",
+          stack: [
+            sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
+            {
+              text: safeText((model as any).profile),
+              fontSize: 9.5 * scale,
+              color: ink,
+              margin: [0, 2 * scale, 0, 6 * scale],
+              alignment: "justify",
+            },
 
-      {
-        columns: [
-          {
-            width: "*",
-            stack: [
-              sectionTitle(normLang(lang) === "en" ? "Experience" : "Expérience", scale, brand, ICONS.calendar(brand)),
-              { stack: renderXp(model, scale, ink, muted, brand) },
+            sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
+            {
+              stack: renderXp(model, scale, ink, muted),
+            },
+          ],
+        },
+        {
+          width: 180 * scale,
+          margin: [16 * scale, 0, 0, 0],
+          stack: [
+            sectionTitle(L === "en" ? "Key Skills" : "Compétences clés", scale, ink),
+            {
+              text: joinDot(skills, 140),
+              fontSize: 9 * scale,
+              color: muted,
+              margin: [0, 2 * scale, 0, 6 * scale],
+            },
 
-              hr(scale, line, 330),
+            sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
+            {
+              stack: renderEducation(model, scale, ink, muted),
+            },
 
-              sectionTitle(normLang(lang) === "en" ? "Education" : "Formation", scale, brand, ICONS.cap(brand)),
-              { stack: renderEducation(model, scale, ink, muted) },
-            ],
-          },
-          {
-            width: rightW,
-            margin: [18 * scale, 0, 0, 0],
-            stack: [
-              sectionTitle(normLang(lang) === "en" ? "Skills" : "Compétences", scale, ink, ICONS.globe(ink)),
-              renderSkillsCompact(model, scale, muted),
-              hr(scale, line, rightW),
+            sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
+            {
+              text: safeText((model as any).certs),
+              fontSize: 9 * scale,
+              color: muted,
+              margin: [0, 2 * scale, 0, 6 * scale],
+            },
 
-              sectionTitle("Certifications", scale, ink, ICONS.medal(ink)),
-              { text: safeText((model as any).certs) || "—", fontSize: 9 * scale, color: muted },
-              hr(scale, line, rightW),
+            sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
+            {
+              text: joinDot((model as any).hobbies as string[] | undefined, 140),
+              fontSize: 9 * scale,
+              color: muted,
+            },
+          ],
+        },
+      ],
+      columnGap: 18 * scale,
+    }
+  );
 
-              sectionTitle(normLang(lang) === "en" ? "Languages" : "Langues", scale, ink, ICONS.globe(ink)),
-              { stack: renderLanguages(safeText((model as any).langLine), scale, brand, line, ink, muted) },
-            ],
-          },
-        ],
-      },
-    ].filter(Boolean),
-  } as any;
+  return doc;
 }
 
 function buildMinimalist(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  const brand = pick(colors, "brand", "#ef4444");
-  const ink = pick(colors, "ink", "#0f172a");
-  const muted = pick(colors, "muted", "#64748b");
-  const line = pick(colors, "line", "#e2e8f0");
+  const L = normLang(lang);
+  const ink = pick(colors, "ink", "#111827");
+  const muted = pick(colors, "muted", "#6b7280");
+  const line = pick(colors, "line", "#e5e7eb");
 
-  return {
-    pageSize: "A4",
-    pageMargins: [40 * scale, 34 * scale, 40 * scale, 28 * scale],
-    content: [
-      { text: safeText((model as any).name), fontSize: 21 * scale, bold: true, color: ink, margin: [0, 0, 0, 2 * scale] },
-      (model as any).title ? { text: safeText((model as any).title), fontSize: 10.5 * scale, color: muted, margin: [0, 0, 0, 4 * scale] } : null,
-      (model as any).contactLine ? { text: safeText((model as any).contactLine), fontSize: 9 * scale, color: muted, margin: [0, 0, 0, 8 * scale] } : null,
-      { canvas: [{ type: "line", x1: 0, y1: 0, x2: 515, y2: 0, lineWidth: 2, lineColor: brand }], margin: [0, 2 * scale, 0, 10 * scale] },
+  const doc = baseDocDefinition(model, colors, scale, [
+    40 * scale,
+    32 * scale,
+    40 * scale,
+    32 * scale,
+  ]);
 
-      (model as any).profile ? { text: safeText((model as any).profile), fontSize: 9.6 * scale, color: muted, lineHeight: 1.25, margin: [0, 0, 0, 6 * scale] } : null,
+  const skills = collectSkills(model);
 
-      sectionTitle(normLang(lang) === "en" ? "Skills" : "Compétences", scale, ink),
-      renderSkillsCompact(model, scale, muted),
+  (doc.content as any[]).push(
+    {
+      text: safeText(model.name),
+      fontSize: 20 * scale,
+      bold: true,
+      color: ink,
+      margin: [0, 0, 0, 2 * scale],
+    },
+    {
+      text: safeText((model as any).title),
+      fontSize: 11 * scale,
+      color: muted,
+      margin: [0, 0, 0, 4 * scale],
+    },
+    {
+      text: safeText((model as any).contactLine ?? (model as any).contact),
+      fontSize: 9 * scale,
+      color: muted,
+      margin: [0, 0, 0, 8 * scale],
+    },
+    hr(scale, line),
+    sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
+    {
+      text: safeText((model as any).profile),
+      fontSize: 9.5 * scale,
+      color: ink,
+      margin: [0, 2 * scale, 0, 6 * scale],
+      alignment: "justify",
+    },
+    sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
+    {
+      stack: renderXp(model, scale, ink, muted),
+      margin: [0, 0, 0, 4 * scale],
+    },
+    sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
+    {
+      stack: renderEducation(model, scale, ink, muted),
+    },
+    sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
+    {
+      text: joinDot(skills, 160),
+      fontSize: 9 * scale,
+      color: muted,
+      margin: [0, 2 * scale, 0, 4 * scale],
+    },
+    sectionTitle(L === "en" ? "Languages" : "Langues", scale, ink),
+    {
+      text: safeText((model as any).langLine),
+      fontSize: 9 * scale,
+      color: muted,
+      margin: [0, 2 * scale, 0, 4 * scale],
+    },
+    sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
+    {
+      text: joinDot((model as any).hobbies as string[] | undefined, 160),
+      fontSize: 9 * scale,
+      color: muted,
+    }
+  );
 
-      sectionTitle(normLang(lang) === "en" ? "Experience" : "Expérience", scale, ink),
-      { stack: renderXp(model, scale, ink, muted, brand) },
-
-      sectionTitle(normLang(lang) === "en" ? "Education" : "Formation", scale, ink),
-      { stack: renderEducation(model, scale, ink, muted) },
-
-      sectionTitle(normLang(lang) === "en" ? "Languages" : "Langues", scale, ink),
-      { stack: renderLanguages(safeText((model as any).langLine), scale, brand, line, ink, muted) },
-    ].filter(Boolean),
-  } as any;
+  return doc;
 }
 
+// pour l’instant, on réutilise les layouts existants
 function buildCreative(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  const brand = pick(colors, "brand", "#ef4444");
-  const ink = pick(colors, "ink", "#0f172a");
-  const muted = pick(colors, "muted", "#64748b");
-  const line = pick(colors, "line", "#e2e8f0");
-  const bgSoft = pick(colors, "bgSoft", "#f8fafc");
-  const white = pick(colors, "white", "#ffffff");
-
-  const cardTitle = (t: string) => ({ text: t, fontSize: 10 * scale, bold: true, color: ink, margin: [0, 0, 0, 6 * scale] });
-
-  return {
-    pageSize: "A4",
-    pageMargins: [34 * scale, 28 * scale, 34 * scale, 24 * scale],
-    content: [
-      {
-        columns: [
-          {
-            width: "*",
-            stack: [
-              { text: safeText((model as any).name), fontSize: 19 * scale, bold: true, color: ink },
-              (model as any).title ? { text: safeText((model as any).title), fontSize: 10.5 * scale, color: muted, margin: [0, 2 * scale, 0, 2 * scale] } : null,
-              (model as any).contactLine ? { text: safeText((model as any).contactLine), fontSize: 9 * scale, color: muted } : null,
-            ].filter(Boolean),
-          },
-          {
-            width: 120 * scale,
-            stack: [{ canvas: [{ type: "rect", x: 0, y: 0, w: 120 * scale, h: 12 * scale, color: brand, r: 6 * scale }] }],
-          },
-        ],
-        margin: [0, 0, 0, 10 * scale],
-      },
-
-      (model as any).profile
-        ? { ...card(scale, white, line, [{ text: safeText((model as any).profile), fontSize: 9.4 * scale, color: muted, lineHeight: 1.25 }]), margin: [0, 0, 0, 10 * scale] }
-        : null,
-
-      {
-        columns: [
-          {
-            width: 230 * scale,
-            stack: [
-              card(scale, bgSoft, line, [
-                cardTitle(normLang(lang) === "en" ? "Skills" : "Compétences"),
-                renderSkillsCompact(model, scale, muted),
-              ]),
-              { text: " ", margin: [0, 8 * scale, 0, 0] },
-              card(scale, bgSoft, line, [
-                cardTitle(normLang(lang) === "en" ? "Languages" : "Langues"),
-                { stack: renderLanguages(safeText((model as any).langLine), scale, brand, line, ink, muted) },
-              ]),
-              { text: " ", margin: [0, 8 * scale, 0, 0] },
-              card(scale, bgSoft, line, [
-                cardTitle("Certifications"),
-                { text: safeText((model as any).certs) || "—", fontSize: 9 * scale, color: muted },
-              ]),
-            ],
-          },
-          {
-            width: "*",
-            stack: [
-              card(scale, white, line, [
-                cardTitle(normLang(lang) === "en" ? "Experience" : "Expérience"),
-                { stack: renderXp(model, scale, ink, muted, brand) },
-              ]),
-              { text: " ", margin: [0, 8 * scale, 0, 0] },
-              card(scale, white, line, [
-                cardTitle(normLang(lang) === "en" ? "Education" : "Formation"),
-                { stack: renderEducation(model, scale, ink, muted) },
-              ]),
-            ],
-          },
-        ],
-        columnGap: 14 * scale,
-      },
-    ].filter(Boolean),
-  } as any;
+  // Style plus "design" : on réutilise Modern (tu pourras raffiner plus tard)
+  return buildModern(model, lang, colors, scale);
 }
 
 function buildElegant(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  const brand = pick(colors, "brand", "#ef4444");
-  const ink = pick(colors, "ink", "#0f172a");
-  const muted = pick(colors, "muted", "#64748b");
-  const line = pick(colors, "line", "#e2e8f0");
-
-  return {
-    pageSize: "A4",
-    pageMargins: [40 * scale, 34 * scale, 40 * scale, 28 * scale],
-    content: [
-      {
-        columns: [
-          {
-            width: "*",
-            stack: [
-              { text: safeText((model as any).name), fontSize: 21 * scale, bold: true, color: ink, margin: [0, 0, 0, 2 * scale] },
-              (model as any).title ? { text: safeText((model as any).title), fontSize: 10.5 * scale, color: muted } : null,
-              (model as any).contactLine ? { text: safeText((model as any).contactLine), fontSize: 9 * scale, color: muted, margin: [0, 4 * scale, 0, 0] } : null,
-            ].filter(Boolean),
-          },
-          {
-            width: 120 * scale,
-            stack: [
-              {
-                canvas: [
-                  { type: "rect", x: 0, y: 2 * scale, w: 120 * scale, h: 2 * scale, color: brand, r: 1 * scale },
-                  { type: "rect", x: 28 * scale, y: 10 * scale, w: 92 * scale, h: 2 * scale, color: brand, r: 1 * scale, opacity: 0.35 },
-                ],
-              },
-            ],
-          },
-        ],
-        margin: [0, 0, 0, 10 * scale],
-      },
-
-      (model as any).profile ? { text: safeText((model as any).profile), fontSize: 9.6 * scale, color: muted, lineHeight: 1.28, margin: [0, 0, 0, 10 * scale] } : null,
-
-      sectionTitle(normLang(lang) === "en" ? "Experience" : "Expérience", scale, brand, ICONS.calendar(brand)),
-      { stack: renderXp(model, scale, ink, muted, brand) },
-
-      hr(scale, line, 515),
-
-      {
-        columns: [
-          {
-            width: "*",
-            stack: [
-              sectionTitle(normLang(lang) === "en" ? "Skills" : "Compétences", scale, brand, ICONS.globe(brand)),
-              renderSkillsCompact(model, scale, muted),
-              hr(scale, line, 300),
-              sectionTitle("Certifications", scale, brand, ICONS.medal(brand)),
-              { text: safeText((model as any).certs) || "—", fontSize: 9.2 * scale, color: muted },
-            ],
-          },
-          {
-            width: 210 * scale,
-            stack: [
-              sectionTitle(normLang(lang) === "en" ? "Education" : "Formation", scale, brand, ICONS.cap(brand)),
-              { stack: renderEducation(model, scale, ink, muted) },
-              hr(scale, line, 210),
-              sectionTitle(normLang(lang) === "en" ? "Languages" : "Langues", scale, brand, ICONS.globe(brand)),
-              { stack: renderLanguages(safeText((model as any).langLine), scale, brand, line, ink, muted) },
-            ],
-          },
-        ],
-        columnGap: 16 * scale,
-      },
-    ].filter(Boolean),
-  } as any;
+  // Style premium mais sobre : on part du Classic
+  return buildClassic(model, lang, colors, scale);
 }
 
 function buildTech(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  const brand = pick(colors, "brand", "#ef4444");
-  const ink = pick(colors, "ink", "#0f172a");
-  const muted = pick(colors, "muted", "#64748b");
-  const line = pick(colors, "line", "#e2e8f0");
-
-  const sidebar = "#0b1220";
-  const sidebarText = "#ffffff";
-  const leftW = 185 * scale;
-
-  return {
-    pageSize: "A4",
-    pageMargins: [32 * scale, 28 * scale, 32 * scale, 24 * scale],
-    content: [
-      {
-        columns: [
-          {
-            width: leftW,
-            stack: [
-              { canvas: [{ type: "rect", x: 0, y: 0, w: leftW, h: 780, color: sidebar, r: 12 * scale }] },
-              {
-                stack: [
-                  { text: safeText((model as any).name), fontSize: 16.5 * scale, bold: true, color: sidebarText, margin: [14 * scale, -760, 12 * scale, 3 * scale] },
-                  (model as any).title ? { text: safeText((model as any).title), fontSize: 9.5 * scale, color: sidebarText, opacity: 0.9, margin: [14 * scale, 0, 12 * scale, 8 * scale] } : null,
-                  (model as any).contactLine ? { text: safeText((model as any).contactLine), fontSize: 8.6 * scale, color: sidebarText, opacity: 0.85, margin: [14 * scale, 0, 12 * scale, 10 * scale] } : null,
-
-                  {
-                    text: (normLang(lang) === "en" ? "SKILLS" : "COMPÉTENCES"),
-                    fontSize: 9.2 * scale,
-                    bold: true,
-                    color: brand,
-                    margin: [14 * scale, 0, 12 * scale, 6 * scale],
-                    letterSpacing: 0.8,
-                  },
-                  { ...renderSkillsCompact(model, scale, sidebarText), margin: [14 * scale, 0, 12 * scale, 10 * scale] },
-
-                  {
-                    text: (normLang(lang) === "en" ? "LANGUAGES" : "LANGUES"),
-                    fontSize: 9.2 * scale,
-                    bold: true,
-                    color: brand,
-                    margin: [14 * scale, 0, 12 * scale, 6 * scale],
-                    letterSpacing: 0.8,
-                  },
-                  {
-                    stack: renderLanguages(safeText((model as any).langLine), scale, brand, mixHex(line, "#000000", 0.35), sidebarText, sidebarText),
-                    margin: [14 * scale, 0, 12 * scale, 8 * scale],
-                  },
-
-                  {
-                    text: "CERTIFS",
-                    fontSize: 9.2 * scale,
-                    bold: true,
-                    color: brand,
-                    margin: [14 * scale, 0, 12 * scale, 6 * scale],
-                    letterSpacing: 0.8,
-                  },
-                  { text: safeText((model as any).certs) || "—", fontSize: 8.8 * scale, color: sidebarText, opacity: 0.9, margin: [14 * scale, 0, 12 * scale, 0] },
-                ].filter(Boolean),
-              },
-            ],
-          },
-          {
-            width: "*",
-            stack: [
-              { canvas: [{ type: "rect", x: 0, y: 0, w: 16 * scale, h: 16 * scale, color: brand, r: 3 * scale }], margin: [0, 0, 0, 6 * scale] },
-
-              (model as any).profile ? { text: safeText((model as any).profile), fontSize: 9.4 * scale, color: muted, lineHeight: 1.25, margin: [0, 0, 0, 10 * scale] } : null,
-
-              sectionTitle(normLang(lang) === "en" ? "Experience" : "Expérience", scale, ink, ICONS.calendar(ink)),
-              { stack: renderXp(model, scale, ink, muted, brand) },
-
-              hr(scale, line, 320),
-
-              sectionTitle(normLang(lang) === "en" ? "Education" : "Formation", scale, ink, ICONS.cap(ink)),
-              { stack: renderEducation(model, scale, ink, muted) },
-            ].filter(Boolean),
-          },
-        ],
-        columnGap: 16 * scale,
-      },
-    ],
-  } as any;
+  // Palette plus sombre pour un look "tech"
+  const overridden: PdfColorsLike = {
+    ...colors,
+    brand: colors.brand || "#22c55e",
+    ink: colors.ink || "#f9fafb",
+    muted: colors.muted || "#94a3b8",
+    bgSoft: colors.bgSoft || "#020617",
+    line: colors.line || "#1e293b",
+  };
+  return buildModern(model, lang, overridden, scale);
 }
 
 function buildProMax(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  const brand = pick(colors, "brand", "#ef4444");
-  const brand2 = mixHex(brand, "#ffffff", 0.35); // pseudo "dégradé"
-  const ink = pick(colors, "ink", "#0f172a");
-  const muted = pick(colors, "muted", "#64748b");
-  const line = pick(colors, "line", "#e2e8f0");
-  const bgSoft = pick(colors, "bgSoft", "#f8fafc");
-  const white = pick(colors, "white", "#ffffff");
-
-  const headerH = 148 * scale;
-  const rightW = 182 * scale;
-
-  const headerGradientBands = Array.from({ length: 18 }).map((_, i) => ({
-    type: "rect",
-    x: (i * 34) as any,
-    y: 0,
-    w: 34,
-    h: headerH,
-    color: mixHex(brand, brand2, i / 17),
-    opacity: 0.95,
-  }));
-
-  return {
-    pageSize: "A4",
-    pageMargins: [34 * scale, 28 * scale, 34 * scale, 24 * scale],
-    background: (currentPage: number, pageSize: any) => {
-      if (currentPage !== 1) return null;
-      const w = pageSize?.width ?? 595;
-      const h = pageSize?.height ?? 842;
-      return [
-        // header pseudo-grad
-        { canvas: headerGradientBands.map((b) => ({ ...b, w: (w / 18) + 1, x: (b.x as number) * (w / (18 * 34)) })) },
-        // big soft circle motif
-        { canvas: [{ type: "ellipse", x: w - 70, y: 64, r1: 90, r2: 90, color: "#ffffff", opacity: 0.18 }] },
-        { canvas: [{ type: "ellipse", x: w - 40, y: 86, r1: 62, r2: 62, color: "#ffffff", opacity: 0.12 }] },
-        // bottom border
-        { canvas: [{ type: "rect", x: 0, y: h - 10, w, h: 10, color: brand }] },
-      ];
-    },
-    content: [
-      {
-        columns: [
-          {
-            width: "*",
-            stack: [
-              { text: safeText((model as any).name), fontSize: 24 * scale, bold: true, color: "#ffffff" },
-              (model as any).title ? { text: safeText((model as any).title), fontSize: 11 * scale, color: "#ffffff", opacity: 0.95, margin: [0, 4 * scale, 0, 0] } : null,
-              (model as any).contactLine ? { text: safeText((model as any).contactLine), fontSize: 9.2 * scale, color: "#ffffff", opacity: 0.9, margin: [0, 10 * scale, 0, 0] } : null,
-            ].filter(Boolean),
-          },
-          {
-            width: 62 * scale,
-            stack: [
-              {
-                canvas: [
-                  { type: "rect", x: 0, y: 0, w: 62 * scale, h: 62 * scale, color: mixHex("#ffffff", brand, 0.9), r: 14 * scale },
-                  { type: "ellipse", x: 31 * scale, y: 31 * scale, r1: 20 * scale, r2: 20 * scale, color: "#ffffff", opacity: 0.25 },
-                ],
-              },
-            ],
-          },
-        ],
-        columnGap: 14 * scale,
-        margin: [0, 0, 0, 16 * scale],
-      },
-
-      // Profile Card (premium)
-      (model as any).profile
-        ? {
-            ...card(scale, white, line, [
-              {
-                columns: [
-                  { svg: ICONS.user(brand), width: 12 * scale, margin: [0, 1 * scale, 6 * scale, 0] },
-                  { text: (normLang(lang) === "en" ? "PROFILE" : "PROFIL") + " — Pro Max", fontSize: 9.3 * scale, bold: true, color: brand, letterSpacing: 0.3 },
-                ],
-                margin: [0, 0, 0, 4 * scale],
-              },
-              { text: safeText((model as any).profile), fontSize: 9.9 * scale, color: ink, lineHeight: 1.3 },
-            ]),
-            margin: [0, 0, 0, 12 * scale],
-          }
-        : null,
-
-      {
-        columns: [
-          {
-            width: "*",
-            stack: [
-              // Experience card
-              {
-                ...card(scale, white, line, [
-                  sectionTitle(normLang(lang) === "en" ? "Experience" : "Expérience", scale, brand, ICONS.calendar(brand)),
-                  { stack: renderXp(model, scale, ink, muted, brand) },
-                ]),
-                margin: [0, 0, 0, 10 * scale],
-              },
-
-              // Education card
-              card(scale, white, line, [
-                sectionTitle(normLang(lang) === "en" ? "Education" : "Formation", scale, brand, ICONS.cap(brand)),
-                { stack: renderEducation(model, scale, ink, muted) },
-              ]),
-            ],
-          },
-          {
-            width: rightW,
-            margin: [18 * scale, 0, 0, 0],
-            stack: [
-              // Skills (dark badge)
-              {
-                table: { widths: ["*"], body: [[{ stack: [sectionTitle(normLang(lang) === "en" ? "Skills" : "Compétences", scale, "#ffffff", ICONS.globe("#ffffff")), renderSkillsCompact(model, scale, "#cbd5e1")], fillColor: "#0b1220" }]] },
-                layout: {
-                  hLineWidth: () => 0,
-                  vLineWidth: () => 0,
-                  paddingLeft: () => 12 * scale,
-                  paddingRight: () => 12 * scale,
-                  paddingTop: () => 12 * scale,
-                  paddingBottom: () => 12 * scale,
-                },
-                margin: [0, 0, 0, 10 * scale],
-              },
-
-              card(scale, bgSoft, line, [
-                sectionTitle("Certifications", scale, ink, ICONS.medal(ink)),
-                { text: safeText((model as any).certs) || "—", fontSize: 9.2 * scale, color: muted },
-              ]),
-
-              { text: " ", margin: [0, 8 * scale, 0, 0] },
-
-              card(scale, bgSoft, line, [
-                sectionTitle(normLang(lang) === "en" ? "Languages" : "Langues", scale, ink, ICONS.globe(ink)),
-                { stack: renderLanguages(safeText((model as any).langLine), scale, brand, line, ink, muted) },
-              ]),
-            ],
-          },
-        ],
-      },
-    ].filter(Boolean),
-  } as any;
+  // Version "premium" basée sur Modern, avec léger zoom
+  const overridden: PdfColorsLike = {
+    ...colors,
+    brand: colors.brand || "#0ea5e9",
+  };
+  const boostedScale = clamp(scale * 1.02, 0.75, 1.6);
+  return buildModern(model, lang, overridden, boostedScale);
 }
 
-// ----------------------
-// PUBLIC API
-// ----------------------
+// ----------------------------------------------------
+// Public API
+// ----------------------------------------------------
+
 export function buildCvPdf(
   templateId: CvTemplateId,
   model: CvDocModel,
@@ -989,12 +674,16 @@ export function buildCvPdf(
 ) {
   const L = normLang(lang);
 
-  // ATS -> ton template existant
+  // mapping layout -> styleMode attendu par buildCvAtsPdf
+  const styleMode: "auto" | "compact" | "expanded" =
+    layout === "tight" ? "compact" : layout === "spacious" ? "expanded" : "auto";
+
+  // ATS = ton template existant
   if (templateId === "ats") {
-    return buildCvAtsPdf(model, L, colors as any, layout, scale);
+    return buildCvAtsPdf(model, L, colors as any, styleMode, scale);
   }
 
-  // layout = ajustement global
+  // ajustement global de l’échelle selon layout
   const mul = layout === "tight" ? 0.92 : layout === "spacious" ? 1.08 : 1.0;
   const s = clamp(scale * mul, 0.75, 1.6);
 
@@ -1014,6 +703,7 @@ export function buildCvPdf(
     case "pro_max":
       return buildProMax(model, L, colors, s);
     default:
-      return buildModern(model, L, colors, s);
+      // fallback safe
+      return buildClassic(model, L, colors, s);
   }
 }

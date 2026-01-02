@@ -560,25 +560,37 @@ function FullScreenModal({
 }
 
 // =============================
-// ✅ PDF VIEWER (sans toolbar Chrome)
-// Requiert: npm i pdfjs-dist
+// ✅ PDF VIEWER (sans toolbar Chrome) via PDF.js CDN
 // =============================
 let __pdfjsReady = false;
 let __pdfjs: any = null;
+let __pdfjsLoading: Promise<any> | null = null;
 
 async function ensurePdfJs() {
   if (__pdfjsReady && __pdfjs) return __pdfjs;
+  if (__pdfjsLoading) return __pdfjsLoading;
 
-  // ✅ pdfjs v4+ : chemin correct = pdf.mjs (pas build/pdf)
-  const pdfjs = await import("pdfjs-dist/build/pdf.mjs");
-  __pdfjs = pdfjs;
+  __pdfjsLoading = (async () => {
+    if (typeof window === "undefined") {
+      throw new Error("PDF.js doit être chargé côté client.");
+    }
 
-  // ✅ Worker via CDN (évite les soucis Next/Webpack avec pdf.worker.min.mjs)
-  const v = (pdfjs as any).version || "4.0.379";
-  (pdfjs as any).GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${v}/build/pdf.worker.min.mjs`;
+    // Version PDF.js utilisée via CDN
+    const PDFJS_VERSION = "4.0.379";
 
-  __pdfjsReady = true;
-  return pdfjs;
+    const pdfjs: any = await import(
+      /* webpackIgnore: true */ `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.mjs`
+    );
+
+    // Worker PDF.js également via CDN
+    pdfjs.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
+
+    __pdfjs = pdfjs;
+    __pdfjsReady = true;
+    return pdfjs;
+  })();
+
+  return __pdfjsLoading;
 }
 
 function PdfCanvasViewer({
@@ -612,10 +624,12 @@ function PdfCanvasViewer({
 
       try {
         const pdfjs = await ensurePdfJs();
-        // ✅ Correction syntaxe getDocument
+
+        // On passe un objet { url } (plus robuste)
         const task = (pdfjs as any).getDocument({ url: fileUrl });
         const doc = await task.promise;
         if (cancelled) return;
+
         setPdf(doc);
         setNumPages(doc.numPages || 1);
       } catch (e: any) {
@@ -890,8 +904,8 @@ export default function AssistanceCandidaturePage() {
   const [lmLoading, setLmLoading] = useState(false);
   const [lmError, setLmError] = useState<string | null>(null);
 
-  const [lmPdfError, setLmPdfError] = useState<string | null>(null);
   const [lmPdfLoading, setLmPdfLoading] = useState(false);
+  const [lmPdfError, setLmPdfError] = useState<string | null>(null);
 
   const [lmLastBlob, setLmLastBlob] = useState<Blob | null>(null);
   const [lmPreviewUrl, setLmPreviewUrl] = useState<string | null>(null);
