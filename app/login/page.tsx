@@ -1,12 +1,13 @@
 "use client";
 
 import { Suspense, useState, useEffect, FormEvent } from "react";
-import Script from "next/script";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   signInWithEmailAndPassword,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   GoogleAuthProvider,
 } from "firebase/auth";
 import { auth, googleProvider, db } from "@/lib/firebase";
@@ -18,10 +19,100 @@ import { getRecaptchaToken, verifyRecaptcha } from "@/lib/recaptcha";
 const MAX_ATTEMPTS = 5;
 const LOCK_DURATION_MS = 60_000; // 1 minute
 
+function isProbablyMobile() {
+  if (typeof navigator === "undefined") return false;
+  return /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent);
+}
+
+function isInAppBrowser() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  // Instagram / Facebook / Messenger / LinkedIn / Twitter(X) webviews etc.
+  return /FBAN|FBAV|Instagram|Line|LinkedInApp|Twitter|X;/i.test(ua);
+}
+
+function shouldUseRedirectFlow() {
+  // On ne l’utilise PLUS directement pour Google,
+  // mais on le garde si tu veux t’en servir plus tard
+  return isProbablyMobile() || isInAppBrowser();
+}
+
+function formatRecaptchaDetails(check: any) {
+  const reason = String(check?.reason || "unknown");
+  const score =
+    typeof check?.score === "number" ? `score=${check.score.toFixed(2)}` : null;
+  const expected = check?.expected ? `expected=${check.expected}` : null;
+  const got = check?.got ? `got=${check.got}` : null;
+
+  const parts = [reason, score, expected, got].filter(Boolean);
+  return parts.length ? `(${parts.join(", ")})` : "";
+}
+
+// ✅ Utilisé seulement pour email + mot de passe
+async function checkRecaptchaOrDegrade(params: {
+  action: string;
+  emailForLog: string;
+  providerForLog: "password" | "google";
+  onError: (msg: string) => void;
+}) {
+  const { action, emailForLog, providerForLog, onError } = params;
+
+  // Sur mobile, si reCAPTCHA ne charge pas à cause d’un bloqueur / webview,
+  // on autorise un mode dégradé pour ne pas bloquer l’accès.
+  const allowDegraded = shouldUseRedirectFlow();
+
+  let token = "";
+  try {
+    token = await getRecaptchaToken(action);
+  } catch (e: any) {
+    logAuthFailed({
+      email: emailForLog,
+      provider: providerForLog,
+      errorCode: "recaptcha:token_error",
+      errorMessage: e?.message || "getRecaptchaToken failed",
+    });
+
+    if (allowDegraded) {
+      onError(
+        "⚠️ reCAPTCHA bloquée sur ce navigateur (webview / bloqueur). Connexion en mode dégradé. Si possible, ouvre le site dans Chrome/Safari."
+      );
+      return { ok: true, degraded: true };
+    }
+
+    onError(
+      "Sécurité: impossible de valider reCAPTCHA (script bloqué ?). Désactive l’adblock ou ouvre dans Chrome/Safari puis réessaie."
+    );
+    return { ok: false, degraded: false };
+  }
+
+  const check: any = await verifyRecaptcha(token, action);
+  if (!check.ok) {
+    const details = formatRecaptchaDetails(check);
+
+    logAuthFailed({
+      email: emailForLog,
+      provider: providerForLog,
+      errorCode: `recaptcha:${check.reason}`,
+      errorMessage: `score=${check.score ?? "?"}`,
+    });
+
+    if (allowDegraded && (check.reason === "timeout" || check.reason === "unavailable")) {
+      onError(
+        `⚠️ reCAPTCHA instable sur mobile. Connexion en mode dégradé. ${details}`.trim()
+      );
+      return { ok: true, degraded: true };
+    }
+
+    onError(`Connexion refusée par sécurité. Réessayez. ${details}`.trim());
+    return { ok: false, degraded: false };
+  }
+
+  return { ok: true, degraded: false };
+}
+
 function LoginPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
-
   const { user, loading, blocked } = useAuth();
 
   const [email, setEmail] = useState("");
@@ -41,7 +132,7 @@ function LoginPageInner() {
     if (!blocked) return;
     setInfo(null);
     setError(
-      "Votre compte est bloqué. Si vous pensez que c'est une erreur, contactez l'administrateur."
+      "Votre compte est bloqué. Si vous pensez que c’est une erreur, contactez l’administrateur."
     );
   }, [blocked]);
 
@@ -64,7 +155,7 @@ function LoginPageInner() {
     if (blockedParam === "1") {
       setInfo(null);
       setError(
-        "Votre compte a été bloqué par l'administrateur. Si vous pensez que c'est une erreur, contactez le support."
+        "Votre compte a été bloqué par l’administrateur. Si vous pensez que c’est une erreur, contactez le support."
       );
     } else if (justSignedUp === "1") {
       setError(null);
@@ -124,6 +215,46 @@ function LoginPageInner() {
     return () => window.clearInterval(id);
   }, [isLocked, lockEnd]);
 
+  // ✅ Finalise le login Google quand on revient de signInWithRedirect()
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    (async () => {
+      try {
+        setSubmitting(true);
+        const result = await getRedirectResult(auth);
+        if (!result) return;
+
+        const u = result.user;
+
+        // Vérif blocage Firestore
+        const ref = doc(db, "users", u.uid);
+        const snap = await getDoc(ref);
+        const data = snap.data() as any | undefined;
+
+        if (data?.blocked) {
+          await auth.signOut();
+          setError(
+            "Votre compte est bloqué. Si vous pensez que c’est une erreur, contactez l’administrateur."
+          );
+          return;
+        }
+
+        const displayName = u.displayName || u.email || "";
+        setInfo(`Bienvenue ${displayName} 👋`);
+
+        const redirectTo = searchParams.get("redirect") || "/app";
+        router.replace(redirectTo);
+      } catch (err: any) {
+        // Important: getRedirectResult peut throw si rien / annulé selon environnements
+        console.error("getRedirectResult error:", err);
+      } finally {
+        setSubmitting(false);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // -------------------------
   //  LOGIN EMAIL / PASSWORD
   // -------------------------
@@ -136,33 +267,18 @@ function LoginPageInner() {
     setSubmitting(true);
 
     try {
-      // ✅ reCAPTCHA avant Firebase Auth
-      const action = "LOGIN";
-      let token = "";
-      try {
-        token = await getRecaptchaToken(action);
-      } catch {
-        setError(
-          "Sécurité: impossible de valider reCAPTCHA (script bloqué ?). Désactive l'adblock et réessaie."
-        );
-        return;
-      }
-
-      const check = await verifyRecaptcha(token, action);
-      if (!check.ok) {
-        setError("Connexion refusée par sécurité. Réessayez dans quelques secondes.");
-        logAuthFailed({
-          email,
-          provider: "password",
-          errorCode: `recaptcha:${check.reason}`,
-          errorMessage: `score=${check.score ?? "?"}`,
-        });
-        return;
-      }
+      // ✅ reCAPTCHA avant Firebase Auth (avec fallback mobile)
+      const cap = await checkRecaptchaOrDegrade({
+        action: "login",
+        emailForLog: email,
+        providerForLog: "password",
+        onError: (msg) => setInfo(msg),
+      });
+      if (!cap.ok) return;
 
       const cred = await signInWithEmailAndPassword(auth, email, password);
 
-      // Vérif blocage Firestore (optionnel, mais ok)
+      // Vérif blocage Firestore
       const ref = doc(db, "users", cred.user.uid);
       const snap = await getDoc(ref);
       const data = snap.data() as any | undefined;
@@ -170,7 +286,7 @@ function LoginPageInner() {
       if (data?.blocked) {
         await auth.signOut();
         setError(
-          "Votre compte est bloqué. Si vous pensez que c'est une erreur, contactez l'administrateur."
+          "Votre compte est bloqué. Si vous pensez que c’est une erreur, contactez l’administrateur."
         );
         return;
       }
@@ -216,7 +332,7 @@ function LoginPageInner() {
         setError("Email ou mot de passe incorrect. Vérifiez vos identifiants puis réessayez.");
       } else if (code === "auth/too-many-requests") {
         setError(
-          "Trop de tentatives échouées. Votre compte est temporairement bloqué côté serveur. Réessayez dans quelques minutes ou réinitialisez votre mot de passe."
+          "Trop de tentatives échouées. Blocage temporaire côté serveur. Réessayez dans quelques minutes ou réinitialisez votre mot de passe."
         );
       } else if (code === "auth/network-request-failed") {
         setError("Problème de connexion réseau. Vérifiez votre connexion Internet.");
@@ -229,7 +345,7 @@ function LoginPageInner() {
   };
 
   // -------------------------
-  //  LOGIN GOOGLE
+  //  LOGIN GOOGLE (SIMPLIFIÉ)
   // -------------------------
   const handleGoogleLogin = async () => {
     setError(null);
@@ -237,51 +353,43 @@ function LoginPageInner() {
     setSubmitting(true);
 
     try {
-      // ✅ reCAPTCHA avant Firebase Auth
-      const action = "LOGIN_GOOGLE";
-      let token = "";
-      try {
-        token = await getRecaptchaToken(action);
-      } catch {
-        setError(
-          "Sécurité: impossible de valider reCAPTCHA (script bloqué ?). Désactive l'adblock et réessaie."
-        );
-        return;
-      }
-
-      const check = await verifyRecaptcha(token, action);
-      if (!check.ok) {
-        setError("Connexion refusée par sécurité. Réessayez dans quelques secondes.");
-        logAuthFailed({
-          email,
-          provider: "google",
-          errorCode: `recaptcha:${check.reason}`,
-          errorMessage: `score=${check.score ?? "?"}`,
-        });
-        return;
-      }
-
       const provider = googleProvider || new GoogleAuthProvider();
-      const result = await signInWithPopup(auth, provider);
-      const u = result.user;
 
-      const ref = doc(db, "users", u.uid);
-      const snap = await getDoc(ref);
-      const data = snap.data() as any | undefined;
+      // ✅ NO reCAPTCHA pour Google → on évite le combo redirect + enterprise qui casse sur mobile
 
-      if (data?.blocked) {
-        await auth.signOut();
-        setError(
-          "Votre compte est bloqué. Si vous pensez que c'est une erreur, contactez l'administrateur."
-        );
-        return;
+      // 1) On tente TOUJOURS le popup (desktop + mobile)
+      try {
+        const result = await signInWithPopup(auth, provider);
+        const u = result.user;
+
+        const ref = doc(db, "users", u.uid);
+        const snap = await getDoc(ref);
+        const data = snap.data() as any | undefined;
+
+        if (data?.blocked) {
+          await auth.signOut();
+          setError(
+            "Votre compte est bloqué. Si vous pensez que c’est une erreur, contactez l’administrateur."
+          );
+          return;
+        }
+
+        const displayName = u.displayName || u.email || "";
+        setInfo(`Bienvenue ${displayName} 👋`);
+
+        const redirectTo = searchParams.get("redirect") || "/app";
+        router.replace(redirectTo);
+      } catch (err: any) {
+        const code = err?.code as string | undefined;
+
+        // 2) Popup bloquée → fallback redirect (tous devices)
+        if (code === "auth/popup-blocked" || code === "auth/cancelled-popup-request") {
+          await signInWithRedirect(auth, provider);
+          return;
+        }
+
+        throw err;
       }
-
-      const displayName = u.displayName || u.email || "";
-      setInfo(`Bienvenue ${displayName} 👋`);
-
-      const redirectTo = searchParams.get("redirect") || "/app";
-      router.replace(redirectTo);
     } catch (err: any) {
       console.error("Google login error:", err);
       const code = err?.code as string | undefined;
@@ -295,7 +403,7 @@ function LoginPageInner() {
 
       if (code === "auth/account-exists-with-different-credential") {
         setError(
-          "Un compte existe déjà pour cette adresse email avec une autre méthode de connexion. Essayez avec votre mot de passe habituel."
+          "Un compte existe déjà pour cette adresse email avec une autre méthode. Essayez avec votre mot de passe habituel."
         );
       } else if (code === "auth/popup-closed-by-user") {
         setError("La fenêtre Google a été fermée avant la fin du processus.");
@@ -321,11 +429,6 @@ function LoginPageInner() {
 
   return (
     <div className="min-h-screen flex flex-col bg-gradient-to-b from-slate-950 via-slate-950/95 to-slate-900 text-slate-100">
-      <Script
-        src={`https://www.google.com/recaptcha/enterprise.js?render=${process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY}`}
-        strategy="afterInteractive"
-      />
-
       {/* NAVBAR */}
       <header className="border-b border-slate-800/80 bg-slate-950/80 backdrop-blur">
         <div className="max-w-5xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-3">
@@ -461,7 +564,9 @@ function LoginPageInner() {
 
           <div className="flex items-center gap-2 my-4">
             <div className="h-px flex-1 bg-slate-800" />
-            <span className="text-[10px] text-slate-500 uppercase tracking-[0.16em]">ou</span>
+            <span className="text-[10px] text-slate-500 uppercase tracking-[0.16em]">
+              ou
+            </span>
             <div className="h-px flex-1 bg-slate-800" />
           </div>
 
@@ -476,7 +581,10 @@ function LoginPageInner() {
 
           <p className="mt-4 text-[11px] text-slate-400 text-center">
             Pas encore de compte ?{" "}
-            <Link href="/signup" className="text-sky-400 hover:text-sky-300 hover:underline font-medium">
+            <Link
+              href="/signup"
+              className="text-sky-400 hover:text-sky-300 hover:underline font-medium"
+            >
               Créer un compte
             </Link>
           </p>

@@ -1,363 +1,481 @@
-// lib/gemini.ts
-"use client";
+// /lib/gemini.ts
+// Client-side helpers to call Firebase Cloud Functions (Gemini / PDF / Interview / reCAPTCHA / Jobs / Polar).
+// ✅ Fix: exports GenerateInterviewQAResult (required by /app/app/interview/page.tsx)
 
-// Client-side helpers: Cloud Functions / API routes + reCAPTCHA via lib/recaptcha.ts
-// ⚠️ Ce fichier ne doit contenir AUCUN JSX/React. Uniquement du TypeScript.
+export type Lang = "fr" | "en";
 
-import { getRecaptchaToken } from "@/lib/recaptcha";
+export type SkillSection = { title: string; items: string[] };
+export type SkillsBlock = { sections: SkillSection[]; tools: string[] };
 
-export type Language = "fr" | "en";
-
-/** ------ Types domaine ------ */
-export type ProfileData = {
-  fullName?: string;
-  email?: string;
-  phone?: string;
-  location?: string;
+export type Experience = {
+  company?: string;
+  role?: string;
   title?: string;
-  summary?: string;
-
-  links?: Array<{ label?: string; url: string }>;
-  skills?: string[];
-  languages?: Array<{ name: string; level?: string }>;
-
-  experiences?: Array<{
-    company?: string;
-    title?: string;
-    role?: string; // compat
-    location?: string;
-    city?: string; // compat
-    startDate?: string;
-    endDate?: string;
-    dates?: string; // compat
-    description?: string;
-    bullets?: string[];
-  }>;
-  experience?: any; // compat
-  [key: string]: any;
+  dates?: string;
+  city?: string;
+  location?: string;
+  bullets?: string[];
 };
 
-export type LetterAndPitchResponse = {
-  coverLetter: string;
+export type Education = {
+  school?: string;
+  degree?: string;
+  dates?: string;
+};
+
+export type Profile = {
+  fullName?: string;
+  name?: string;
+  email?: string;
+  phone?: string;
+  linkedin?: string;
+  profileSummary?: string;
+  summary?: string;
+
+  city?: string;
+  address?: string;
+
+  contractType?: string;
+  contractTypeStandard?: string;
+  contractTypeFull?: string;
+
+  primaryDomain?: string;
+  secondaryDomains?: string[];
+
+  skills?: SkillsBlock | string[];
+  softSkills?: string[];
+
+  experiences?: Experience[];
+  education?: Education[];
+  educationShort?: string[];
+
+  certs?: string;
+  langLine?: string;
+  lang?: string;
+
+  hobbies?: string[];
+
+  drivingLicense?: string;
+  vehicle?: string;
+};
+
+export type ExtractProfileResult = Profile;
+
+export type GenerateLetterAndPitchResult = {
+  lang: Lang;
+  letterBody: string; // body only
+  coverLetter: string; // fully formatted doc (header/date/objet/salutation/signature)
   pitch: string;
 };
 
-export type InterviewQAResponse = {
-  questions: Array<{
-    question: string;
-    expectedPoints?: string[];
-    sampleAnswer?: string;
-    answer?: string;
-    a?: string;
-    q?: string;
-  }>;
-  lang: Language;
+export type InterviewQAItem = { question: string; answer: string };
+
+// ✅ THIS TYPE WAS MISSING → fixes your build error
+export type GenerateInterviewQAResult = {
+  questions: InterviewQAItem[];
+  lang: Lang;
 };
 
-/** Compat : ancienne page importait ce type */
-export type GenerateInterviewQAResult = InterviewQAResponse;
+export type InterviewStartResult = {
+  sessionId: string;
+  step: number;
+  totalQuestions: number;
+  next_question: string | null;
+  short_analysis: string;
+  final_summary: string | null;
+  final_score: number | null;
+};
 
-/** ------ Config URLs ------ */
-function stripTrailingSlash(s: string) {
-  return s.endsWith("/") ? s.slice(0, -1) : s;
+export type InterviewAnswerResult = InterviewStartResult;
+
+export type RecaptchaVerifyResult =
+  | { ok: true; score?: number }
+  | { ok: false; reason: string; score?: number; invalidReason?: string };
+
+type JsonValue = any;
+
+function getEnv(name: string): string | undefined {
+  // Next exposes only NEXT_PUBLIC_*
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const v = (process.env as any)?.[name];
+  return typeof v === "string" && v.trim() ? v.trim() : undefined;
 }
 
-const CF_BASE =
-  stripTrailingSlash(
-    process.env.NEXT_PUBLIC_CLOUD_FUNCTIONS_BASE_URL ||
-      "https://europe-west1-assistant-ia-v4.cloudfunctions.net"
-  ) || "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+function getFunctionsBaseUrl(): string {
+  // Allow overriding by env
+  const fromEnv =
+    getEnv("NEXT_PUBLIC_FUNCTIONS_BASE_URL") ||
+    getEnv("NEXT_PUBLIC_FUNCTIONS_URL") ||
+    getEnv("NEXT_PUBLIC_FIREBASE_FUNCTIONS_URL");
 
-const URL_EXTRACT_PROFILE = `${CF_BASE}/extractProfile`;
-const URL_GENERATE_INTERVIEW_QA = `${CF_BASE}/generateInterviewQA`;
-const URL_GENERATE_CV_PDF = `${CF_BASE}/generateCvPdf`;
-const URL_GENERATE_CV_LM_ZIP = `${CF_BASE}/generateCvLmZip`;
-const URL_GENERATE_LETTER_AND_PITCH_CF = `${CF_BASE}/generateLetterAndPitch`;
-const URL_GENERATE_LETTER_PDF = `${CF_BASE}/generateLetterPdf`;
+  if (fromEnv) return fromEnv.replace(/\/+$/, "");
 
-// App Route (Next.js) — si tu utilises /api/letterAndPitch côté serveur
-const URL_LETTER_AND_PITCH_API = "/api/letterAndPitch";
+  // Default to your deployed project (matches your logs)
+  return "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+}
 
-/** ------ Fetch helpers ------ */
-type FetchJsonOptions = {
-  timeoutMs?: number;
-  headers?: Record<string, string>;
-};
+function buildHeaders(opts?: { idToken?: string; extra?: Record<string, string> }): HeadersInit {
+  const h: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(opts?.extra || {}),
+  };
+  if (opts?.idToken) h.Authorization = `Bearer ${opts.idToken}`;
+  return h;
+}
 
-async function readErrorBody(res: Response): Promise<string> {
-  const ct = res.headers.get("content-type") || "";
+async function parseError(resp: Response): Promise<{ message: string; data?: any }> {
+  const ct = resp.headers.get("content-type") || "";
   try {
     if (ct.includes("application/json")) {
-      const j = await res.json().catch(() => null);
-      if (j && typeof j === "object") {
-        const msg =
-          (j as any).error ||
-          (j as any).message ||
-          JSON.stringify(j).slice(0, 2000);
-        return msg;
-      }
+      const j = await resp.json();
+      const msg =
+        (j && (j.message || j.error || j?.details?.reason || j?.details?.error)) ||
+        JSON.stringify(j);
+      return { message: String(msg), data: j };
     }
-    const t = await res.text().catch(() => "");
-    return t || `HTTP ${res.status}`;
+    const t = await resp.text();
+    return { message: t || `${resp.status} ${resp.statusText}` };
   } catch {
-    return `HTTP ${res.status}`;
+    return { message: `${resp.status} ${resp.statusText}` };
   }
 }
 
-async function fetchJson<T>(
-  url: string,
-  body: unknown,
-  opts: FetchJsonOptions = {}
+async function postJson<T = JsonValue>(
+  path: string,
+  body: any,
+  opts?: { idToken?: string }
 ): Promise<T> {
-  const controller = opts.timeoutMs ? new AbortController() : undefined;
-  const timer =
-    controller && opts.timeoutMs
-      ? window.setTimeout(() => controller.abort(), opts.timeoutMs)
-      : undefined;
+  const url = `${getFunctionsBaseUrl()}/${path.replace(/^\/+/, "")}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: buildHeaders({ idToken: opts?.idToken }),
+    body: JSON.stringify(body ?? {}),
+  });
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(opts.headers || {}),
-      },
-      body: JSON.stringify(body),
-      signal: controller?.signal,
+  if (!resp.ok) {
+    const err = await parseError(resp);
+    throw Object.assign(new Error(err.message), {
+      status: resp.status,
+      data: err.data,
+      url,
     });
-
-    if (!res.ok) {
-      const msg = await readErrorBody(res);
-      throw new Error(`HTTP ${res.status}: ${msg}`);
-    }
-
-    return (await res.json()) as T;
-  } finally {
-    if (timer) window.clearTimeout(timer);
   }
+
+  return (await resp.json()) as T;
 }
 
-async function fetchBinary(
-  url: string,
-  body: unknown,
-  opts: FetchJsonOptions = {}
+async function postBinary(
+  path: string,
+  body: any,
+  opts?: { idToken?: string }
 ): Promise<Blob> {
-  const controller = opts.timeoutMs ? new AbortController() : undefined;
-  const timer =
-    controller && opts.timeoutMs
-      ? window.setTimeout(() => controller.abort(), opts.timeoutMs)
-      : undefined;
+  const url = `${getFunctionsBaseUrl()}/${path.replace(/^\/+/, "")}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: buildHeaders({ idToken: opts?.idToken }),
+    body: JSON.stringify(body ?? {}),
+  });
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(opts.headers || {}),
-      },
-      body: JSON.stringify(body),
-      signal: controller?.signal,
+  if (!resp.ok) {
+    const err = await parseError(resp);
+    throw Object.assign(new Error(err.message), {
+      status: resp.status,
+      data: err.data,
+      url,
     });
-
-    if (!res.ok) {
-      const msg = await readErrorBody(res);
-      throw new Error(`HTTP ${res.status}: ${msg}`);
-    }
-
-    return await res.blob();
-  } finally {
-    if (timer) window.clearTimeout(timer);
   }
+
+  const ab = await resp.arrayBuffer();
+  const ct = resp.headers.get("content-type") || "application/octet-stream";
+  return new Blob([ab], { type: ct });
 }
 
-/** ------ Domain helpers ------ */
-function getExperiencesArray(profile: ProfileData): any[] {
-  const a = (profile as any)?.experiences ?? (profile as any)?.experience ?? [];
-  return Array.isArray(a) ? a : [];
+// -----------------------------
+// reCAPTCHA (optional)
+// -----------------------------
+export async function callRecaptchaVerify(args: {
+  token: string;
+  action: string;
+}): Promise<RecaptchaVerifyResult> {
+  return await postJson<RecaptchaVerifyResult>("recaptchaVerify", {
+    token: args.token,
+    action: args.action,
+  });
 }
 
-function buildExperienceJobDescription(
-  profile: ProfileData,
-  experienceIndex: number
-): {
-  jobTitle: string;
-  companyName: string;
-  jobDescription: string;
-  experience: any;
-} {
-  const experiences = getExperiencesArray(profile);
-
-  if (
-    typeof experienceIndex !== "number" ||
-    Number.isNaN(experienceIndex) ||
-    experienceIndex < 0 ||
-    experienceIndex >= experiences.length
-  ) {
-    throw new Error("Indice d'expérience invalide.");
-  }
-
-  const exp = experiences[experienceIndex];
-
-  const jobTitle =
-    String(exp?.title || exp?.role || "").trim() ||
-    String(profile.title || "").trim() ||
-    "Poste (non renseigné)";
-
-  const companyName =
-    String(exp?.company || "").trim() || "Entreprise (non renseignée)";
-
-  const lines: string[] = [];
-  lines.push(`Expérience ciblée: ${jobTitle} chez ${companyName}`);
-
-  const location = exp?.location || exp?.city || profile.location || "";
-  if (location) lines.push(`Lieu: ${String(location)}`);
-
-  const period =
-    exp?.dates ||
-    ((exp?.startDate || exp?.endDate)
-      ? `${exp?.startDate || "?"} → ${exp?.endDate || "?"}`
-      : "");
-  if (period) lines.push(`Période: ${String(period)}`);
-
-  if (exp?.description) {
-    lines.push("");
-    lines.push(String(exp.description));
-  }
-
-  if (Array.isArray(exp?.bullets) && exp.bullets.length) {
-    lines.push("");
-    lines.push("Points clés:");
-    for (const b of exp.bullets) {
-      const t = String(b || "").trim();
-      if (t) lines.push(`- ${t}`);
-    }
-  }
-
-  if (profile.skills?.length) {
-    lines.push("");
-    lines.push(`Compétences (extrait): ${profile.skills.slice(0, 12).join(", ")}`);
-  }
-
-  if (profile.summary?.trim()) {
-    lines.push("");
-    lines.push(`Résumé candidat: ${profile.summary.trim()}`);
-  }
-
-  const jobDescription = lines.join("\n").trim() || "Description non disponible.";
-  return { jobTitle, companyName, jobDescription, experience: exp };
-}
-
-/** ------ Public API ------ */
-export async function callExtractProfile(profileText: string): Promise<ProfileData> {
-  const recaptchaToken = await getRecaptchaToken("extract_profile");
-  return await fetchJson<ProfileData>(
-    URL_EXTRACT_PROFILE,
-    { text: profileText, recaptchaToken },
-    { timeoutMs: 60_000 }
-  );
-}
-
-export async function callGenerateLetterAndPitch(
-  profile: ProfileData,
-  jobOffer: {
-    companyName: string;
-    jobTitle: string;
-    jobDescription: string;
-    location?: string;
-  }
-): Promise<LetterAndPitchResponse> {
-  return await fetchJson<LetterAndPitchResponse>(
-    URL_LETTER_AND_PITCH_API,
-    { profile, jobOffer },
-    { timeoutMs: 90_000 }
-  );
-}
-
-export async function callGenerateLetterAndPitchCF(
-  profile: ProfileData,
-  jobOffer: {
-    companyName: string;
-    jobTitle: string;
-    jobDescription: string;
-    location?: string;
-  },
-  lang: Language = "fr"
-): Promise<LetterAndPitchResponse> {
-  const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
-  return await fetchJson<LetterAndPitchResponse>(
-    URL_GENERATE_LETTER_AND_PITCH_CF,
-    { profile, jobOffer, lang, recaptchaToken },
-    { timeoutMs: 120_000 }
-  );
-}
-
-/** ✅ Q/R entretien sur une expérience (Cloud Function) */
-export async function callGenerateInterviewQA(params: {
-  profile: ProfileData;
-  experienceIndex: number;
-  lang?: Language;
-}): Promise<InterviewQAResponse> {
-  const { profile, experienceIndex, lang = "fr" } = params;
-
-  const { jobTitle, companyName, jobDescription, experience } =
-    buildExperienceJobDescription(profile, experienceIndex);
-
-  const recaptchaToken = await getRecaptchaToken("generate_interview_qa");
-
-  return await fetchJson<InterviewQAResponse>(
-    URL_GENERATE_INTERVIEW_QA,
+// -----------------------------
+// Gemini: extract profile from CV PDF base64
+// -----------------------------
+export async function callExtractProfile(args: {
+  base64Pdf: string;
+  recaptchaToken?: string;
+  idToken?: string; // optional (bypasses recaptcha server-side)
+}): Promise<ExtractProfileResult> {
+  return await postJson<ExtractProfileResult>(
+    "extractProfile",
     {
-      experienceIndex, // ✅ important
-      profile,
-      experience,
-      jobTitle,
-      companyName,
-      jobDescription,
-      lang,
-      recaptchaToken,
+      base64Pdf: args.base64Pdf,
+      recaptchaToken: args.recaptchaToken,
+      action: "extract_profile",
+      recaptchaAction: "extract_profile",
     },
-    { timeoutMs: 120_000 }
+    { idToken: args.idToken }
   );
 }
 
-export async function callGenerateCvPdf(cvJson: unknown): Promise<Blob> {
-  const recaptchaToken = await getRecaptchaToken("generate_cv_pdf");
-  return await fetchBinary(
-    URL_GENERATE_CV_PDF,
-    { cvJson, recaptchaToken },
-    { timeoutMs: 120_000 }
-  );
-}
-
-export async function callGenerateCvLmZip(cvJson: unknown): Promise<Blob> {
-  const recaptchaToken = await getRecaptchaToken("generate_cv_lm_zip");
-  return await fetchBinary(
-    URL_GENERATE_CV_LM_ZIP,
-    { cvJson, recaptchaToken },
-    { timeoutMs: 180_000 }
-  );
-}
-
-export async function callGenerateLetterPdf(params: {
-  letterText: string;
-  candidateName?: string;
+// -----------------------------
+// Gemini: generate letter + pitch (JSON strict)
+// -----------------------------
+export async function callGenerateLetterAndPitch(args: {
+  profile: Profile;
+  jobDescription?: string;
   jobTitle?: string;
   companyName?: string;
-  lang?: Language;
+  lang?: Lang;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<GenerateLetterAndPitchResult> {
+  return await postJson<GenerateLetterAndPitchResult>(
+    "generateLetterAndPitch",
+    {
+      profile: args.profile,
+      jobDescription: args.jobDescription || "",
+      jobTitle: args.jobTitle || "",
+      companyName: args.companyName || "",
+      lang: args.lang || "fr",
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "generate_letter_pitch",
+      action: "generate_letter_pitch",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+// -----------------------------
+// Gemini: generate interview Q&A (3 questions/answers for one experience)
+// -----------------------------
+export async function callGenerateInterviewQA(args: {
+  profile: Profile;
+  experienceIndex: number;
+  lang?: Lang;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<GenerateInterviewQAResult> {
+  return await postJson<GenerateInterviewQAResult>(
+    "generateInterviewQA",
+    {
+      profile: args.profile,
+      experienceIndex: args.experienceIndex,
+      lang: args.lang || "fr",
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "generate_interview_qa",
+      action: "generate_interview_qa",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+// -----------------------------
+// Interview simulation (start / answer)
+// -----------------------------
+export async function callInterviewStart(args: {
+  userId: string;
+  jobTitle?: string;
+  jobDesc?: string;
+  interviewMode?: "complet" | "rapide" | "technique" | "comportemental";
+  difficulty?: "standard" | "difficile";
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<InterviewStartResult> {
+  return await postJson<InterviewStartResult>(
+    "interview",
+    {
+      action: "start",
+      userId: args.userId,
+      jobTitle: args.jobTitle || "",
+      jobDesc: args.jobDesc || "",
+      interviewMode: args.interviewMode || "complet",
+      difficulty: args.difficulty || "standard",
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "interview",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+export async function callInterviewAnswer(args: {
+  userId: string;
+  sessionId: string;
+  userMessage: string;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<InterviewAnswerResult> {
+  return await postJson<InterviewAnswerResult>(
+    "interview",
+    {
+      action: "answer",
+      userId: args.userId,
+      sessionId: args.sessionId,
+      userMessage: args.userMessage,
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "interview",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+// -----------------------------
+// PDF endpoints (return Blob)
+// -----------------------------
+export async function callGenerateCvPdf(args: {
+  profile: Profile;
+  targetJob?: string;
+  lang?: Lang;
+  contract?: string;
+  jobLink?: string;
+  jobDescription?: string;
+  companyName?: string;
+  recaptchaToken?: string;
+  idToken: string; // required (server debits credits)
 }): Promise<Blob> {
-  const {
-    letterText,
-    candidateName = "",
-    jobTitle = "",
-    companyName = "",
-    lang = "fr",
-  } = params;
+  return await postBinary(
+    "generateCvPdf",
+    {
+      profile: args.profile,
+      targetJob: args.targetJob || "",
+      lang: args.lang || "fr",
+      contract: args.contract || "",
+      jobLink: args.jobLink || "",
+      jobDescription: args.jobDescription || "",
+      companyName: args.companyName || "",
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "generate_cv_pdf",
+      action: "generate_cv_pdf",
+    },
+    { idToken: args.idToken }
+  );
+}
 
-  const recaptchaToken = await getRecaptchaToken("generate_letter_pdf");
+export async function callGenerateCvLmZip(args: {
+  profile: Profile;
+  targetJob?: string;
+  lang?: Lang;
+  contract?: string;
+  jobLink?: string;
+  jobDescription?: string;
+  lm: {
+    jobTitle?: string;
+    companyName?: string;
+    jobDescription?: string;
+    lang?: Lang;
+  };
+  recaptchaToken?: string;
+  idToken: string; // required
+}): Promise<Blob> {
+  return await postBinary(
+    "generateCvLmZip",
+    {
+      profile: args.profile,
+      targetJob: args.targetJob || "",
+      lang: args.lang || "fr",
+      contract: args.contract || "",
+      jobLink: args.jobLink || "",
+      jobDescription: args.jobDescription || "",
+      lm: args.lm || {},
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "generate_cv_lm_zip",
+      action: "generate_cv_lm_zip",
+    },
+    { idToken: args.idToken }
+  );
+}
 
-  return await fetchBinary(
-    URL_GENERATE_LETTER_PDF,
-    { letterText, candidateName, jobTitle, companyName, lang, recaptchaToken },
-    { timeoutMs: 120_000 }
+export async function callGenerateLetterPdf(args: {
+  coverLetter: string;
+  jobTitle?: string;
+  companyName?: string;
+  candidateName?: string;
+  lang?: Lang;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<Blob> {
+  return await postBinary(
+    "generateLetterPdf",
+    {
+      coverLetter: args.coverLetter,
+      jobTitle: args.jobTitle || "",
+      companyName: args.companyName || "",
+      candidateName: args.candidateName || "",
+      lang: args.lang || "fr",
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "generate_letter_pdf",
+      action: "generate_letter_pdf",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+// -----------------------------
+// Jobs search (Adzuna proxy)
+// -----------------------------
+export type JobItem = {
+  id: string;
+  title: string;
+  company: string;
+  location: string;
+  url: string;
+  description: string;
+  created: string;
+  salary: string | null;
+};
+
+export type JobsSearchResult = { jobs: JobItem[] };
+
+export async function callJobsSearch(args: {
+  query?: string;
+  location?: string;
+  page?: number;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<JobsSearchResult> {
+  return await postJson<JobsSearchResult>(
+    "jobs",
+    {
+      query: args.query || "",
+      location: args.location || "",
+      page: typeof args.page === "number" ? args.page : 1,
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "jobs_search",
+      action: "jobs_search",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+// -----------------------------
+// Polar checkout
+// -----------------------------
+export type PolarCheckoutResult =
+  | { ok: true; url: string }
+  | { ok: false; error: string };
+
+export async function callPolarCheckout(args: {
+  packId: "20" | "50" | "100" | string;
+  userId: string;
+  email: string;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<PolarCheckoutResult> {
+  return await postJson<PolarCheckoutResult>(
+    "polarCheckout",
+    {
+      packId: args.packId,
+      userId: args.userId,
+      email: args.email,
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "polar_checkout",
+      action: "polar_checkout",
+    },
+    { idToken: args.idToken }
   );
 }

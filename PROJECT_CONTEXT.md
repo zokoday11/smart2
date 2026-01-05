@@ -45,40 +45,6 @@ app/
     logs/
       page.tsx
     page.tsx
-  api/
-    extractProfile/
-      route.ts
-    generate-cv/
-      generate-letter/
-        route.ts
-      route.ts
-    generate-zip/
-      route.ts
-    generateInterviewQA/
-      route.ts
-    generateLetterAndPitch/
-      route.ts
-    interview/
-      route.ts
-    jobs/
-      route.ts
-    letterAndPitch/
-      route.ts
-    linkedin/
-      exchange/
-        route.ts
-      token/
-        route.ts
-    polar/
-      checkout/
-        route.ts
-      test/
-        route.ts
-    stt/
-      route.ts
-    webhook/
-      polar/
-        route.ts
   app/
     apply/
       page.tsx
@@ -206,6 +172,42 @@ public/
     cv-template-tech.png
     cv-template-timeline.png
   manifest.webmanifest
+server/
+  api/
+    api/
+      extractProfile/
+        route.ts
+      generate-cv/
+        generate-letter/
+          route.ts
+        route.ts
+      generate-zip/
+        route.ts
+      generateInterviewQA/
+        route.ts
+      generateLetterAndPitch/
+        route.ts
+      interview/
+        route.ts
+      jobs/
+        route.ts
+      letterAndPitch/
+        route.ts
+      linkedin/
+        exchange/
+          route.ts
+        token/
+          route.ts
+      polar/
+        checkout/
+          route.ts
+        test/
+          route.ts
+      stt/
+        route.ts
+      webhook/
+        polar/
+          route.ts
 types/
   cv.ts
 .firebaserc
@@ -225,6 +227,2865 @@ tsconfig.json
 ```
 
 # Files
+
+## File: server/api/api/extractProfile/route.ts
+````typescript
+import { NextResponse } from "next/server";
+
+const UPSTREAM =
+  process.env.EXTRACT_PROFILE_UPSTREAM ||
+  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/extractProfile";
+
+export async function POST(req: Request) {
+  const auth = req.headers.get("authorization") || "";
+  const recaptcha = req.headers.get("x-recaptcha-token") || "";
+
+  const body = await req.json().catch(() => null);
+
+  if (!body || !body.base64Pdf) {
+    return NextResponse.json(
+      { error: "Champ 'base64Pdf' manquant." },
+      { status: 400 }
+    );
+  }
+
+  const upstreamRes = await fetch(UPSTREAM, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(auth ? { Authorization: auth } : {}),
+      ...(recaptcha ? { "X-Recaptcha-Token": recaptcha } : {}),
+    },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+
+  const text = await upstreamRes.text();
+  const contentType =
+    upstreamRes.headers.get("content-type") || "application/json";
+
+  return new NextResponse(text, {
+    status: upstreamRes.status,
+    headers: { "Content-Type": contentType },
+  });
+}
+````
+
+## File: server/api/api/generate-cv/generate-letter/route.ts
+````typescript
+import { NextResponse } from "next/server";
+import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+
+export const runtime = "nodejs";
+
+function getAdminApp() {
+  if (getApps().length) return getApps()[0];
+
+  const projectId = process.env.FIREBASE_ADMIN_PROJECT_ID || process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_ADMIN_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.FIREBASE_ADMIN_PRIVATE_KEY;
+
+  if (projectId && clientEmail && privateKeyRaw) {
+    const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+    return initializeApp({
+      credential: cert({ projectId, clientEmail, privateKey }),
+    });
+  }
+
+  return initializeApp({
+    credential: applicationDefault(),
+  });
+}
+
+async function requireUser(req: Request) {
+  getAdminApp();
+
+  const authHeader = req.headers.get("authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+
+  if (!token) {
+    return { ok: false as const, status: 401, error: "Missing Authorization Bearer token" };
+  }
+
+  try {
+    const decoded = await getAuth().verifyIdToken(token);
+    return { ok: true as const, uid: decoded.uid, email: decoded.email || "" };
+  } catch (e) {
+    console.error("verifyIdToken error:", e);
+    return { ok: false as const, status: 401, error: "Invalid token" };
+  }
+}
+
+async function consumeCreditsAndLog(params: {
+  uid: string;
+  email: string;
+  cost: number;
+  tool: string;
+  docType: "cv" | "lm" | "other";
+  meta?: any;
+}) {
+  getAdminApp();
+  const db = getFirestore();
+
+  const userRef = db.collection("users").doc(params.uid);
+  const usageRef = db.collection("usageLogs").doc();
+  const now = Date.now();
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const data = snap.exists ? snap.data() || {} : {};
+    const currentCredits = typeof data.credits === "number" ? data.credits : 0;
+
+    if (currentCredits < params.cost) {
+      const err: any = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      throw err;
+    }
+
+    tx.set(
+      userRef,
+      {
+        credits: currentCredits - params.cost,
+        totalIaCalls: FieldValue.increment(1),
+        totalDocumentsGenerated: FieldValue.increment(params.docType === "cv" || params.docType === "lm" ? 1 : 0),
+        totalCvGenerated: FieldValue.increment(params.docType === "cv" ? 1 : 0),
+        totalLmGenerated: FieldValue.increment(params.docType === "lm" ? 1 : 0),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    tx.set(
+      usageRef,
+      {
+        userId: params.uid,
+        email: params.email || "",
+        action: "generate_document",
+        docType: params.docType,
+        eventType: "generate",
+        tool: params.tool,
+        creditsDelta: -params.cost,
+        meta: params.meta || null,
+        createdAt: now,
+        createdAtServer: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+function buildProfileContextForIA(profile: any) {
+  const p = profile || {};
+
+  let skillsArr: any[] = [];
+  if (Array.isArray(p.skills)) {
+    skillsArr = p.skills;
+  } else if (p.skills && typeof p.skills === "object") {
+    if (Array.isArray(p.skills.sections)) {
+      p.skills.sections.forEach((sec: any) => {
+        if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
+      });
+    }
+    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
+  }
+
+  const skillsStr = (skillsArr || []).join(", ");
+
+  const expStr = Array.isArray(p.experiences)
+    ? p.experiences
+        .map(
+          (e: any) =>
+            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
+        )
+        .join("; \n")
+    : "";
+
+  const eduStr = Array.isArray(p.education)
+    ? p.education
+        .map((e: any) => `${e.degree || e.title || ""} - ${e.school || e.institution || ""} (${e.dates || ""})`)
+        .join("; \n")
+    : "";
+
+  return `Nom: ${p.fullName || p.name || ""}
+Titre: ${p.profileHeadline || p.title || ""}
+Contact: ${p.email || ""} | ${p.phone || ""} | ${p.linkedin || ""} | ${p.city || ""}
+Résumé de profil: ${p.profileSummary || p.summary || ""}
+Compétences: ${skillsStr}
+Expériences: 
+${expStr}
+Formations: 
+${eduStr}
+Certifications: ${p.certs || ""}
+Langues: ${p.langLine || p.lang || ""}`.trim();
+}
+
+async function callGeminiText(prompt: string, apiKey: string, temperature = 0.7, maxOutputTokens = 2400) {
+  const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature, maxOutputTokens },
+  };
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const errorText = await resp.text();
+    throw new Error("Erreur Gemini (texte): " + errorText);
+  }
+
+  const data = await resp.json();
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const text = parts
+    .map((p: any) => (typeof p.text === "string" ? p.text : ""))
+    .join("\n")
+    .trim();
+
+  if (!text) throw new Error("Réponse Gemini (texte) vide");
+  return text;
+}
+
+function buildFallbackLetterAndPitch(profile: any, jobTitle: string, companyName: string, jobDescription: string, lang: string) {
+  const p = profile || {};
+  const name = p.fullName || "";
+  const primaryDomain = p.primaryDomain || "";
+  const summary = p.profileSummary || "";
+  const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
+  const role = firstExp?.role || firstExp?.title || "";
+  const company = firstExp?.company || "";
+  const years = Array.isArray(p.experiences) && p.experiences.length > 0 ? p.experiences.length : null;
+
+  if (lang === "en") {
+    return {
+      pitch:
+        summary ||
+        `I am ${name || "a candidate"} with ${years ? years + " years of experience" : "solid experience"} in ${
+          primaryDomain || "my field"
+        }, motivated by the ${jobTitle || "role"} at ${companyName || "your company"}.`,
+      coverLetter: `I am writing to express my interest in the position of ${jobTitle || "your advertised role"}. With ${
+        years ? years + " years of experience" : "solid experience"
+      } in ${primaryDomain || "my field"}, I have developed strong skills relevant to this opportunity.
+
+In my previous experience at ${company || "my last company"}, I contributed to projects with measurable impact and collaborated with different stakeholders.
+
+I would be delighted to discuss how I can contribute to your team.`,
+    };
+  }
+
+  return {
+    pitch:
+      summary ||
+      `Je suis ${name || "un(e) candidat(e)"} avec ${
+        years ? years + " ans d’expérience" : "une solide expérience"
+      } ${primaryDomain ? "dans " + primaryDomain : ""}, motivé(e) par le poste de ${
+        jobTitle || "votre poste"
+      } chez ${companyName || "votre entreprise"}.`,
+    coverLetter: `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
+      companyName || "votre entreprise"
+    }. Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
+      primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
+    }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
+
+Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`,
+  };
+}
+
+export async function POST(req: Request) {
+  const auth = await requireUser(req);
+  if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
+
+  let body: any = null;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const profile = body?.profile;
+  const jobDescription = body?.jobDescription || "";
+  const jobTitle = body?.jobTitle || "";
+  const companyName = body?.companyName || "";
+  const langRaw = body?.lang || "fr";
+  const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+
+  if (!profile) return NextResponse.json({ ok: false, error: "Missing profile" }, { status: 400 });
+  if (!jobTitle && !jobDescription) {
+    return NextResponse.json(
+      { ok: false, error: "Ajoute au moins l'intitulé du poste ou un extrait de la description." },
+      { status: 400 }
+    );
+  }
+
+  // ✅ Débit -1 crédit + log
+  try {
+    await consumeCreditsAndLog({
+      uid: auth.uid,
+      email: auth.email,
+      cost: 1,
+      tool: "generateLetterAndPitch",
+      docType: "lm",
+      meta: { jobTitle, companyName, lang },
+    });
+  } catch (e: any) {
+    if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
+      return NextResponse.json({ ok: false, error: "NO_CREDITS" }, { status: 402 });
+    }
+    console.error("consumeCreditsAndLog error:", e);
+    return NextResponse.json({ ok: false, error: "CREDITS_ERROR" }, { status: 500 });
+  }
+
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+
+  const cvText = buildProfileContextForIA(profile);
+
+  if (!GEMINI_API_KEY) {
+    const fb = buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang);
+    return NextResponse.json({ ok: true, coverLetter: fb.coverLetter, pitch: fb.pitch, lang }, { status: 200 });
+  }
+
+  const prompt =
+    lang === "en"
+      ? `You are a senior career coach and recruiter.
+
+Return STRICTLY valid JSON:
+{ "coverLetter": "string", "pitch": "string" }
+
+COVER LETTER RULES:
+- "coverLetter" must be ONLY the BODY (no header, no subject, no greeting, no signature).
+- 3 to 5 short paragraphs separated by a blank line.
+- Do not invent facts, companies, tools, numbers.
+- Use ONLY the candidate profile and the job description.
+
+CANDIDATE PROFILE (source of truth):
+${cvText}
+
+JOB DESCRIPTION:
+${jobDescription || "—"}
+
+JOB TITLE: ${jobTitle || "the role"}
+COMPANY: ${companyName || "your company"}`
+      : `Tu es un coach carrières senior et recruteur.
+
+Retourne STRICTEMENT un JSON valide :
+{ "coverLetter": "string", "pitch": "string" }
+
+RÈGLES LETTRE :
+- "coverLetter" = UNIQUEMENT le CORPS (pas d’en-tête, pas d’objet, pas de formule d’appel, pas de signature).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Ne pas inventer (entreprises/outils/chiffres).
+- Utilise UNIQUEMENT le profil candidat + la fiche de poste.
+
+PROFIL CANDIDAT (source de vérité) :
+${cvText}
+
+FICHE DE POSTE :
+${jobDescription || "—"}
+
+INTITULÉ : ${jobTitle || "le poste"}
+ENTREPRISE : ${companyName || "votre entreprise"}`;
+
+  let coverLetter = "";
+  let pitch = "";
+
+  try {
+    const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.7, 2200);
+    const cleaned = String(raw).replace(/```json|```/gi, "").trim();
+
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      parsed = { coverLetter: cleaned, pitch: "" };
+    }
+
+    coverLetter = typeof parsed.coverLetter === "string" ? parsed.coverLetter.trim() : "";
+    pitch = typeof parsed.pitch === "string" ? parsed.pitch.trim() : "";
+  } catch (e) {
+    console.error("Gemini generateLetterAndPitch error:", e);
+  }
+
+  if (!coverLetter || !pitch) {
+    const fb = buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang);
+    if (!coverLetter) coverLetter = fb.coverLetter;
+    if (!pitch) pitch = fb.pitch;
+  }
+
+  return NextResponse.json({ ok: true, coverLetter, pitch, lang }, { status: 200 });
+}
+````
+
+## File: server/api/api/generate-cv/route.ts
+````typescript
+import { NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+// ✅ compatible avec output: "export" : on enlève force-dynamic
+// export const dynamic = "force-dynamic";
+
+const UPSTREAM =
+  process.env.GENERATE_LETTER_UPSTREAM ||
+  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
+
+export async function POST(req: Request) {
+  try {
+    const auth = req.headers.get("authorization") || "";
+    const headerRecaptcha = req.headers.get("x-recaptcha-token") || "";
+
+    const body = await req.json().catch(() => null);
+    if (!body) {
+      return NextResponse.json({ error: "Body JSON invalide." }, { status: 400 });
+    }
+
+    const bodyRecaptcha =
+      typeof body?.recaptchaToken === "string" ? body.recaptchaToken : "";
+    const recaptcha = headerRecaptcha || bodyRecaptcha;
+
+    const upstreamRes = await fetch(UPSTREAM, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth ? { Authorization: auth } : {}),
+        ...(recaptcha ? { "X-Recaptcha-Token": recaptcha } : {}),
+      },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+
+    const contentType =
+      upstreamRes.headers.get("content-type") || "application/json";
+    const text = await upstreamRes.text();
+
+    return new NextResponse(text, {
+      status: upstreamRes.status,
+      headers: { "Content-Type": contentType },
+    });
+  } catch (e: any) {
+    console.error("API /generateLetterAndPitch error:", e);
+    return NextResponse.json({ error: "internal_error" }, { status: 500 });
+  }
+}
+````
+
+## File: server/api/api/generate-zip/route.ts
+````typescript
+// app/api/generate-zip/route.ts
+
+import { NextResponse } from "next/server";
+import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import JSZip from "jszip";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+
+// ⚠️ Pour typer proprement le cast à la fin
+type BodyInitCompat = BodyInit | null | undefined;
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+function getAdminApp() {
+  if (getApps().length) return getApps()[0];
+
+  const projectId = process.env.FIREBASE_ADMIN_PROJECT_ID || process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_ADMIN_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.FIREBASE_ADMIN_PRIVATE_KEY;
+
+  if (projectId && clientEmail && privateKeyRaw) {
+    const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+    return initializeApp({
+      credential: cert({ projectId, clientEmail, privateKey }),
+    });
+  }
+
+  return initializeApp({
+    credential: applicationDefault(),
+  });
+}
+
+async function requireUser(req: Request) {
+  getAdminApp();
+
+  const authHeader = req.headers.get("authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+
+  if (!token) {
+    return { ok: false as const, status: 401, error: "Missing Authorization Bearer token" };
+  }
+
+  try {
+    const decoded = await getAuth().verifyIdToken(token);
+    return { ok: true as const, uid: decoded.uid, email: decoded.email || "" };
+  } catch (e) {
+    console.error("verifyIdToken error:", e);
+    return { ok: false as const, status: 401, error: "Invalid token" };
+  }
+}
+
+async function consumeCreditsAndLog(params: {
+  uid: string;
+  email: string;
+  cost: number; // ex 2
+  tool: string; // generateCvLmZip
+  docType: "cv" | "lm" | "other";
+  meta?: any;
+}) {
+  getAdminApp();
+  const db = getFirestore();
+
+  const userRef = db.collection("users").doc(params.uid);
+  const usageRef = db.collection("usageLogs").doc();
+  const now = Date.now();
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(userRef);
+    const data = snap.exists ? snap.data() || {} : {};
+    const currentCredits = typeof data.credits === "number" ? data.credits : 0;
+
+    if (currentCredits < params.cost) {
+      const err: any = new Error("NO_CREDITS");
+      err.code = "NO_CREDITS";
+      throw err;
+    }
+
+    tx.set(
+      userRef,
+      {
+        credits: currentCredits - params.cost,
+        totalIaCalls: FieldValue.increment(1),
+        totalDocumentsGenerated: FieldValue.increment(2), // zip = 2 docs (cv + lm)
+        totalCvGenerated: FieldValue.increment(1),
+        totalLmGenerated: FieldValue.increment(1),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    tx.set(
+      usageRef,
+      {
+        userId: params.uid,
+        email: params.email || "",
+        action: "generate_document",
+        docType: params.docType,
+        eventType: "generate",
+        tool: params.tool,
+        creditsDelta: -params.cost,
+        meta: params.meta || null,
+        createdAt: now,
+        createdAtServer: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+}
+
+function buildProfileContextForIA(profile: any) {
+  const p = profile || {};
+
+  let skillsArr: any[] = [];
+  if (Array.isArray(p.skills)) {
+    skillsArr = p.skills;
+  } else if (p.skills && typeof p.skills === "object") {
+    if (Array.isArray(p.skills.sections)) {
+      p.skills.sections.forEach((sec: any) => {
+        if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
+      });
+    }
+    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
+  }
+
+  const skillsStr = (skillsArr || []).join(", ");
+
+  const expStr = Array.isArray(p.experiences)
+    ? p.experiences
+        .map(
+          (e: any) =>
+            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
+        )
+        .join("; \n")
+    : "";
+
+  const eduStr = Array.isArray(p.education)
+    ? p.education
+        .map((e: any) => `${e.degree || e.title || ""} - ${e.school || e.institution || ""} (${e.dates || ""})`)
+        .join("; \n")
+    : "";
+
+  return `Nom: ${p.fullName || p.name || ""}
+Titre: ${p.profileHeadline || p.title || ""}
+Contact: ${p.email || ""} | ${p.phone || ""} | ${p.linkedin || ""} | ${p.city || ""}
+Résumé de profil: ${p.profileSummary || p.summary || ""}
+Compétences: ${skillsStr}
+Expériences: 
+${expStr}
+Formations: 
+${eduStr}
+Certifications: ${p.certs || ""}
+Langues: ${p.langLine || p.lang || ""}`.trim();
+}
+
+async function callGeminiText(
+  prompt: string,
+  apiKey: string,
+  temperature = 0.65,
+  maxOutputTokens = 1400
+) {
+  const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature, maxOutputTokens },
+  };
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const errorText = await resp.text();
+    throw new Error("Erreur Gemini (texte): " + errorText);
+  }
+
+  const data = await resp.json();
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const text = parts
+    .map((p: any) => (typeof p.text === "string" ? p.text : ""))
+    .join("\n")
+    .trim();
+
+  if (!text) throw new Error("Réponse Gemini (texte) vide");
+  return text;
+}
+
+function buildFallbackLetterBody(profile: any, jobTitle: string, companyName: string, lang: string) {
+  const p = profile || {};
+  const primaryDomain = p.primaryDomain || "";
+  const summary = p.profileSummary || "";
+  const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
+  const role = firstExp?.role || firstExp?.title || "";
+  const company = firstExp?.company || "";
+  const years = Array.isArray(p.experiences) && p.experiences.length > 0 ? p.experiences.length : null;
+
+  if (lang === "en") {
+    return `I am writing to express my interest in the position of ${jobTitle || "your advertised role"} at ${
+      companyName || "your company"
+    }. ${summary || ""}
+
+With ${years ? years + " years of experience" : "solid experience"} in ${primaryDomain || "my field"}, I have developed skills relevant to this opportunity.
+
+In my previous experience at ${company || "my last company"}, I contributed to projects and collaborated with different stakeholders.
+
+I would be delighted to discuss how I can contribute to your team.`;
+  }
+
+  return `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
+    companyName || "votre entreprise"
+  }. ${summary || ""}
+
+Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
+    primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
+  }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
+
+Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`;
+}
+
+async function createSimpleCvPdf(profile: any, options: any) {
+  const { targetJob = "", lang = "fr", contract = "", jobLink = "", jobDescription = "" } = options || {};
+
+  const p = profile || {};
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([595.28, 841.89]); // A4
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const { width, height } = page.getSize();
+  const marginX = 50;
+  let y = height - 60;
+
+  function drawLine(text: string, size = 11, bold = false) {
+    if (!text || y < 50) return;
+    const f = bold ? fontBold : font;
+    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+    y -= size + 4;
+  }
+
+  function drawParagraph(text: string, size = 10) {
+    if (!text) return;
+    const f = font;
+    const maxWidth = width - marginX * 2;
+    const paragraphs = text.split(/\n{2,}/);
+
+    for (const paragraph of paragraphs) {
+      const words = paragraph.split(/\s+/);
+      let line = "";
+
+      for (const w of words) {
+        const testLine = line ? line + " " + w : w;
+        const testWidth = f.widthOfTextAtSize(testLine, size);
+        if (testWidth > maxWidth) {
+          if (y < 50) return;
+          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+          y -= size + 3;
+          line = w;
+        } else {
+          line = testLine;
+        }
+      }
+
+      if (line && y >= 50) {
+        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
+        y -= size + 6;
+      }
+      y -= 2;
+    }
+  }
+
+  function drawSectionTitle(title: string) {
+    if (!title || y < 60) return;
+    page.drawText(title, { x: marginX, y, size: 11, font: fontBold, color: rgb(0.08, 0.15, 0.45) });
+    y -= 14;
+  }
+
+  function drawBullet(text: string, size = 9) {
+    if (!text || y < 50) return;
+    const f = font;
+    const bulletX = marginX + 8;
+    const maxWidth = width - marginX * 2 - 10;
+    const words = text.split(/\s+/);
+    let line = "";
+    let firstLine = true;
+
+    for (const w of words) {
+      const testLine = line ? line + " " + w : w;
+      const testWidth = f.widthOfTextAtSize(testLine, size);
+      if (testWidth > maxWidth) {
+        if (y < 50) return;
+        page.drawText(firstLine ? "• " + line : "  " + line, {
+          x: bulletX,
+          y,
+          size,
+          font: f,
+          color: rgb(0.1, 0.12, 0.16),
+        });
+        y -= size + 3;
+        line = w;
+        firstLine = false;
+      } else {
+        line = testLine;
+      }
+    }
+
+    if (line && y >= 50) {
+      page.drawText(firstLine ? "• " + line : "  " + line, {
+        x: bulletX,
+        y,
+        size,
+        font: f,
+        color: rgb(0.1, 0.12, 0.16),
+      });
+      y -= size + 3;
+    }
+  }
+
+  // Header
+  drawLine(p.fullName || "", 16, true);
+  const jobLine = targetJob || contract || p.contractType || (lang === "en" ? "Target position" : "Poste recherché");
+  drawLine(jobLine, 11, false);
+
+  const contactParts = [p.email || "", p.phone || "", p.city || "", p.linkedin || ""].filter(Boolean);
+  if (contactParts.length) drawLine(contactParts.join(" · "), 9, false);
+
+  if (jobLink) drawLine((lang === "en" ? "Job link: " : "Lien de l'offre : ") + jobLink, 8, false);
+
+  y -= 6;
+
+  if (p.profileSummary) {
+    drawSectionTitle(lang === "en" ? "Profile" : "Profil");
+    drawParagraph(p.profileSummary, 9.5);
+    y -= 4;
+  }
+
+  if (p.skills && Array.isArray(p.skills.sections) && p.skills.sections.length) {
+    drawSectionTitle(lang === "en" ? "Key skills" : "Compétences clés");
+    p.skills.sections.forEach((sec: any) => {
+      if (!sec || (!sec.title && !Array.isArray(sec.items))) return;
+      if (sec.title) drawLine(sec.title, 9.5, true);
+      if (Array.isArray(sec.items)) drawParagraph(sec.items.join(" · "), 9);
+      y -= 2;
+    });
+  }
+
+  if (Array.isArray(p.experiences) && p.experiences.length) {
+    drawSectionTitle(lang === "en" ? "Experience" : "Expériences professionnelles");
+    p.experiences.forEach((exp: any) => {
+      if (y < 90) return;
+      const header = [exp.role, exp.company].filter(Boolean).join(" — ");
+      if (header) drawLine(header, 10, true);
+      if (exp.dates) drawLine(exp.dates, 8.5, false);
+      if (Array.isArray(exp.bullets)) exp.bullets.slice(0, 4).forEach((b: string) => drawBullet(b, 8.5));
+      y -= 4;
+    });
+  }
+
+  if (Array.isArray(p.education) && p.education.length && y > 80) {
+    drawSectionTitle(lang === "en" ? "Education" : "Formation");
+    p.education.forEach((ed: any) => {
+      if (y < 60) return;
+      const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
+      if (header) drawLine(header, 9.5, true);
+      if (ed.dates) drawLine(ed.dates, 8.5, false);
+      y -= 4;
+    });
+  }
+
+  if (p.langLine && y > 60) {
+    drawSectionTitle(lang === "en" ? "Languages" : "Langues");
+    drawParagraph(p.langLine, 9);
+  }
+
+  if (Array.isArray(p.hobbies) && p.hobbies.length && y > 60) {
+    drawSectionTitle(lang === "en" ? "Interests" : "Centres d'intérêt");
+    drawParagraph(p.hobbies.join(" · "), 9);
+  }
+
+  const pdfBytes = await pdfDoc.save();
+  return Buffer.from(pdfBytes);
+}
+
+async function createLetterPdf(coverLetter: string, meta: any) {
+  const { jobTitle = "", companyName = "", candidateName = "", lang = "fr" } = meta || {};
+
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([595.28, 841.89]); // A4
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+  const { width, height } = page.getSize();
+  const marginX = 60;
+  let y = height - 70;
+
+  function drawLine(text: string, size = 11, bold = false) {
+    if (!text || y < 60) return;
+    const f = bold ? fontBold : font;
+    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
+    y -= size + 4;
+  }
+
+  function drawParagraph(text: string, size = 11) {
+    if (!text) return;
+    const f = font;
+    const maxWidth = width - marginX * 2;
+    const paragraphs = text.split(/\n{2,}/);
+
+    for (const paragraph of paragraphs) {
+      const words = paragraph.split(/\s+/);
+      let line = "";
+
+      for (const w of words) {
+        const testLine = line ? line + " " + w : w;
+        const testWidth = f.widthOfTextAtSize(testLine, size);
+        if (testWidth > maxWidth) {
+          if (y < 60) return;
+          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
+          y -= size + 4;
+          line = w;
+        } else {
+          line = testLine;
+        }
+      }
+
+      if (line && y >= 60) {
+        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
+        y -= size + 8;
+      }
+
+      y -= 4;
+    }
+  }
+
+  if (candidateName) drawLine(candidateName, 14, true);
+
+  if (jobTitle || companyName) {
+    const titleLine =
+      lang === "en"
+        ? `Application for ${jobTitle || "the position"} – ${companyName || "Company"}`
+        : `Candidature : ${jobTitle || "poste"} – ${companyName || "Entreprise"}`;
+    drawLine(titleLine, 11, false);
+  }
+
+  y -= 10;
+  drawParagraph(coverLetter, 11);
+
+  const pdfBytes = await pdfDoc.save();
+  return Buffer.from(pdfBytes);
+}
+
+export async function POST(req: Request) {
+  const auth = await requireUser(req);
+  if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
+
+  let body: any = null;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const profile = body?.profile;
+  const targetJob = body?.targetJob || "";
+  const langRaw = body?.lang || "fr";
+  const contract = body?.contract || "";
+  const jobLink = body?.jobLink || "";
+  const jobDescription = body?.jobDescription || "";
+
+  const lm = body?.lm || {};
+  const companyName = lm?.companyName || "";
+  const jobTitle = lm?.jobTitle || targetJob || "";
+  const lmJobDescription = lm?.jobDescription || jobDescription || "";
+  const lmLangRaw = lm?.lang || langRaw;
+
+  const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+  const lmLang = String(lmLangRaw).toLowerCase().startsWith("en") ? "en" : "fr";
+
+  if (!profile) return NextResponse.json({ ok: false, error: "Missing profile" }, { status: 400 });
+
+  // ✅ Débit -2 crédits (CV + LM) + log
+  try {
+    await consumeCreditsAndLog({
+      uid: auth.uid,
+      email: auth.email,
+      cost: 2,
+      tool: "generateCvLmZip",
+      docType: "other",
+      meta: { targetJob, jobTitle, companyName, lang, lmLang },
+    });
+  } catch (e: any) {
+    if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
+      return NextResponse.json({ ok: false, error: "NO_CREDITS" }, { status: 402 });
+    }
+    console.error("consumeCreditsAndLog error:", e);
+    return NextResponse.json({ ok: false, error: "CREDITS_ERROR" }, { status: 500 });
+  }
+
+  // CV PDF
+  let cvBuffer: Buffer;
+  try {
+    cvBuffer = await createSimpleCvPdf(profile, {
+      targetJob,
+      lang,
+      contract,
+      jobLink,
+      jobDescription,
+    });
+  } catch (e: any) {
+    console.error("CV PDF error:", e);
+    return NextResponse.json({ ok: false, error: e?.message || "CV_PDF_ERROR" }, { status: 500 });
+  }
+
+  // LM BODY via Gemini
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+  const cvText = buildProfileContextForIA(profile);
+
+  let coverLetterBody = "";
+
+  if (GEMINI_API_KEY) {
+    const promptLm =
+      lmLang === "en"
+        ? `
+You are a senior career coach and recruiter.
+
+TASK:
+Write ONLY the BODY of a cover letter tailored to the job, using ONLY the provided information (CV + job description).
+
+INPUTS:
+- Job title: "${jobTitle || "the role"}"
+- Company: "${companyName || "your company"}"
+- Job description:
+${lmJobDescription || "—"}
+
+- Candidate profile (source of truth):
+${cvText}
+
+STRICT RULES:
+- Do NOT invent facts (no fake metrics, clients, tools, dates).
+- 3 to 5 paragraphs separated by ONE blank line.
+- No header, no subject line, no greeting, no signature.
+- Output MUST be STRICT JSON only:
+{ "body": "..." }
+`.trim()
+        : `
+Tu es un coach carrières senior et recruteur.
+
+MISSION :
+Rédige UNIQUEMENT le CORPS d’une lettre de motivation adaptée au poste, basée UNIQUEMENT sur les infos fournies (CV + fiche de poste).
+
+ENTRÉES :
+- Intitulé : "${jobTitle || targetJob || "le poste"}"
+- Entreprise : "${companyName || "votre entreprise"}"
+- Fiche de poste :
+${lmJobDescription || "—"}
+
+- Profil candidat :
+${cvText}
+
+RÈGLES :
+- Ne pas inventer (pas de chiffres/clients/technos non présents).
+- 3 à 5 paragraphes séparés par une ligne vide.
+- Pas d’en-tête, pas d’objet, pas de salutation, pas de signature.
+- Réponds STRICTEMENT en JSON :
+{ "body": "..." }
+`.trim();
+
+    try {
+      const rawLm = await callGeminiText(promptLm, GEMINI_API_KEY, 0.65, 1400);
+      const cleaned = String(rawLm).replace(/```json|```/gi, "").trim();
+      try {
+        const parsed = JSON.parse(cleaned);
+        coverLetterBody = typeof parsed.body === "string" ? parsed.body.trim() : "";
+      } catch {
+        coverLetterBody = String(rawLm || "").trim();
+      }
+    } catch (e) {
+      console.error("Gemini LM error:", e);
+    }
+  }
+
+  if (!coverLetterBody) {
+    coverLetterBody = buildFallbackLetterBody(profile, jobTitle, companyName, lmLang);
+  }
+
+  // LM PDF
+  let lmBuffer: Buffer;
+  try {
+    lmBuffer = await createLetterPdf(coverLetterBody, {
+      jobTitle,
+      companyName,
+      candidateName: profile.fullName || "",
+      lang: lmLang,
+    });
+  } catch (e: any) {
+    console.error("LM PDF error:", e);
+    return NextResponse.json({ ok: false, error: e?.message || "LM_PDF_ERROR" }, { status: 500 });
+  }
+
+  // ZIP ✅ (avec cast pour calmer TypeScript)
+  try {
+    const zip = new JSZip();
+    zip.file("cv-ia.pdf", cvBuffer);
+    zip.file(lmLang === "en" ? "cover-letter.pdf" : "lettre-motivation.pdf", lmBuffer);
+
+    const zipContent = await zip.generateAsync({ type: "uint8array" });
+
+    return new NextResponse(zipContent as unknown as BodyInitCompat, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Disposition": 'attachment; filename="cv-lm-ia.zip"',
+        "Content-Length": String(zipContent.byteLength),
+      },
+    });
+  } catch (e: any) {
+    console.error("ZIP error:", e);
+    return NextResponse.json({ ok: false, error: e?.message || "ZIP_ERROR" }, { status: 500 });
+  }
+}
+````
+
+## File: server/api/api/generateInterviewQA/route.ts
+````typescript
+// app/api/generateInterviewQA/route.ts
+import { NextRequest, NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+
+// Petit helper pour récupérer un JSON même si Gemini met des ```json ... ```
+function extractJson(text: string): any | null {
+  if (!text) return null;
+
+  let t = text.trim();
+
+  // Si Gemini renvoie ```json ... ```
+  if (t.startsWith("```")) {
+    // retire ```json ou ``` et la dernière ```
+    t = t.replace(/^```[a-zA-Z]*\s*/, "").replace(/```$/, "").trim();
+  }
+
+  // 1ère tentative : parser tout
+  try {
+    return JSON.parse(t);
+  } catch {
+    // ignore, on tente plus bas
+  }
+
+  // 2ème tentative : chercher le premier bloc {...}
+  const match = t.match(/\{[\s\S]*\}/);
+  if (match) {
+    try {
+      return JSON.parse(match[0]);
+    } catch {
+      // toujours pas bon
+    }
+  }
+
+  return null;
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const { profile, experienceIndex, lang = "fr" } = body;
+
+    if (!profile || typeof experienceIndex !== "number") {
+      return NextResponse.json(
+        { error: "Missing profile or experienceIndex" },
+        { status: 400 }
+      );
+    }
+
+    const experiences: any[] =
+      (profile.experiences as any[]) ||
+      (profile.experience as any[]) ||
+      [];
+
+    const exp = experiences[experienceIndex];
+    if (!exp) {
+      return NextResponse.json(
+        { error: "Experience not found" },
+        { status: 404 }
+      );
+    }
+
+    const bullets = Array.isArray(exp.bullets)
+      ? exp.bullets.join("\n- ")
+      : "";
+
+    const prompt = `
+Tu es un coach d'entretien. Génère 5 questions d'entretien pour le candidat,
+basées sur cette expérience de son CV, avec des réponses de qualité.
+
+Tu dois renvoyer STRICTEMENT un objet JSON valide, sans aucun texte avant ou après.
+
+Format de sortie EXACT :
+{
+  "questions": [
+    {
+      "question": "string",
+      "answer": "string"
+    }
+  ]
+}
+
+Pas de commentaires, pas de texte hors de cet objet JSON.
+
+Langue : ${lang === "en" ? "anglais" : "français"}.
+
+Expérience :
+- Poste : ${exp.role || exp.title || ""}
+- Entreprise : ${exp.company || ""}
+- Lieu : ${exp.city || exp.location || ""}
+- Dates : ${exp.dates || ""}
+
+Missions / résultats :
+- ${bullets}
+    `.trim();
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.warn("[generateInterviewQA] GEMINI_API_KEY manquant → mode démo.");
+      // Fallback démo simple
+      return NextResponse.json({
+        questions: [
+          {
+            question:
+              lang === "en"
+                ? "Tell me about a challenge in this role and how you handled it."
+                : "Parle-moi d’un défi que tu as rencontré sur ce poste et comment tu l’as géré.",
+            answer:
+              lang === "en"
+                ? "Sample answer here…"
+                : "Exemple de réponse ici…",
+          },
+        ],
+        lang,
+      });
+    }
+
+    const model =
+      process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
+
+    const payload = {
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: prompt }],
+        },
+      ],
+      // >>> IMPORTANT : on force une réponse en JSON pur
+      generationConfig: {
+        response_mime_type: "application/json",
+      },
+    };
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const errorText = await resp.text();
+      console.error(
+        "Gemini error (generateInterviewQA):",
+        resp.status,
+        errorText
+      );
+
+      if (resp.status === 429) {
+        console.warn(
+          "[generateInterviewQA] Quota Gemini dépassé → fallback démo."
+        );
+        return NextResponse.json({
+          questions: [
+            {
+              question:
+                lang === "en"
+                  ? "Demo mode (quota exceeded): what did you learn in this experience?"
+                  : "Mode démo (quota dépassé) : qu’as-tu appris dans cette expérience ?",
+              answer:
+                lang === "en"
+                  ? "Sample answer here…"
+                  : "Exemple de réponse ici…",
+            },
+          ],
+          lang,
+        });
+      }
+
+      return NextResponse.json(
+        { error: "Gemini call failed" },
+        { status: 500 }
+      );
+    }
+
+    const data = await resp.json();
+
+    const textRaw: string =
+      data?.candidates?.[0]?.content?.parts
+        ?.map((p: any) => p?.text || "")
+        .join("")
+        .trim() || "";
+
+    if (!textRaw) {
+      console.error("Empty Gemini response (generateInterviewQA):", data);
+      // On ne jette plus une 500, on renvoie un fallback propre
+      return NextResponse.json({
+        questions: [
+          {
+            question:
+              lang === "en"
+                ? "Based on this experience, what are you most proud of?"
+                : "De quoi es-tu le plus fier dans cette expérience ?",
+            answer:
+              lang === "en"
+                ? "Sample answer here…"
+                : "Exemple de réponse ici…",
+          },
+        ],
+        lang,
+      });
+    }
+
+    const parsed = extractJson(textRaw);
+
+    if (!parsed || !Array.isArray(parsed.questions)) {
+      console.error(
+        "JSON parse error generateInterviewQA: texte non exploitable",
+        textRaw
+      );
+      // Toujours un fallback pour ne plus avoir de 500 côté front
+      return NextResponse.json({
+        questions: [
+          {
+            question:
+              lang === "en"
+                ? "Tell me about this role and your main responsibilities."
+                : "Parle-moi de ce poste et de tes principales responsabilités.",
+            answer:
+              lang === "en"
+                ? "Sample answer here…"
+                : "Exemple de réponse ici…",
+          },
+        ],
+        lang,
+      });
+    }
+
+    // On force la langue si absente
+    if (!parsed.lang) {
+      parsed.lang = lang;
+    }
+
+    return NextResponse.json(parsed);
+  } catch (err) {
+    console.error("generateInterviewQA API error:", err);
+    return NextResponse.json(
+      { error: "Internal error" },
+      { status: 500 }
+    );
+  }
+}
+````
+
+## File: server/api/api/generateLetterAndPitch/route.ts
+````typescript
+// app/api/generateLetterAndPitch/route.ts
+import { NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+
+const CF_LETTER_AND_PITCH_URL =
+  process.env.FUNCTIONS_BASE_URL
+    ? `${process.env.FUNCTIONS_BASE_URL}/generateLetterAndPitch`
+    : "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
+
+// --------------------
+// Helpers (server)
+// --------------------
+function safeText(v: any) {
+  return String(v ?? "").trim();
+}
+
+function cleanGeneratedLetter(raw: string): string {
+  if (!raw) return "";
+  let txt = String(raw);
+
+  txt = txt.replace(/<\/?body[^>]*>/gi, "");
+  txt = txt.replace(/<\/?html[^>]*>/gi, "");
+  txt = txt.replace(/<\/?head[^>]*>[\s\S]*?<\/head>/gi, "");
+  txt = txt.replace(/<\/?[^>]+>/g, "");
+
+  return txt.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function extractBodyFromLetterText(letterText: string, lang: "fr" | "en", fullName?: string) {
+  const raw = safeText(letterText);
+  if (!raw) return "";
+
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  if (!lines.length) return raw;
+
+  const first = lines[0].toLowerCase();
+  const isGreeting =
+    (lang === "fr" && (first.startsWith("madame") || first.startsWith("bonjour"))) ||
+    (lang === "en" && (first.startsWith("dear") || first.startsWith("hello")));
+
+  if (isGreeting) lines.shift();
+
+  while (lines.length) {
+    const last = lines[lines.length - 1].toLowerCase();
+
+    if (
+      last.includes("cordialement") ||
+      last.includes("bien cordialement") ||
+      last.includes("salutations") ||
+      last.includes("sincerely") ||
+      last.includes("best regards") ||
+      last.includes("kind regards")
+    ) {
+      lines.pop();
+      continue;
+    }
+
+    if (fullName && last.includes(fullName.toLowerCase())) {
+      lines.pop();
+      continue;
+    }
+
+    break;
+  }
+
+  return lines.join("\n\n").trim() || raw;
+}
+
+// --------------------
+// Route
+// --------------------
+export async function POST(req: Request) {
+  // 1) Parse JSON
+  let body: any = null;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Corps JSON invalide." }, { status: 400 });
+  }
+
+  try {
+    // 2) Headers vers Cloud Function
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    const authHeader = req.headers.get("authorization");
+    if (authHeader) headers["Authorization"] = authHeader;
+
+    // ✅ reCAPTCHA : body OU header (front envoie souvent dans le body)
+    const recaptchaFromHeader =
+      req.headers.get("x-recaptcha-token") || req.headers.get("X-Recaptcha-Token");
+
+    const recaptchaFromBody = typeof body?.recaptchaToken === "string" ? body.recaptchaToken.trim() : "";
+
+    const recaptchaToken = recaptchaFromBody || recaptchaFromHeader || "";
+    if (recaptchaToken) headers["X-Recaptcha-Token"] = recaptchaToken;
+
+    // optionnel mais propre : ne pas forward le token dans le body si la CF attend un header
+    if (body && "recaptchaToken" in body) delete body.recaptchaToken;
+
+    // 3) Timeout (évite req qui pend)
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45_000);
+
+    const cfRes = await fetch(CF_LETTER_AND_PITCH_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeout));
+
+    const status = cfRes.status;
+    const contentType = cfRes.headers.get("content-type") || "";
+
+    // 4) Si pas JSON -> erreur explicite
+    if (!contentType.includes("application/json")) {
+      const text = await cfRes.text().catch(() => "");
+      return NextResponse.json(
+        {
+          error: "La Cloud Function generateLetterAndPitch ne renvoie pas de JSON.",
+          status,
+          rawBody: text.slice(0, 800),
+        },
+        { status: status || 500 }
+      );
+    }
+
+    const json = await cfRes.json().catch(() => null);
+
+    // 5) Propager erreur backend CF
+    if (!cfRes.ok) {
+      return NextResponse.json(json || { error: "Erreur backend generateLetterAndPitch" }, { status });
+    }
+
+    // 6) ✅ Normalisation : garantir letterBody côté front
+    // - si la CF renvoie déjà letterBody : on le clean
+    // - sinon fallback coverLetter -> on extrait un body propre
+    const lang = (body?.lang === "en" ? "en" : "fr") as "fr" | "en";
+    const fullName = safeText(body?.profile?.fullName);
+
+    const apiLetterBody = typeof json?.letterBody === "string" ? json.letterBody : "";
+    const apiCoverLetter = typeof json?.coverLetter === "string" ? json.coverLetter : "";
+
+    const cleanedPrimary = cleanGeneratedLetter(apiLetterBody || apiCoverLetter);
+    const bodyOnly = extractBodyFromLetterText(cleanedPrimary, lang, fullName);
+
+    const out = {
+      ...json,
+      // ✅ on force un champ stable
+      letterBody: bodyOnly || cleanedPrimary || "",
+      // (optionnel) on garde coverLetter intact si tu l’utilises ailleurs
+      coverLetter: typeof json?.coverLetter === "string" ? json.coverLetter : apiCoverLetter || "",
+    };
+
+    return NextResponse.json(out, { status });
+  } catch (e: any) {
+    const isAbort = e?.name === "AbortError";
+    console.error("Erreur proxy /api/generateLetterAndPitch :", e);
+
+    return NextResponse.json(
+      {
+        error: isAbort
+          ? "Timeout lors de l'appel à generateLetterAndPitch."
+          : "Erreur interne dans la route Next /api/generateLetterAndPitch (proxy).",
+        details: e?.message ?? String(e),
+      },
+      { status: isAbort ? 504 : 500 }
+    );
+  }
+}
+````
+
+## File: server/api/api/interview/route.ts
+````typescript
+// app/api/interview/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import {
+  buildPrompt,
+  InterviewLevel,
+  InterviewChannel,
+  HistoryItem,
+} from "@/lib/interviewPrompt";
+import { verifyUserAndCredits, consumeCredit } from "@/lib/server/credits";
+
+export const runtime = "nodejs";
+
+/**
+ * ✅ reCAPTCHA OFF par défaut
+ * -> Active uniquement si INTERVIEW_REQUIRE_RECAPTCHA=true
+ */
+const REQUIRE_RECAPTCHA =
+  (process.env.INTERVIEW_REQUIRE_RECAPTCHA || "").toLowerCase().trim() ===
+  "true";
+
+// ---- Sessions en mémoire (DEV) ---- //
+type InterviewSession = {
+  userId: string;
+  createdAt: string;
+  lastUpdated: string;
+  jobDesc: string;
+  cvSummary: string;
+  mode: string;
+  level: InterviewLevel;
+  channel: InterviewChannel;
+  status: "active" | "completed";
+  currentStep: number;
+  history: HistoryItem[];
+  score?: number | null;
+  finalSummary?: string | null;
+};
+
+const memorySessions = new Map<string, InterviewSession>();
+
+function createSessionId() {
+  try {
+    // @ts-ignore
+    return crypto.randomUUID();
+  } catch {
+    return Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+  }
+}
+
+function purgeOldSessions(maxAgeMs = 1000 * 60 * 60 * 6) {
+  const now = Date.now();
+  for (const [sid, s] of memorySessions.entries()) {
+    const t = Date.parse(s.lastUpdated || s.createdAt);
+    if (!Number.isNaN(t) && now - t > maxAgeMs) memorySessions.delete(sid);
+  }
+}
+
+// ---------------- reCAPTCHA (Enterprise via CF recaptchaVerify) ----------------
+type RecaptchaVerifyResult =
+  | { ok: true; score?: number }
+  | { ok: false; reason: string; score?: number };
+
+function stripTrailingSlash(s: string) {
+  return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+
+function getApiBaseServer(): string {
+  return stripTrailingSlash(
+    process.env.CLOUD_FUNCTIONS_BASE_URL ||
+      process.env.API_BASE_URL ||
+      "https://europe-west1-assistant-ia-v4.cloudfunctions.net"
+  );
+}
+
+async function verifyRecaptchaEnterpriseViaCF(
+  token: string,
+  action: string
+): Promise<RecaptchaVerifyResult> {
+  const base = getApiBaseServer();
+  try {
+    const res = await fetch(`${base}/recaptchaVerify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, action: (action || "").trim() }),
+      cache: "no-store",
+    });
+
+    const data: any = await res.json().catch(() => null);
+
+    if (!res.ok || !data?.ok) {
+      return {
+        ok: false,
+        reason: String(data?.reason || data?.error || "recaptcha_failed"),
+        score: typeof data?.score === "number" ? data.score : undefined,
+      };
+    }
+
+    return {
+      ok: true,
+      score: typeof data?.score === "number" ? data.score : undefined,
+    };
+  } catch (e: any) {
+    return { ok: false, reason: e?.message || "network_error" };
+  }
+}
+
+// ---- Handler principal ---- //
+export async function POST(req: NextRequest) {
+  try {
+    purgeOldSessions();
+
+    const body = await req.json().catch(() => null);
+    if (!body || typeof body !== "object") {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
+
+    const { action } = body as any;
+
+    // ✅ token peut venir de plusieurs endroits (selon ton front)
+    const recaptchaToken =
+      (body as any)?.recaptchaToken ||
+      (body as any)?.token ||
+      (body as any)?.recaptcha?.token ||
+      null;
+
+    const recaptchaAction =
+      (body as any)?.recaptchaAction ||
+      (body as any)?.recaptcha?.action ||
+      "interview";
+
+    // ✅ reCAPTCHA (optionnel)
+    if (REQUIRE_RECAPTCHA) {
+      if (!recaptchaToken || typeof recaptchaToken !== "string") {
+        return NextResponse.json(
+          {
+            error: "reCAPTCHA failed",
+            details: "token_missing_or_invalid",
+            requireRecaptcha: true,
+            expectedAction: recaptchaAction,
+          },
+          { status: 403 }
+        );
+      }
+
+      const rec = await verifyRecaptchaEnterpriseViaCF(
+        recaptchaToken,
+        recaptchaAction
+      );
+
+      if (!rec.ok) {
+        return NextResponse.json(
+          {
+            error: "reCAPTCHA failed",
+            details: rec.reason,
+            score: rec.score ?? null,
+            requireRecaptcha: true,
+            expectedAction: recaptchaAction,
+          },
+          { status: 403 }
+        );
+      }
+    }
+
+    // ---------- START ---------- //
+    if (action === "start") {
+      const { userId, jobDesc, cvSummary, mode, channel, level } = body as any;
+
+      if (!userId) {
+        return NextResponse.json({ error: "Missing userId" }, { status: 400 });
+      }
+
+      const user = await verifyUserAndCredits(userId);
+      if (!user) {
+        return NextResponse.json(
+          { error: "Unauthorized or no credits" },
+          { status: 401 }
+        );
+      }
+
+      const nowIso = new Date().toISOString();
+      const safeMode = (mode || "mixed") as string;
+      const safeChannel = (channel || "written") as InterviewChannel;
+      const safeLevel = (level || "junior") as InterviewLevel;
+
+      const sessionId = createSessionId();
+
+      const sessionData: InterviewSession = {
+        userId,
+        createdAt: nowIso,
+        lastUpdated: nowIso,
+        jobDesc: jobDesc || "",
+        cvSummary: cvSummary || "",
+        mode: safeMode,
+        level: safeLevel,
+        channel: safeChannel,
+        status: "active",
+        currentStep: 1,
+        history: [],
+      };
+
+      memorySessions.set(sessionId, sessionData);
+
+      const prompt = buildPrompt({
+        cvSummary: sessionData.cvSummary,
+        jobDesc: sessionData.jobDesc,
+        mode: sessionData.mode,
+        level: sessionData.level,
+        channel: sessionData.channel,
+        history: [],
+        step: 1,
+      });
+
+      const llmResponseText = await callLLM(prompt);
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(llmResponseText);
+      } catch {
+        parsed = { next_question: "Parlez-moi de vous.", short_analysis: null };
+      }
+
+      const firstQuestion = parsed.next_question || "Parlez-moi de vous.";
+
+      const historyItem: HistoryItem = {
+        role: "interviewer",
+        text: firstQuestion,
+        createdAt: new Date().toISOString(),
+      };
+
+      const updatedSession = memorySessions.get(sessionId);
+      if (updatedSession) {
+        updatedSession.history.push(historyItem);
+        updatedSession.currentStep = 1;
+        updatedSession.lastUpdated = new Date().toISOString();
+        memorySessions.set(sessionId, updatedSession);
+      }
+
+      await consumeCredit(userId);
+
+      return NextResponse.json({
+        sessionId,
+        firstQuestion,
+        shortAnalysis: parsed.short_analysis ?? null,
+      });
+    }
+
+    // ---------- ANSWER ---------- //
+    if (action === "answer") {
+      const { userId, sessionId, userMessage, channel, step } = body as any;
+
+      if (!userId || !sessionId || !userMessage?.trim()) {
+        return NextResponse.json(
+          { error: "Missing userId, sessionId or userMessage" },
+          { status: 400 }
+        );
+      }
+
+      const user = await verifyUserAndCredits(userId);
+      if (!user) {
+        return NextResponse.json(
+          { error: "Unauthorized or no credits" },
+          { status: 401 }
+        );
+      }
+
+      const session = memorySessions.get(sessionId);
+      if (!session) {
+        return NextResponse.json({ error: "Session not found" }, { status: 404 });
+      }
+
+      if (session.userId !== userId) {
+        return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+      }
+
+      const history = Array.isArray(session.history) ? [...session.history] : [];
+
+      history.push({
+        role: "candidate",
+        text: userMessage,
+        createdAt: new Date().toISOString(),
+      });
+
+      const nextStep =
+        typeof step === "number" && Number.isFinite(step)
+          ? step
+          : (session.currentStep || 1) + 1;
+
+      const prompt = buildPrompt({
+        cvSummary: session.cvSummary,
+        jobDesc: session.jobDesc,
+        mode: session.mode,
+        level: (session.level || "junior") as InterviewLevel,
+        channel: (channel || session.channel || "written") as InterviewChannel,
+        history,
+        step: nextStep,
+      });
+
+      const llmResponseText = await callLLM(prompt);
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(llmResponseText);
+      } catch {
+        parsed = {
+          next_question: "Merci. Peux-tu illustrer avec un exemple concret ?",
+          short_analysis: "",
+          final_summary: null,
+          final_score: null,
+        };
+      }
+
+      const nextQuestion =
+        parsed.next_question || "Merci, l’entretien est terminé.";
+      const shortAnalysis = parsed.short_analysis ?? "";
+      const isFinal = Boolean(parsed.final_summary);
+
+      history.push({
+        role: "interviewer",
+        text: nextQuestion,
+        createdAt: new Date().toISOString(),
+      });
+
+      const updated: InterviewSession = {
+        ...session,
+        history,
+        lastUpdated: new Date().toISOString(),
+        currentStep: nextStep,
+      };
+
+      if (isFinal) {
+        updated.status = "completed";
+        updated.score = parsed.final_score ?? null;
+        updated.finalSummary = parsed.final_summary ?? null;
+      }
+
+      memorySessions.set(sessionId, updated);
+
+      await consumeCredit(userId);
+
+      return NextResponse.json({
+        nextQuestion,
+        shortAnalysis,
+        finalSummary: parsed.final_summary ?? null,
+        finalScore: parsed.final_score ?? null,
+        isFinal,
+      });
+    }
+
+    return NextResponse.json({ error: "Unknown action" }, { status: 400 });
+  } catch (err) {
+    console.error("Interview API error:", err);
+    return NextResponse.json({ error: "Internal error" }, { status: 500 });
+  }
+}
+
+// ---- APPEL GEMINI ---- //
+async function callLLM(prompt: string): Promise<string> {
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    return JSON.stringify({
+      next_question:
+        "Mode démo : peux-tu me résumer ton expérience la plus récente en lien avec ce poste ?",
+      short_analysis:
+        "Mode démo sans Gemini : configure GEMINI_API_KEY pour avoir l’analyse réelle.",
+      final_summary: null,
+      final_score: null,
+    });
+  }
+
+  const modelRaw = process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
+  const model = modelRaw.startsWith("models/") ? modelRaw : `models/${modelRaw}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
+
+  const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!resp.ok) {
+    const errorText = await resp.text().catch(() => "");
+    console.error("Gemini error (interview):", resp.status, errorText);
+    return JSON.stringify({
+      next_question:
+        "Je n'arrive pas à joindre l’IA. Donne-moi : contexte / actions / résultats (STAR).",
+      short_analysis: `Fallback Gemini HTTP ${resp.status}`,
+      final_summary: null,
+      final_score: null,
+    });
+  }
+
+  const data = await resp.json().catch(() => null);
+
+  const textRaw: string =
+    data?.candidates?.[0]?.content?.parts
+      ?.map((p: any) => p.text || "")
+      .join("")
+      .trim() || "";
+
+  if (!textRaw) {
+    return JSON.stringify({
+      next_question: "Peux-tu préciser ?",
+      short_analysis: "",
+      final_summary: null,
+      final_score: null,
+    });
+  }
+
+  return textRaw.trim();
+}
+````
+
+## File: server/api/api/jobs/route.ts
+````typescript
+// app/api/jobs/route.ts
+import { NextRequest, NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+
+// Clés Adzuna côté serveur Next
+const ADZUNA_APP_ID = process.env.ADZUNA_APP_ID;
+const ADZUNA_APP_KEY = process.env.ADZUNA_APP_KEY;
+
+// Base CF pour vérifier reCAPTCHA côté serveur (anti-bypass)
+const DEFAULT_API_BASE =
+  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+const API_BASE = (
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  process.env.API_BASE_URL ||
+  DEFAULT_API_BASE
+).replace(/\/+$/, "");
+
+async function verifyRecaptchaServer(token: string, action: string) {
+  const res = await fetch(`${API_BASE}/recaptchaVerify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, action: (action || "").trim().toLowerCase() }),
+    cache: "no-store",
+  });
+
+  const data: any = await res.json().catch(() => ({}));
+  return { ok: res.ok && data?.ok === true, data };
+}
+
+type AdzunaRawJob = {
+  id?: string;
+  title?: string;
+  company?: { display_name?: string };
+  location?: { display_name?: string };
+  redirect_url?: string;
+  description?: string;
+  created?: string;
+  salary_min?: number;
+  salary_max?: number;
+};
+
+type AdzunaRawResponse = {
+  results?: AdzunaRawJob[];
+  count?: number;
+  mean?: number;
+};
+
+const ALLOWED_COUNTRIES = new Set([
+  "fr",
+  "be",
+  "ch",
+  "ca",
+  "gb",
+  "es",
+  "de",
+  "it",
+]);
+
+function asNumber(v: any): number | undefined {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+
+    const {
+      query,
+      location,
+      country = "fr",
+      page = 1,
+      results_per_page = 50,
+
+      // Filtres optionnels (front)
+      contract_time, // "any" | "full_time" | "part_time"
+      contract_type, // "any" | "permanent" | "contract"
+      salary_min,
+      salary_max,
+      max_days_old,
+
+      recaptchaToken,
+    } = body || {};
+
+    // ✅ reCAPTCHA (anti-bypass)
+    const check = await verifyRecaptchaServer(
+      String(recaptchaToken || ""),
+      "jobs_search"
+    );
+    if (!check.ok) {
+      return NextResponse.json(
+        { error: "reCAPTCHA refusé", details: check.data },
+        { status: 403 }
+      );
+    }
+
+    if (!query && !location) {
+      return NextResponse.json(
+        { error: "query ou location requis" },
+        { status: 400 }
+      );
+    }
+
+    if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY) {
+      console.error("ADZUNA_APP_ID ou ADZUNA_APP_KEY manquants");
+      return NextResponse.json(
+        {
+          error:
+            "Clés Adzuna non configurées côté serveur. Ajoute ADZUNA_APP_ID et ADZUNA_APP_KEY dans ton .env.local.",
+        },
+        { status: 500 }
+      );
+    }
+
+    const safeCountry = String(country || "fr").toLowerCase().trim();
+    const countryCode = ALLOWED_COUNTRIES.has(safeCountry) ? safeCountry : "fr";
+
+    const safePage = asNumber(page) && (page as number) > 0 ? Number(page) : 1;
+
+    const rppRaw = asNumber(results_per_page) ?? 50;
+    const safeRpp = Math.max(1, Math.min(100, Math.floor(rppRaw)));
+
+    const params = new URLSearchParams();
+    params.set("app_id", ADZUNA_APP_ID);
+    params.set("app_key", ADZUNA_APP_KEY);
+    params.set("results_per_page", String(safeRpp));
+    params.set("content-type", "application/json");
+
+    if (query) params.set("what", String(query));
+    if (location) params.set("where", String(location));
+
+    // Filtres Adzuna
+    const salMin = asNumber(salary_min);
+    const salMax = asNumber(salary_max);
+    const maxDays = asNumber(max_days_old);
+
+    if (salMin !== undefined) params.set("salary_min", String(Math.floor(salMin)));
+    if (salMax !== undefined) params.set("salary_max", String(Math.floor(salMax)));
+    if (maxDays !== undefined) params.set("max_days_old", String(Math.floor(maxDays)));
+
+    // contract_time
+    if (contract_time === "full_time") params.set("full_time", "1");
+    if (contract_time === "part_time") params.set("part_time", "1");
+
+    // contract_type
+    if (contract_type === "permanent") params.set("permanent", "1");
+    if (contract_type === "contract") params.set("contract", "1");
+
+    // URL
+    const url = `https://api.adzuna.com/v1/api/jobs/${countryCode}/search/${safePage}?${params.toString()}`;
+
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+
+    if (!resp.ok) {
+      const textErr = await resp.text();
+      console.error("Erreur Adzuna:", resp.status, textErr);
+      return NextResponse.json(
+        { error: "Erreur lors de l'appel à l'API Adzuna." },
+        { status: 500 }
+      );
+    }
+
+    const data: AdzunaRawResponse = await resp.json();
+
+    const jobs =
+      (data.results || []).map((job, index) => ({
+        id: job.id || `job-${safePage}-${index}`,
+        title: job.title || "Offre sans titre",
+        company: job.company?.display_name || "Entreprise non renseignée",
+        location: job.location?.display_name || "Lieu non précisé",
+        url: job.redirect_url || "",
+        description: job.description || "",
+        created: job.created || "",
+        // ✅ important pour ton front (il calcule salary avec salary_min/max)
+        salary_min: typeof job.salary_min === "number" ? job.salary_min : undefined,
+        salary_max: typeof job.salary_max === "number" ? job.salary_max : undefined,
+      })) || [];
+
+    return NextResponse.json({
+      jobs,
+      meta: {
+        country: countryCode,
+        page: safePage,
+        results_per_page: safeRpp,
+        count: typeof data.count === "number" ? data.count : undefined,
+      },
+    });
+  } catch (err) {
+    console.error("Erreur /api/jobs:", err);
+    return NextResponse.json(
+      { error: "Erreur interne lors de la recherche d'offres (API jobs)." },
+      { status: 500 }
+    );
+  }
+}
+````
+
+## File: server/api/api/letterAndPitch/route.ts
+````typescript
+// app/api/letterAndPitch/route.ts
+import { NextRequest, NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+
+function getModelPath(envValue: string | undefined, fallback: string): string {
+  const raw = (envValue || fallback).trim();
+  return raw.startsWith("models/") ? raw : `models/${raw}`;
+}
+
+// Base Cloud Functions pour vérifier reCAPTCHA côté serveur
+const DEFAULT_API_BASE =
+  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+const API_BASE = (
+  process.env.NEXT_PUBLIC_API_BASE_URL ||
+  process.env.API_BASE_URL ||
+  DEFAULT_API_BASE
+).replace(/\/+$/, "");
+
+async function verifyRecaptchaServer(token: string, action: string) {
+  const res = await fetch(`${API_BASE}/recaptchaVerify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, action: (action || "").trim().toLowerCase() }),
+    cache: "no-store",
+  });
+
+  const data: any = await res.json().catch(() => ({}));
+  return { ok: res.ok && data?.ok === true, data };
+}
+
+// Helper: enlève ```json ... ``` si besoin
+function extractJson(text: string): any | null {
+  if (!text) return null;
+  let t = text.trim();
+
+  if (t.startsWith("```")) {
+    t = t.replace(/^```[a-zA-Z]*\s*/, "").replace(/```$/, "").trim();
+  }
+
+  try {
+    return JSON.parse(t);
+  } catch {
+    const match = t.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const {
+      profile,
+      jobTitle = "",
+      companyName = "",
+      jobDescription = "",
+      lang = "fr",
+      recaptchaToken,
+    } = body || {};
+
+    // ✅ Vérif reCAPTCHA (anti-bypass)
+    const check = await verifyRecaptchaServer(
+      String(recaptchaToken || ""),
+      "generate_letter_pitch"
+    );
+    if (!check.ok) {
+      return NextResponse.json(
+        { error: "reCAPTCHA refusé", details: check.data },
+        { status: 403 }
+      );
+    }
+
+    if (!profile) {
+      return NextResponse.json({ error: "Missing profile" }, { status: 400 });
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.warn("[letterAndPitch] GEMINI_API_KEY manquant → mode démo.");
+      return NextResponse.json({
+        coverLetter:
+          lang === "en"
+            ? "Demo mode: here would be a tailored cover letter based on your CV and the job description."
+            : "Mode démo : ici apparaîtrait une lettre de motivation personnalisée à partir de ton CV et de l'offre.",
+        pitch:
+          lang === "en"
+            ? "Demo mode: here would be a short elevator pitch summarizing your profile for this job."
+            : "Mode démo : ici apparaîtrait un court pitch d’ascenseur résumant ton profil pour ce poste.",
+        lang,
+      });
+    }
+
+    const model = getModelPath(process.env.GEMINI_MODEL, "gemini-2.5-flash");
+    const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
+
+    const profileJson = JSON.stringify(profile ?? {}).slice(0, 20000);
+
+    const prompt = `
+Tu es un assistant expert en candidatures.
+
+À partir :
+- du profil CV du candidat (en JSON),
+- du poste visé (intitulé, entreprise),
+- et d'éventuels extraits d'annonce,
+
+tu dois produire :
+1) une lettre de motivation complète (1 page max) prête à être envoyée,
+2) un pitch d'ascenseur de 2 à 4 phrases pour se présenter rapidement.
+
+Langue de sortie : ${lang === "en" ? "anglais" : "français"}.
+
+Réponds STRICTEMENT au format JSON suivant, sans aucun texte avant ou après :
+
+{
+  "coverLetter": "string",
+  "pitch": "string",
+  "lang": "fr"
+}
+
+Où "lang" est "fr" ou "en".
+
+Profil CV (JSON) :
+${profileJson}
+
+Informations sur le poste :
+- Intitulé : ${jobTitle}
+- Entreprise : ${companyName}
+- Description / extraits d'annonce : ${jobDescription}
+`.trim();
+
+    const payload = {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { response_mime_type: "application/json" },
+    };
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const errorText = await resp.text().catch(() => "");
+      console.error("Gemini error (letterAndPitch):", resp.status, errorText);
+
+      if (resp.status === 429) {
+        return NextResponse.json({
+          coverLetter:
+            lang === "en"
+              ? "Demo mode (quota exceeded): here is a short sample cover letter. Please try again later when the quota is reset."
+              : "Mode démo (quota dépassé) : voici un exemple de lettre. Réessaie plus tard quand le quota sera réinitialisé.",
+          pitch:
+            lang === "en"
+              ? "Demo mode (quota exceeded): here is a sample elevator pitch."
+              : "Mode démo (quota dépassé) : voici un exemple de pitch d’ascenseur.",
+          lang,
+        });
+      }
+
+      return NextResponse.json({ error: "Gemini call failed" }, { status: 500 });
+    }
+
+    const data = await resp.json().catch(() => null);
+
+    const textRaw: string =
+      data?.candidates?.[0]?.content?.parts
+        ?.map((p: any) => p?.text || "")
+        .join("")
+        .trim() || "";
+
+    if (!textRaw) {
+      console.error("Empty Gemini response (letterAndPitch):", data);
+      return NextResponse.json({
+        coverLetter:
+          lang === "en"
+            ? "Based on your experience and this role, explain in 3–4 paragraphs why you are a good fit."
+            : "En te basant sur ton expérience et ce poste, explique en 3–4 paragraphes pourquoi tu es un bon profil.",
+        pitch:
+          lang === "en"
+            ? "Summarize your profile in 2–3 sentences as if you were introducing yourself at the start of an interview."
+            : "Résume ton profil en 2–3 phrases comme si tu te présentais en début d’entretien.",
+        lang,
+      });
+    }
+
+    const parsed = extractJson(textRaw);
+
+    const coverLetter =
+      typeof parsed?.coverLetter === "string" ? parsed.coverLetter.trim() : "";
+    const pitch =
+      typeof parsed?.pitch === "string" ? parsed.pitch.trim() : "";
+    const outLang = typeof parsed?.lang === "string" ? parsed.lang : lang;
+
+    if (!coverLetter && !pitch) {
+      console.error("letterAndPitch: JSON non exploitable, texte brut :", textRaw);
+      return NextResponse.json({
+        coverLetter:
+          lang === "en"
+            ? "Based on your CV and this job, write a motivation letter explaining why you are a good match."
+            : "À partir de ton CV et de cette offre, rédige une lettre de motivation expliquant pourquoi tu corresponds au poste.",
+        pitch:
+          lang === "en"
+            ? "Give a short pitch (2–4 sentences) summarizing your profile for this job."
+            : "Donne un court pitch (2–4 phrases) résumant ton profil pour ce poste.",
+        lang,
+      });
+    }
+
+    return NextResponse.json({ coverLetter, pitch, lang: outLang });
+  } catch (err) {
+    console.error("letterAndPitch API error:", err);
+    return NextResponse.json({ error: "Internal error" }, { status: 500 });
+  }
+}
+````
+
+## File: server/api/api/linkedin/exchange/route.ts
+````typescript
+// app/api/linkedin/exchange/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import qs from "querystring";
+
+// ⚠️ Mets ces valeurs dans .env.local (voir plus bas)
+const CLIENT_ID = process.env.LINKEDIN_CLIENT_ID!;
+const CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET!;
+const REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI!; // doit matcher l'URL callback
+
+export async function POST(req: NextRequest) {
+  try {
+    const { code } = await req.json();
+
+    if (!code) {
+      return NextResponse.json(
+        { error: "Missing authorization code" },
+        { status: 400 }
+      );
+    }
+
+    // 1) Échanger le code contre un access_token + id_token
+    const tokenResp = await fetch(
+      "https://www.linkedin.com/oauth/v2/accessToken",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: qs.stringify({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: REDIRECT_URI,
+          client_id: CLIENT_ID,
+          client_secret: CLIENT_SECRET
+        })
+      }
+    );
+
+    if (!tokenResp.ok) {
+      const text = await tokenResp.text();
+      console.error("LinkedIn token error:", text);
+      return NextResponse.json(
+        { error: "Failed to exchange code", details: text },
+        { status: 400 }
+      );
+    }
+
+    const tokenJson = (await tokenResp.json()) as any;
+
+    // LinkedIn peut renvoyer un id_token si on a demandé scope "openid"
+    const idToken = tokenJson.id_token;
+    const accessToken = tokenJson.access_token;
+
+    if (!idToken) {
+      // On peut continuer avec accessToken si besoin, mais pour Firebase OIDC,
+      // on veut surtout un id_token. Si pas dispo, renvoie erreur claire.
+      return NextResponse.json(
+        {
+          error:
+            "LinkedIn n'a pas renvoyé d'id_token (vérifie que le scope openid est bien activé)"
+        },
+        { status: 400 }
+      );
+    }
+
+    return NextResponse.json({ idToken, accessToken });
+  } catch (e: any) {
+    console.error("LinkedIn exchange error:", e);
+    return NextResponse.json(
+      { error: "Server error", details: e.message },
+      { status: 500 }
+    );
+  }
+}
+````
+
+## File: server/api/api/linkedin/token/route.ts
+````typescript
+// app/api/linkedin/token/route.ts
+import { NextRequest, NextResponse } from "next/server";
+
+export async function POST(req: NextRequest) {
+  try {
+    const { code } = await req.json();
+
+    if (!code) {
+      return NextResponse.json(
+        { error: "code manquant" },
+        { status: 400 }
+      );
+    }
+
+    const clientId = process.env.LINKEDIN_CLIENT_ID!;
+    const clientSecret = process.env.LINKEDIN_CLIENT_SECRET!;
+    const redirectUri = process.env.LINKEDIN_REDIRECT_URI!;
+
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+      client_id: clientId,
+      client_secret: clientSecret,
+    });
+
+    // Appel LinkedIn pour échanger le code
+    const resp = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: body.toString(),
+    });
+
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      console.error("LinkedIn token error:", data);
+      return NextResponse.json(
+        { error: "Erreur LinkedIn", details: data },
+        { status: 400 }
+      );
+    }
+
+    // Avec le scope "openid", LinkedIn peut renvoyer un id_token
+    const idToken = (data as any).id_token;
+
+    if (!idToken) {
+      return NextResponse.json(
+        {
+          error:
+            "id_token manquant dans la réponse LinkedIn. Vérifie que le scope 'openid' est bien activé.",
+          details: data,
+        },
+        { status: 400 }
+      );
+    }
+
+    return NextResponse.json({ idToken });
+  } catch (e: any) {
+    console.error("API /api/linkedin/token error:", e);
+    return NextResponse.json(
+      { error: e.message ?? "Erreur serveur" },
+      { status: 500 }
+    );
+  }
+}
+````
+
+## File: server/api/api/polar/checkout/route.ts
+````typescript
+// src/app/api/polar/checkout/route.ts
+// @ts-nocheck
+import { NextRequest, NextResponse } from "next/server";
+import { createPolarCheckout, CreditPackId } from "@/lib/polar";
+
+// Cette route tourne en mode node en dev / en mode serveur
+export const runtime = "nodejs";
+// ⚠️ NE PAS mettre `export const dynamic = "force-dynamic"` ici en output: "export"
+
+export async function POST(req: NextRequest) {
+  try {
+    let body: any = null;
+    try {
+      body = await req.json();
+    } catch (e) {
+      console.error("[/api/polar/checkout] Body non JSON ou vide");
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Body JSON invalide pour /api/polar/checkout.",
+        },
+        { status: 400 }
+      );
+    }
+
+    const packId = body.packId as CreditPackId | undefined;
+    const userId = body.userId as string | undefined;
+    const email = body.email as string | undefined;
+
+    console.log("[/api/polar/checkout] body reçu :", body);
+
+    if (!packId || !userId || !email) {
+      console.error("[/api/polar/checkout] Paramètres manquants", {
+        packId,
+        userId,
+        email,
+      });
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "Paramètres manquants. Il faut packId ('20' | '50' | '100'), userId et email.",
+        },
+        { status: 400 }
+      );
+    }
+
+    // Vérif rapide des variables d'env
+    if (!process.env.POLAR_ACCESS_TOKEN) {
+      console.error("[/api/polar/checkout] POLAR_ACCESS_TOKEN manquant");
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Config Polar manquante (POLAR_ACCESS_TOKEN).",
+        },
+        { status: 500 }
+      );
+    }
+
+    const { url } = await createPolarCheckout({
+      packId,
+      userId,
+      email,
+    });
+
+    console.log("[/api/polar/checkout] Checkout créé, URL :", url);
+
+    // Toujours renvoyer du JSON
+    return NextResponse.json({ ok: true, url }, { status: 200 });
+  } catch (error: any) {
+    console.error("[/api/polar/checkout] ERREUR :", error);
+
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Erreur lors de la création du checkout Polar.",
+        detail: error?.message ?? String(error),
+      },
+      { status: 500 }
+    );
+  }
+}
+````
+
+## File: server/api/api/polar/test/route.ts
+````typescript
+// src/app/api/polar/test/route.ts
+import { NextResponse } from "next/server";
+import { polar } from "@/lib/polar";
+
+export async function GET() {
+  try {
+    // Appel simple à l'API Polar en prod
+    const result = await polar.products.list({});
+
+    // On renvoie directement ce que Polar renvoie,
+    // sans essayer de boucler ni de faire des "..."
+    return NextResponse.json({ ok: true, result });
+  } catch (error: any) {
+    console.error("Erreur Polar test (prod):", error);
+    return NextResponse.json(
+      {
+        ok: false,
+        message:
+          "Erreur d'appel à Polar (prod). Vérifie POLAR_ACCESS_TOKEN si ça persiste.",
+        detail: error?.message ?? String(error),
+      },
+      { status: 500 }
+    );
+  }
+}
+````
+
+## File: server/api/api/stt/route.ts
+````typescript
+import { NextRequest, NextResponse } from "next/server";
+
+export const runtime = "nodejs";
+
+// Nettoie le nom du modèle si nécessaire
+function getModelName(envValue: string | undefined, fallback: string): string {
+  const raw = (envValue || fallback).trim();
+  // On accepte "gemini-2.5-flash" ou "models/gemini-2.5-flash"
+  return raw.replace(/^models\//, "");
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const formData = await req.formData();
+    const file = formData.get("audio") as File | null;
+
+    if (!file) {
+      return NextResponse.json(
+        { error: "Aucun fichier audio reçu (champ 'audio' manquant)." },
+        { status: 400 }
+      );
+    }
+
+    const arrayBuffer = await file.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const base64 = buffer.toString("base64");
+    const mimeType = file.type || "audio/webm";
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.error("[/api/stt] GEMINI_API_KEY manquant.");
+      return NextResponse.json(
+        { error: "GEMINI_API_KEY manquant côté serveur." },
+        { status: 500 }
+      );
+    }
+
+    // Modèle audio (configurable via env)
+    const configuredModel = getModelName(
+      process.env.GEMINI_STT_MODEL,
+      "gemini-2.5-flash"
+    );
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${configuredModel}:generateContent?key=${apiKey}`;
+
+    const prompt =
+      "Transcris mot à mot l'audio suivant en texte. " +
+      "Réponds uniquement par la transcription, sans guillemets ni commentaire.";
+
+    const payload = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: prompt },
+            {
+              inlineData: {
+                mimeType,
+                data: base64,
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const status = resp.status;
+    const bodyText = await resp.text().catch(() => "");
+
+    if (!resp.ok) {
+      console.error("Erreur Gemini STT:", status, bodyText);
+
+      if (status === 429) {
+        return NextResponse.json(
+          {
+            error:
+              "Quota Gemini STT dépassé. Réessaie un peu plus tard.",
+          },
+          { status: 429 }
+        );
+      }
+
+      return NextResponse.json(
+        { error: `Erreur Gemini (${status})` },
+        { status: 500 }
+      );
+    }
+
+    let data: any;
+    try {
+      data = JSON.parse(bodyText);
+    } catch {
+      return NextResponse.json(
+        { error: "Réponse invalide de Gemini (JSON)" },
+        { status: 500 }
+      );
+    }
+
+    const transcript: string =
+      data?.candidates?.[0]?.content?.parts
+        ?.map((p: any) => p?.text || "")
+        .join("")
+        .trim() || "";
+
+    return NextResponse.json({ transcript });
+  } catch (err) {
+    console.error("Erreur interne /api/stt:", err);
+    return NextResponse.json(
+      { error: "Erreur interne sur /api/stt" },
+      { status: 500 }
+    );
+  }
+}
+````
+
+## File: server/api/api/webhook/polar/route.ts
+````typescript
+// @ts-nocheck
+import { NextRequest, NextResponse } from "next/server";
+import {
+  validateEvent,
+  WebhookVerificationError,
+  WebhookHeaders,
+} from "@polar-sh/sdk/webhooks";
+import {
+  addCreditsToUserById,
+  addCreditsToUserByEmail,
+} from "@/lib/credits";
+
+export const runtime = "nodejs";
+
+// ✅ mapping product_id -> crédits (depuis tes .env)
+const PRODUCT_ID_TO_CREDITS: Record<string, number> = {};
+
+if (process.env.POLAR_PRODUCT_20_ID) {
+  PRODUCT_ID_TO_CREDITS[process.env.POLAR_PRODUCT_20_ID] = 20;
+}
+if (process.env.POLAR_PRODUCT_50_ID) {
+  PRODUCT_ID_TO_CREDITS[process.env.POLAR_PRODUCT_50_ID] = 50;
+}
+if (process.env.POLAR_PRODUCT_100_ID) {
+  PRODUCT_ID_TO_CREDITS[process.env.POLAR_PRODUCT_100_ID] = 100;
+}
+
+// GET juste pour tester depuis le navigateur
+export async function GET() {
+  return NextResponse.json({
+    ok: true,
+    env: process.env.POLAR_ENV,
+    mappedProducts: PRODUCT_ID_TO_CREDITS,
+    message:
+      "Endpoint webhook Polar OK. Utilisé en POST par Polar, pas en GET par le navigateur.",
+  });
+}
+
+// Webhook POST appelé par Polar
+export async function POST(req: NextRequest) {
+  const secret = process.env.POLAR_WEBHOOK_SECRET;
+  if (!secret) {
+    console.error("POLAR_WEBHOOK_SECRET manquant");
+    return new NextResponse("Config manquante", { status: 500 });
+  }
+
+  // 1) Body brut (texte) pour la vérification de signature
+  const body = await req.text();
+
+  // 2) Headers envoyés par Polar
+  const headers: WebhookHeaders = {
+    "webhook-id": req.headers.get("webhook-id") ?? "",
+    "webhook-timestamp": req.headers.get("webhook-timestamp") ?? "",
+    "webhook-signature": req.headers.get("webhook-signature") ?? "",
+  };
+
+  let event: any;
+  try {
+    // 3) Vérifier la signature + parser l'event
+    event = validateEvent(body, headers, secret);
+  } catch (error) {
+    if (error instanceof WebhookVerificationError) {
+      console.error("Signature Polar invalide");
+      return new NextResponse("Signature invalide", { status: 403 });
+    }
+    console.error("Erreur webhook Polar:", error);
+    return new NextResponse("Erreur interne", { status: 500 });
+  }
+
+  console.log("📬 Webhook Polar reçu:", event.type);
+
+  // 4) Gestion des événements
+  switch (event.type) {
+    case "order.paid": {
+      const data = event.data;
+
+      console.log("💰 order.paid data brut:", JSON.stringify(data, null, 2));
+
+      const productId = data.product_id as string | undefined;
+      const creditsToAdd =
+        (productId && PRODUCT_ID_TO_CREDITS[productId]) ?? 0;
+
+      const externalId: string | undefined =
+        (data.customer?.external_id as string | undefined) ?? undefined;
+      const email: string | undefined =
+        (data.customer?.email as string | undefined) ?? undefined;
+
+      console.log("👤 Client pour crédit:", {
+        productId,
+        creditsToAdd,
+        externalId,
+        email,
+      });
+
+      if (creditsToAdd > 0) {
+        try {
+          if (externalId) {
+            await addCreditsToUserById(externalId, creditsToAdd);
+          } else if (email) {
+            await addCreditsToUserByEmail(email, creditsToAdd);
+          } else {
+            console.warn(
+              "⚠️ Aucun externalId ni email dans l'order.paid, impossible de créditer l'utilisateur."
+            );
+          }
+        } catch (e) {
+          console.error("Erreur lors de l'ajout de crédits Firestore:", e);
+          // On n'échoue pas le webhook : Polar considère le paiement OK
+        }
+      } else {
+        console.log(
+          "Produit non mappé dans PRODUCT_ID_TO_CREDITS, aucun crédit ajouté."
+        );
+      }
+
+      break;
+    }
+
+    default:
+      console.log("Event non géré explicitement:", event.type);
+  }
+
+  // 5) Réponse OK pour Polar
+  return NextResponse.json({ received: true });
+}
+````
 
 ## File: .firebase/hosting.Lm5leHQ.cache
 ````
@@ -2187,1590 +5048,6 @@ export default function AdminDashboardPage() {
       </div>
     </div>
   );
-}
-````
-
-## File: app/api/extractProfile/route.ts
-````typescript
-import { NextResponse } from "next/server";
-
-const UPSTREAM =
-  process.env.EXTRACT_PROFILE_UPSTREAM ||
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/extractProfile";
-
-export async function POST(req: Request) {
-  const auth = req.headers.get("authorization") || "";
-  const recaptcha = req.headers.get("x-recaptcha-token") || "";
-
-  const body = await req.json().catch(() => null);
-
-  if (!body || !body.base64Pdf) {
-    return NextResponse.json(
-      { error: "Champ 'base64Pdf' manquant." },
-      { status: 400 }
-    );
-  }
-
-  const upstreamRes = await fetch(UPSTREAM, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(auth ? { Authorization: auth } : {}),
-      ...(recaptcha ? { "X-Recaptcha-Token": recaptcha } : {}),
-    },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
-
-  const text = await upstreamRes.text();
-  const contentType =
-    upstreamRes.headers.get("content-type") || "application/json";
-
-  return new NextResponse(text, {
-    status: upstreamRes.status,
-    headers: { "Content-Type": contentType },
-  });
-}
-````
-
-## File: app/api/generate-cv/generate-letter/route.ts
-````typescript
-import { NextResponse } from "next/server";
-import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
-import { getAuth } from "firebase-admin/auth";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
-
-export const runtime = "nodejs";
-
-function getAdminApp() {
-  if (getApps().length) return getApps()[0];
-
-  const projectId = process.env.FIREBASE_ADMIN_PROJECT_ID || process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_ADMIN_CLIENT_EMAIL;
-  const privateKeyRaw = process.env.FIREBASE_ADMIN_PRIVATE_KEY;
-
-  if (projectId && clientEmail && privateKeyRaw) {
-    const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
-    return initializeApp({
-      credential: cert({ projectId, clientEmail, privateKey }),
-    });
-  }
-
-  return initializeApp({
-    credential: applicationDefault(),
-  });
-}
-
-async function requireUser(req: Request) {
-  getAdminApp();
-
-  const authHeader = req.headers.get("authorization") || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
-
-  if (!token) {
-    return { ok: false as const, status: 401, error: "Missing Authorization Bearer token" };
-  }
-
-  try {
-    const decoded = await getAuth().verifyIdToken(token);
-    return { ok: true as const, uid: decoded.uid, email: decoded.email || "" };
-  } catch (e) {
-    console.error("verifyIdToken error:", e);
-    return { ok: false as const, status: 401, error: "Invalid token" };
-  }
-}
-
-async function consumeCreditsAndLog(params: {
-  uid: string;
-  email: string;
-  cost: number;
-  tool: string;
-  docType: "cv" | "lm" | "other";
-  meta?: any;
-}) {
-  getAdminApp();
-  const db = getFirestore();
-
-  const userRef = db.collection("users").doc(params.uid);
-  const usageRef = db.collection("usageLogs").doc();
-  const now = Date.now();
-
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(userRef);
-    const data = snap.exists ? snap.data() || {} : {};
-    const currentCredits = typeof data.credits === "number" ? data.credits : 0;
-
-    if (currentCredits < params.cost) {
-      const err: any = new Error("NO_CREDITS");
-      err.code = "NO_CREDITS";
-      throw err;
-    }
-
-    tx.set(
-      userRef,
-      {
-        credits: currentCredits - params.cost,
-        totalIaCalls: FieldValue.increment(1),
-        totalDocumentsGenerated: FieldValue.increment(params.docType === "cv" || params.docType === "lm" ? 1 : 0),
-        totalCvGenerated: FieldValue.increment(params.docType === "cv" ? 1 : 0),
-        totalLmGenerated: FieldValue.increment(params.docType === "lm" ? 1 : 0),
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    tx.set(
-      usageRef,
-      {
-        userId: params.uid,
-        email: params.email || "",
-        action: "generate_document",
-        docType: params.docType,
-        eventType: "generate",
-        tool: params.tool,
-        creditsDelta: -params.cost,
-        meta: params.meta || null,
-        createdAt: now,
-        createdAtServer: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-  });
-}
-
-function buildProfileContextForIA(profile: any) {
-  const p = profile || {};
-
-  let skillsArr: any[] = [];
-  if (Array.isArray(p.skills)) {
-    skillsArr = p.skills;
-  } else if (p.skills && typeof p.skills === "object") {
-    if (Array.isArray(p.skills.sections)) {
-      p.skills.sections.forEach((sec: any) => {
-        if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
-      });
-    }
-    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
-  }
-
-  const skillsStr = (skillsArr || []).join(", ");
-
-  const expStr = Array.isArray(p.experiences)
-    ? p.experiences
-        .map(
-          (e: any) =>
-            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
-        )
-        .join("; \n")
-    : "";
-
-  const eduStr = Array.isArray(p.education)
-    ? p.education
-        .map((e: any) => `${e.degree || e.title || ""} - ${e.school || e.institution || ""} (${e.dates || ""})`)
-        .join("; \n")
-    : "";
-
-  return `Nom: ${p.fullName || p.name || ""}
-Titre: ${p.profileHeadline || p.title || ""}
-Contact: ${p.email || ""} | ${p.phone || ""} | ${p.linkedin || ""} | ${p.city || ""}
-Résumé de profil: ${p.profileSummary || p.summary || ""}
-Compétences: ${skillsStr}
-Expériences: 
-${expStr}
-Formations: 
-${eduStr}
-Certifications: ${p.certs || ""}
-Langues: ${p.langLine || p.lang || ""}`.trim();
-}
-
-async function callGeminiText(prompt: string, apiKey: string, temperature = 0.7, maxOutputTokens = 2400) {
-  const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-
-  const body = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { temperature, maxOutputTokens },
-  };
-
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const errorText = await resp.text();
-    throw new Error("Erreur Gemini (texte): " + errorText);
-  }
-
-  const data = await resp.json();
-  const parts = data?.candidates?.[0]?.content?.parts || [];
-  const text = parts
-    .map((p: any) => (typeof p.text === "string" ? p.text : ""))
-    .join("\n")
-    .trim();
-
-  if (!text) throw new Error("Réponse Gemini (texte) vide");
-  return text;
-}
-
-function buildFallbackLetterAndPitch(profile: any, jobTitle: string, companyName: string, jobDescription: string, lang: string) {
-  const p = profile || {};
-  const name = p.fullName || "";
-  const primaryDomain = p.primaryDomain || "";
-  const summary = p.profileSummary || "";
-  const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
-  const role = firstExp?.role || firstExp?.title || "";
-  const company = firstExp?.company || "";
-  const years = Array.isArray(p.experiences) && p.experiences.length > 0 ? p.experiences.length : null;
-
-  if (lang === "en") {
-    return {
-      pitch:
-        summary ||
-        `I am ${name || "a candidate"} with ${years ? years + " years of experience" : "solid experience"} in ${
-          primaryDomain || "my field"
-        }, motivated by the ${jobTitle || "role"} at ${companyName || "your company"}.`,
-      coverLetter: `I am writing to express my interest in the position of ${jobTitle || "your advertised role"}. With ${
-        years ? years + " years of experience" : "solid experience"
-      } in ${primaryDomain || "my field"}, I have developed strong skills relevant to this opportunity.
-
-In my previous experience at ${company || "my last company"}, I contributed to projects with measurable impact and collaborated with different stakeholders.
-
-I would be delighted to discuss how I can contribute to your team.`,
-    };
-  }
-
-  return {
-    pitch:
-      summary ||
-      `Je suis ${name || "un(e) candidat(e)"} avec ${
-        years ? years + " ans d’expérience" : "une solide expérience"
-      } ${primaryDomain ? "dans " + primaryDomain : ""}, motivé(e) par le poste de ${
-        jobTitle || "votre poste"
-      } chez ${companyName || "votre entreprise"}.`,
-    coverLetter: `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
-      companyName || "votre entreprise"
-    }. Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
-      primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
-    }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
-
-Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`,
-  };
-}
-
-export async function POST(req: Request) {
-  const auth = await requireUser(req);
-  if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
-
-  let body: any = null;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
-  }
-
-  const profile = body?.profile;
-  const jobDescription = body?.jobDescription || "";
-  const jobTitle = body?.jobTitle || "";
-  const companyName = body?.companyName || "";
-  const langRaw = body?.lang || "fr";
-  const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
-
-  if (!profile) return NextResponse.json({ ok: false, error: "Missing profile" }, { status: 400 });
-  if (!jobTitle && !jobDescription) {
-    return NextResponse.json(
-      { ok: false, error: "Ajoute au moins l'intitulé du poste ou un extrait de la description." },
-      { status: 400 }
-    );
-  }
-
-  // ✅ Débit -1 crédit + log
-  try {
-    await consumeCreditsAndLog({
-      uid: auth.uid,
-      email: auth.email,
-      cost: 1,
-      tool: "generateLetterAndPitch",
-      docType: "lm",
-      meta: { jobTitle, companyName, lang },
-    });
-  } catch (e: any) {
-    if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
-      return NextResponse.json({ ok: false, error: "NO_CREDITS" }, { status: 402 });
-    }
-    console.error("consumeCreditsAndLog error:", e);
-    return NextResponse.json({ ok: false, error: "CREDITS_ERROR" }, { status: 500 });
-  }
-
-  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-
-  const cvText = buildProfileContextForIA(profile);
-
-  if (!GEMINI_API_KEY) {
-    const fb = buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang);
-    return NextResponse.json({ ok: true, coverLetter: fb.coverLetter, pitch: fb.pitch, lang }, { status: 200 });
-  }
-
-  const prompt =
-    lang === "en"
-      ? `You are a senior career coach and recruiter.
-
-Return STRICTLY valid JSON:
-{ "coverLetter": "string", "pitch": "string" }
-
-COVER LETTER RULES:
-- "coverLetter" must be ONLY the BODY (no header, no subject, no greeting, no signature).
-- 3 to 5 short paragraphs separated by a blank line.
-- Do not invent facts, companies, tools, numbers.
-- Use ONLY the candidate profile and the job description.
-
-CANDIDATE PROFILE (source of truth):
-${cvText}
-
-JOB DESCRIPTION:
-${jobDescription || "—"}
-
-JOB TITLE: ${jobTitle || "the role"}
-COMPANY: ${companyName || "your company"}`
-      : `Tu es un coach carrières senior et recruteur.
-
-Retourne STRICTEMENT un JSON valide :
-{ "coverLetter": "string", "pitch": "string" }
-
-RÈGLES LETTRE :
-- "coverLetter" = UNIQUEMENT le CORPS (pas d’en-tête, pas d’objet, pas de formule d’appel, pas de signature).
-- 3 à 5 paragraphes séparés par une ligne vide.
-- Ne pas inventer (entreprises/outils/chiffres).
-- Utilise UNIQUEMENT le profil candidat + la fiche de poste.
-
-PROFIL CANDIDAT (source de vérité) :
-${cvText}
-
-FICHE DE POSTE :
-${jobDescription || "—"}
-
-INTITULÉ : ${jobTitle || "le poste"}
-ENTREPRISE : ${companyName || "votre entreprise"}`;
-
-  let coverLetter = "";
-  let pitch = "";
-
-  try {
-    const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.7, 2200);
-    const cleaned = String(raw).replace(/```json|```/gi, "").trim();
-
-    let parsed: any = null;
-    try {
-      parsed = JSON.parse(cleaned);
-    } catch {
-      parsed = { coverLetter: cleaned, pitch: "" };
-    }
-
-    coverLetter = typeof parsed.coverLetter === "string" ? parsed.coverLetter.trim() : "";
-    pitch = typeof parsed.pitch === "string" ? parsed.pitch.trim() : "";
-  } catch (e) {
-    console.error("Gemini generateLetterAndPitch error:", e);
-  }
-
-  if (!coverLetter || !pitch) {
-    const fb = buildFallbackLetterAndPitch(profile, jobTitle, companyName, jobDescription, lang);
-    if (!coverLetter) coverLetter = fb.coverLetter;
-    if (!pitch) pitch = fb.pitch;
-  }
-
-  return NextResponse.json({ ok: true, coverLetter, pitch, lang }, { status: 200 });
-}
-````
-
-## File: app/api/generateInterviewQA/route.ts
-````typescript
-// app/api/generateInterviewQA/route.ts
-import { NextRequest, NextResponse } from "next/server";
-
-export const runtime = "nodejs";
-
-// Petit helper pour récupérer un JSON même si Gemini met des ```json ... ```
-function extractJson(text: string): any | null {
-  if (!text) return null;
-
-  let t = text.trim();
-
-  // Si Gemini renvoie ```json ... ```
-  if (t.startsWith("```")) {
-    // retire ```json ou ``` et la dernière ```
-    t = t.replace(/^```[a-zA-Z]*\s*/, "").replace(/```$/, "").trim();
-  }
-
-  // 1ère tentative : parser tout
-  try {
-    return JSON.parse(t);
-  } catch {
-    // ignore, on tente plus bas
-  }
-
-  // 2ème tentative : chercher le premier bloc {...}
-  const match = t.match(/\{[\s\S]*\}/);
-  if (match) {
-    try {
-      return JSON.parse(match[0]);
-    } catch {
-      // toujours pas bon
-    }
-  }
-
-  return null;
-}
-
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const { profile, experienceIndex, lang = "fr" } = body;
-
-    if (!profile || typeof experienceIndex !== "number") {
-      return NextResponse.json(
-        { error: "Missing profile or experienceIndex" },
-        { status: 400 }
-      );
-    }
-
-    const experiences: any[] =
-      (profile.experiences as any[]) ||
-      (profile.experience as any[]) ||
-      [];
-
-    const exp = experiences[experienceIndex];
-    if (!exp) {
-      return NextResponse.json(
-        { error: "Experience not found" },
-        { status: 404 }
-      );
-    }
-
-    const bullets = Array.isArray(exp.bullets)
-      ? exp.bullets.join("\n- ")
-      : "";
-
-    const prompt = `
-Tu es un coach d'entretien. Génère 5 questions d'entretien pour le candidat,
-basées sur cette expérience de son CV, avec des réponses de qualité.
-
-Tu dois renvoyer STRICTEMENT un objet JSON valide, sans aucun texte avant ou après.
-
-Format de sortie EXACT :
-{
-  "questions": [
-    {
-      "question": "string",
-      "answer": "string"
-    }
-  ]
-}
-
-Pas de commentaires, pas de texte hors de cet objet JSON.
-
-Langue : ${lang === "en" ? "anglais" : "français"}.
-
-Expérience :
-- Poste : ${exp.role || exp.title || ""}
-- Entreprise : ${exp.company || ""}
-- Lieu : ${exp.city || exp.location || ""}
-- Dates : ${exp.dates || ""}
-
-Missions / résultats :
-- ${bullets}
-    `.trim();
-
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      console.warn("[generateInterviewQA] GEMINI_API_KEY manquant → mode démo.");
-      // Fallback démo simple
-      return NextResponse.json({
-        questions: [
-          {
-            question:
-              lang === "en"
-                ? "Tell me about a challenge in this role and how you handled it."
-                : "Parle-moi d’un défi que tu as rencontré sur ce poste et comment tu l’as géré.",
-            answer:
-              lang === "en"
-                ? "Sample answer here…"
-                : "Exemple de réponse ici…",
-          },
-        ],
-        lang,
-      });
-    }
-
-    const model =
-      process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
-
-    const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
-
-    const payload = {
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: prompt }],
-        },
-      ],
-      // >>> IMPORTANT : on force une réponse en JSON pur
-      generationConfig: {
-        response_mime_type: "application/json",
-      },
-    };
-
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!resp.ok) {
-      const errorText = await resp.text();
-      console.error(
-        "Gemini error (generateInterviewQA):",
-        resp.status,
-        errorText
-      );
-
-      if (resp.status === 429) {
-        console.warn(
-          "[generateInterviewQA] Quota Gemini dépassé → fallback démo."
-        );
-        return NextResponse.json({
-          questions: [
-            {
-              question:
-                lang === "en"
-                  ? "Demo mode (quota exceeded): what did you learn in this experience?"
-                  : "Mode démo (quota dépassé) : qu’as-tu appris dans cette expérience ?",
-              answer:
-                lang === "en"
-                  ? "Sample answer here…"
-                  : "Exemple de réponse ici…",
-            },
-          ],
-          lang,
-        });
-      }
-
-      return NextResponse.json(
-        { error: "Gemini call failed" },
-        { status: 500 }
-      );
-    }
-
-    const data = await resp.json();
-
-    const textRaw: string =
-      data?.candidates?.[0]?.content?.parts
-        ?.map((p: any) => p?.text || "")
-        .join("")
-        .trim() || "";
-
-    if (!textRaw) {
-      console.error("Empty Gemini response (generateInterviewQA):", data);
-      // On ne jette plus une 500, on renvoie un fallback propre
-      return NextResponse.json({
-        questions: [
-          {
-            question:
-              lang === "en"
-                ? "Based on this experience, what are you most proud of?"
-                : "De quoi es-tu le plus fier dans cette expérience ?",
-            answer:
-              lang === "en"
-                ? "Sample answer here…"
-                : "Exemple de réponse ici…",
-          },
-        ],
-        lang,
-      });
-    }
-
-    const parsed = extractJson(textRaw);
-
-    if (!parsed || !Array.isArray(parsed.questions)) {
-      console.error(
-        "JSON parse error generateInterviewQA: texte non exploitable",
-        textRaw
-      );
-      // Toujours un fallback pour ne plus avoir de 500 côté front
-      return NextResponse.json({
-        questions: [
-          {
-            question:
-              lang === "en"
-                ? "Tell me about this role and your main responsibilities."
-                : "Parle-moi de ce poste et de tes principales responsabilités.",
-            answer:
-              lang === "en"
-                ? "Sample answer here…"
-                : "Exemple de réponse ici…",
-          },
-        ],
-        lang,
-      });
-    }
-
-    // On force la langue si absente
-    if (!parsed.lang) {
-      parsed.lang = lang;
-    }
-
-    return NextResponse.json(parsed);
-  } catch (err) {
-    console.error("generateInterviewQA API error:", err);
-    return NextResponse.json(
-      { error: "Internal error" },
-      { status: 500 }
-    );
-  }
-}
-````
-
-## File: app/api/jobs/route.ts
-````typescript
-// app/api/jobs/route.ts
-import { NextRequest, NextResponse } from "next/server";
-
-export const runtime = "nodejs";
-
-// Clés Adzuna côté serveur Next
-const ADZUNA_APP_ID = process.env.ADZUNA_APP_ID;
-const ADZUNA_APP_KEY = process.env.ADZUNA_APP_KEY;
-
-// Base CF pour vérifier reCAPTCHA côté serveur (anti-bypass)
-const DEFAULT_API_BASE =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
-const API_BASE = (
-  process.env.NEXT_PUBLIC_API_BASE_URL ||
-  process.env.API_BASE_URL ||
-  DEFAULT_API_BASE
-).replace(/\/+$/, "");
-
-async function verifyRecaptchaServer(token: string, action: string) {
-  const res = await fetch(`${API_BASE}/recaptchaVerify`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token, action: (action || "").trim().toLowerCase() }),
-    cache: "no-store",
-  });
-
-  const data: any = await res.json().catch(() => ({}));
-  return { ok: res.ok && data?.ok === true, data };
-}
-
-type AdzunaRawJob = {
-  id?: string;
-  title?: string;
-  company?: { display_name?: string };
-  location?: { display_name?: string };
-  redirect_url?: string;
-  description?: string;
-  created?: string;
-  salary_min?: number;
-  salary_max?: number;
-};
-
-type AdzunaRawResponse = {
-  results?: AdzunaRawJob[];
-  count?: number;
-  mean?: number;
-};
-
-const ALLOWED_COUNTRIES = new Set([
-  "fr",
-  "be",
-  "ch",
-  "ca",
-  "gb",
-  "es",
-  "de",
-  "it",
-]);
-
-function asNumber(v: any): number | undefined {
-  const n = typeof v === "number" ? v : Number(v);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-
-    const {
-      query,
-      location,
-      country = "fr",
-      page = 1,
-      results_per_page = 50,
-
-      // Filtres optionnels (front)
-      contract_time, // "any" | "full_time" | "part_time"
-      contract_type, // "any" | "permanent" | "contract"
-      salary_min,
-      salary_max,
-      max_days_old,
-
-      recaptchaToken,
-    } = body || {};
-
-    // ✅ reCAPTCHA (anti-bypass)
-    const check = await verifyRecaptchaServer(
-      String(recaptchaToken || ""),
-      "jobs_search"
-    );
-    if (!check.ok) {
-      return NextResponse.json(
-        { error: "reCAPTCHA refusé", details: check.data },
-        { status: 403 }
-      );
-    }
-
-    if (!query && !location) {
-      return NextResponse.json(
-        { error: "query ou location requis" },
-        { status: 400 }
-      );
-    }
-
-    if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY) {
-      console.error("ADZUNA_APP_ID ou ADZUNA_APP_KEY manquants");
-      return NextResponse.json(
-        {
-          error:
-            "Clés Adzuna non configurées côté serveur. Ajoute ADZUNA_APP_ID et ADZUNA_APP_KEY dans ton .env.local.",
-        },
-        { status: 500 }
-      );
-    }
-
-    const safeCountry = String(country || "fr").toLowerCase().trim();
-    const countryCode = ALLOWED_COUNTRIES.has(safeCountry) ? safeCountry : "fr";
-
-    const safePage = asNumber(page) && (page as number) > 0 ? Number(page) : 1;
-
-    const rppRaw = asNumber(results_per_page) ?? 50;
-    const safeRpp = Math.max(1, Math.min(100, Math.floor(rppRaw)));
-
-    const params = new URLSearchParams();
-    params.set("app_id", ADZUNA_APP_ID);
-    params.set("app_key", ADZUNA_APP_KEY);
-    params.set("results_per_page", String(safeRpp));
-    params.set("content-type", "application/json");
-
-    if (query) params.set("what", String(query));
-    if (location) params.set("where", String(location));
-
-    // Filtres Adzuna
-    const salMin = asNumber(salary_min);
-    const salMax = asNumber(salary_max);
-    const maxDays = asNumber(max_days_old);
-
-    if (salMin !== undefined) params.set("salary_min", String(Math.floor(salMin)));
-    if (salMax !== undefined) params.set("salary_max", String(Math.floor(salMax)));
-    if (maxDays !== undefined) params.set("max_days_old", String(Math.floor(maxDays)));
-
-    // contract_time
-    if (contract_time === "full_time") params.set("full_time", "1");
-    if (contract_time === "part_time") params.set("part_time", "1");
-
-    // contract_type
-    if (contract_type === "permanent") params.set("permanent", "1");
-    if (contract_type === "contract") params.set("contract", "1");
-
-    // URL
-    const url = `https://api.adzuna.com/v1/api/jobs/${countryCode}/search/${safePage}?${params.toString()}`;
-
-    const resp = await fetch(url, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-    });
-
-    if (!resp.ok) {
-      const textErr = await resp.text();
-      console.error("Erreur Adzuna:", resp.status, textErr);
-      return NextResponse.json(
-        { error: "Erreur lors de l'appel à l'API Adzuna." },
-        { status: 500 }
-      );
-    }
-
-    const data: AdzunaRawResponse = await resp.json();
-
-    const jobs =
-      (data.results || []).map((job, index) => ({
-        id: job.id || `job-${safePage}-${index}`,
-        title: job.title || "Offre sans titre",
-        company: job.company?.display_name || "Entreprise non renseignée",
-        location: job.location?.display_name || "Lieu non précisé",
-        url: job.redirect_url || "",
-        description: job.description || "",
-        created: job.created || "",
-        // ✅ important pour ton front (il calcule salary avec salary_min/max)
-        salary_min: typeof job.salary_min === "number" ? job.salary_min : undefined,
-        salary_max: typeof job.salary_max === "number" ? job.salary_max : undefined,
-      })) || [];
-
-    return NextResponse.json({
-      jobs,
-      meta: {
-        country: countryCode,
-        page: safePage,
-        results_per_page: safeRpp,
-        count: typeof data.count === "number" ? data.count : undefined,
-      },
-    });
-  } catch (err) {
-    console.error("Erreur /api/jobs:", err);
-    return NextResponse.json(
-      { error: "Erreur interne lors de la recherche d'offres (API jobs)." },
-      { status: 500 }
-    );
-  }
-}
-````
-
-## File: app/api/letterAndPitch/route.ts
-````typescript
-// app/api/letterAndPitch/route.ts
-import { NextRequest, NextResponse } from "next/server";
-
-export const runtime = "nodejs";
-
-function getModelPath(envValue: string | undefined, fallback: string): string {
-  const raw = (envValue || fallback).trim();
-  return raw.startsWith("models/") ? raw : `models/${raw}`;
-}
-
-// Base Cloud Functions pour vérifier reCAPTCHA côté serveur
-const DEFAULT_API_BASE =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
-const API_BASE = (
-  process.env.NEXT_PUBLIC_API_BASE_URL ||
-  process.env.API_BASE_URL ||
-  DEFAULT_API_BASE
-).replace(/\/+$/, "");
-
-async function verifyRecaptchaServer(token: string, action: string) {
-  const res = await fetch(`${API_BASE}/recaptchaVerify`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token, action: (action || "").trim().toLowerCase() }),
-    cache: "no-store",
-  });
-
-  const data: any = await res.json().catch(() => ({}));
-  return { ok: res.ok && data?.ok === true, data };
-}
-
-// Helper: enlève ```json ... ``` si besoin
-function extractJson(text: string): any | null {
-  if (!text) return null;
-  let t = text.trim();
-
-  if (t.startsWith("```")) {
-    t = t.replace(/^```[a-zA-Z]*\s*/, "").replace(/```$/, "").trim();
-  }
-
-  try {
-    return JSON.parse(t);
-  } catch {
-    const match = t.match(/\{[\s\S]*\}/);
-    if (match) {
-      try {
-        return JSON.parse(match[0]);
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-}
-
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const {
-      profile,
-      jobTitle = "",
-      companyName = "",
-      jobDescription = "",
-      lang = "fr",
-      recaptchaToken,
-    } = body || {};
-
-    // ✅ Vérif reCAPTCHA (anti-bypass)
-    const check = await verifyRecaptchaServer(
-      String(recaptchaToken || ""),
-      "generate_letter_pitch"
-    );
-    if (!check.ok) {
-      return NextResponse.json(
-        { error: "reCAPTCHA refusé", details: check.data },
-        { status: 403 }
-      );
-    }
-
-    if (!profile) {
-      return NextResponse.json({ error: "Missing profile" }, { status: 400 });
-    }
-
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      console.warn("[letterAndPitch] GEMINI_API_KEY manquant → mode démo.");
-      return NextResponse.json({
-        coverLetter:
-          lang === "en"
-            ? "Demo mode: here would be a tailored cover letter based on your CV and the job description."
-            : "Mode démo : ici apparaîtrait une lettre de motivation personnalisée à partir de ton CV et de l'offre.",
-        pitch:
-          lang === "en"
-            ? "Demo mode: here would be a short elevator pitch summarizing your profile for this job."
-            : "Mode démo : ici apparaîtrait un court pitch d’ascenseur résumant ton profil pour ce poste.",
-        lang,
-      });
-    }
-
-    const model = getModelPath(process.env.GEMINI_MODEL, "gemini-2.5-flash");
-    const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
-
-    const profileJson = JSON.stringify(profile ?? {}).slice(0, 20000);
-
-    const prompt = `
-Tu es un assistant expert en candidatures.
-
-À partir :
-- du profil CV du candidat (en JSON),
-- du poste visé (intitulé, entreprise),
-- et d'éventuels extraits d'annonce,
-
-tu dois produire :
-1) une lettre de motivation complète (1 page max) prête à être envoyée,
-2) un pitch d'ascenseur de 2 à 4 phrases pour se présenter rapidement.
-
-Langue de sortie : ${lang === "en" ? "anglais" : "français"}.
-
-Réponds STRICTEMENT au format JSON suivant, sans aucun texte avant ou après :
-
-{
-  "coverLetter": "string",
-  "pitch": "string",
-  "lang": "fr"
-}
-
-Où "lang" est "fr" ou "en".
-
-Profil CV (JSON) :
-${profileJson}
-
-Informations sur le poste :
-- Intitulé : ${jobTitle}
-- Entreprise : ${companyName}
-- Description / extraits d'annonce : ${jobDescription}
-`.trim();
-
-    const payload = {
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { response_mime_type: "application/json" },
-    };
-
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!resp.ok) {
-      const errorText = await resp.text().catch(() => "");
-      console.error("Gemini error (letterAndPitch):", resp.status, errorText);
-
-      if (resp.status === 429) {
-        return NextResponse.json({
-          coverLetter:
-            lang === "en"
-              ? "Demo mode (quota exceeded): here is a short sample cover letter. Please try again later when the quota is reset."
-              : "Mode démo (quota dépassé) : voici un exemple de lettre. Réessaie plus tard quand le quota sera réinitialisé.",
-          pitch:
-            lang === "en"
-              ? "Demo mode (quota exceeded): here is a sample elevator pitch."
-              : "Mode démo (quota dépassé) : voici un exemple de pitch d’ascenseur.",
-          lang,
-        });
-      }
-
-      return NextResponse.json({ error: "Gemini call failed" }, { status: 500 });
-    }
-
-    const data = await resp.json().catch(() => null);
-
-    const textRaw: string =
-      data?.candidates?.[0]?.content?.parts
-        ?.map((p: any) => p?.text || "")
-        .join("")
-        .trim() || "";
-
-    if (!textRaw) {
-      console.error("Empty Gemini response (letterAndPitch):", data);
-      return NextResponse.json({
-        coverLetter:
-          lang === "en"
-            ? "Based on your experience and this role, explain in 3–4 paragraphs why you are a good fit."
-            : "En te basant sur ton expérience et ce poste, explique en 3–4 paragraphes pourquoi tu es un bon profil.",
-        pitch:
-          lang === "en"
-            ? "Summarize your profile in 2–3 sentences as if you were introducing yourself at the start of an interview."
-            : "Résume ton profil en 2–3 phrases comme si tu te présentais en début d’entretien.",
-        lang,
-      });
-    }
-
-    const parsed = extractJson(textRaw);
-
-    const coverLetter =
-      typeof parsed?.coverLetter === "string" ? parsed.coverLetter.trim() : "";
-    const pitch =
-      typeof parsed?.pitch === "string" ? parsed.pitch.trim() : "";
-    const outLang = typeof parsed?.lang === "string" ? parsed.lang : lang;
-
-    if (!coverLetter && !pitch) {
-      console.error("letterAndPitch: JSON non exploitable, texte brut :", textRaw);
-      return NextResponse.json({
-        coverLetter:
-          lang === "en"
-            ? "Based on your CV and this job, write a motivation letter explaining why you are a good match."
-            : "À partir de ton CV et de cette offre, rédige une lettre de motivation expliquant pourquoi tu corresponds au poste.",
-        pitch:
-          lang === "en"
-            ? "Give a short pitch (2–4 sentences) summarizing your profile for this job."
-            : "Donne un court pitch (2–4 phrases) résumant ton profil pour ce poste.",
-        lang,
-      });
-    }
-
-    return NextResponse.json({ coverLetter, pitch, lang: outLang });
-  } catch (err) {
-    console.error("letterAndPitch API error:", err);
-    return NextResponse.json({ error: "Internal error" }, { status: 500 });
-  }
-}
-````
-
-## File: app/api/linkedin/exchange/route.ts
-````typescript
-// app/api/linkedin/exchange/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import qs from "querystring";
-
-// ⚠️ Mets ces valeurs dans .env.local (voir plus bas)
-const CLIENT_ID = process.env.LINKEDIN_CLIENT_ID!;
-const CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET!;
-const REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI!; // doit matcher l'URL callback
-
-export async function POST(req: NextRequest) {
-  try {
-    const { code } = await req.json();
-
-    if (!code) {
-      return NextResponse.json(
-        { error: "Missing authorization code" },
-        { status: 400 }
-      );
-    }
-
-    // 1) Échanger le code contre un access_token + id_token
-    const tokenResp = await fetch(
-      "https://www.linkedin.com/oauth/v2/accessToken",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: qs.stringify({
-          grant_type: "authorization_code",
-          code,
-          redirect_uri: REDIRECT_URI,
-          client_id: CLIENT_ID,
-          client_secret: CLIENT_SECRET
-        })
-      }
-    );
-
-    if (!tokenResp.ok) {
-      const text = await tokenResp.text();
-      console.error("LinkedIn token error:", text);
-      return NextResponse.json(
-        { error: "Failed to exchange code", details: text },
-        { status: 400 }
-      );
-    }
-
-    const tokenJson = (await tokenResp.json()) as any;
-
-    // LinkedIn peut renvoyer un id_token si on a demandé scope "openid"
-    const idToken = tokenJson.id_token;
-    const accessToken = tokenJson.access_token;
-
-    if (!idToken) {
-      // On peut continuer avec accessToken si besoin, mais pour Firebase OIDC,
-      // on veut surtout un id_token. Si pas dispo, renvoie erreur claire.
-      return NextResponse.json(
-        {
-          error:
-            "LinkedIn n'a pas renvoyé d'id_token (vérifie que le scope openid est bien activé)"
-        },
-        { status: 400 }
-      );
-    }
-
-    return NextResponse.json({ idToken, accessToken });
-  } catch (e: any) {
-    console.error("LinkedIn exchange error:", e);
-    return NextResponse.json(
-      { error: "Server error", details: e.message },
-      { status: 500 }
-    );
-  }
-}
-````
-
-## File: app/api/linkedin/token/route.ts
-````typescript
-// app/api/linkedin/token/route.ts
-import { NextRequest, NextResponse } from "next/server";
-
-export async function POST(req: NextRequest) {
-  try {
-    const { code } = await req.json();
-
-    if (!code) {
-      return NextResponse.json(
-        { error: "code manquant" },
-        { status: 400 }
-      );
-    }
-
-    const clientId = process.env.LINKEDIN_CLIENT_ID!;
-    const clientSecret = process.env.LINKEDIN_CLIENT_SECRET!;
-    const redirectUri = process.env.LINKEDIN_REDIRECT_URI!;
-
-    const body = new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: redirectUri,
-      client_id: clientId,
-      client_secret: clientSecret,
-    });
-
-    // Appel LinkedIn pour échanger le code
-    const resp = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: body.toString(),
-    });
-
-    const data = await resp.json();
-
-    if (!resp.ok) {
-      console.error("LinkedIn token error:", data);
-      return NextResponse.json(
-        { error: "Erreur LinkedIn", details: data },
-        { status: 400 }
-      );
-    }
-
-    // Avec le scope "openid", LinkedIn peut renvoyer un id_token
-    const idToken = (data as any).id_token;
-
-    if (!idToken) {
-      return NextResponse.json(
-        {
-          error:
-            "id_token manquant dans la réponse LinkedIn. Vérifie que le scope 'openid' est bien activé.",
-          details: data,
-        },
-        { status: 400 }
-      );
-    }
-
-    return NextResponse.json({ idToken });
-  } catch (e: any) {
-    console.error("API /api/linkedin/token error:", e);
-    return NextResponse.json(
-      { error: e.message ?? "Erreur serveur" },
-      { status: 500 }
-    );
-  }
-}
-````
-
-## File: app/api/polar/checkout/route.ts
-````typescript
-// src/app/api/polar/checkout/route.ts
-// @ts-nocheck
-import { NextRequest, NextResponse } from "next/server";
-import { createPolarCheckout, CreditPackId } from "@/lib/polar";
-
-// Cette route tourne en mode node en dev / en mode serveur
-export const runtime = "nodejs";
-// ⚠️ NE PAS mettre `export const dynamic = "force-dynamic"` ici en output: "export"
-
-export async function POST(req: NextRequest) {
-  try {
-    let body: any = null;
-    try {
-      body = await req.json();
-    } catch (e) {
-      console.error("[/api/polar/checkout] Body non JSON ou vide");
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Body JSON invalide pour /api/polar/checkout.",
-        },
-        { status: 400 }
-      );
-    }
-
-    const packId = body.packId as CreditPackId | undefined;
-    const userId = body.userId as string | undefined;
-    const email = body.email as string | undefined;
-
-    console.log("[/api/polar/checkout] body reçu :", body);
-
-    if (!packId || !userId || !email) {
-      console.error("[/api/polar/checkout] Paramètres manquants", {
-        packId,
-        userId,
-        email,
-      });
-      return NextResponse.json(
-        {
-          ok: false,
-          error:
-            "Paramètres manquants. Il faut packId ('20' | '50' | '100'), userId et email.",
-        },
-        { status: 400 }
-      );
-    }
-
-    // Vérif rapide des variables d'env
-    if (!process.env.POLAR_ACCESS_TOKEN) {
-      console.error("[/api/polar/checkout] POLAR_ACCESS_TOKEN manquant");
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Config Polar manquante (POLAR_ACCESS_TOKEN).",
-        },
-        { status: 500 }
-      );
-    }
-
-    const { url } = await createPolarCheckout({
-      packId,
-      userId,
-      email,
-    });
-
-    console.log("[/api/polar/checkout] Checkout créé, URL :", url);
-
-    // Toujours renvoyer du JSON
-    return NextResponse.json({ ok: true, url }, { status: 200 });
-  } catch (error: any) {
-    console.error("[/api/polar/checkout] ERREUR :", error);
-
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "Erreur lors de la création du checkout Polar.",
-        detail: error?.message ?? String(error),
-      },
-      { status: 500 }
-    );
-  }
-}
-````
-
-## File: app/api/polar/test/route.ts
-````typescript
-// src/app/api/polar/test/route.ts
-import { NextResponse } from "next/server";
-import { polar } from "@/lib/polar";
-
-export async function GET() {
-  try {
-    // Appel simple à l'API Polar en prod
-    const result = await polar.products.list({});
-
-    // On renvoie directement ce que Polar renvoie,
-    // sans essayer de boucler ni de faire des "..."
-    return NextResponse.json({ ok: true, result });
-  } catch (error: any) {
-    console.error("Erreur Polar test (prod):", error);
-    return NextResponse.json(
-      {
-        ok: false,
-        message:
-          "Erreur d'appel à Polar (prod). Vérifie POLAR_ACCESS_TOKEN si ça persiste.",
-        detail: error?.message ?? String(error),
-      },
-      { status: 500 }
-    );
-  }
-}
-````
-
-## File: app/api/stt/route.ts
-````typescript
-import { NextRequest, NextResponse } from "next/server";
-
-export const runtime = "nodejs";
-
-// Nettoie le nom du modèle si nécessaire
-function getModelName(envValue: string | undefined, fallback: string): string {
-  const raw = (envValue || fallback).trim();
-  // On accepte "gemini-2.5-flash" ou "models/gemini-2.5-flash"
-  return raw.replace(/^models\//, "");
-}
-
-export async function POST(req: NextRequest) {
-  try {
-    const formData = await req.formData();
-    const file = formData.get("audio") as File | null;
-
-    if (!file) {
-      return NextResponse.json(
-        { error: "Aucun fichier audio reçu (champ 'audio' manquant)." },
-        { status: 400 }
-      );
-    }
-
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    const base64 = buffer.toString("base64");
-    const mimeType = file.type || "audio/webm";
-
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      console.error("[/api/stt] GEMINI_API_KEY manquant.");
-      return NextResponse.json(
-        { error: "GEMINI_API_KEY manquant côté serveur." },
-        { status: 500 }
-      );
-    }
-
-    // Modèle audio (configurable via env)
-    const configuredModel = getModelName(
-      process.env.GEMINI_STT_MODEL,
-      "gemini-2.5-flash"
-    );
-
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${configuredModel}:generateContent?key=${apiKey}`;
-
-    const prompt =
-      "Transcris mot à mot l'audio suivant en texte. " +
-      "Réponds uniquement par la transcription, sans guillemets ni commentaire.";
-
-    const payload = {
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: prompt },
-            {
-              inlineData: {
-                mimeType,
-                data: base64,
-              },
-            },
-          ],
-        },
-      ],
-    };
-
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    const status = resp.status;
-    const bodyText = await resp.text().catch(() => "");
-
-    if (!resp.ok) {
-      console.error("Erreur Gemini STT:", status, bodyText);
-
-      if (status === 429) {
-        return NextResponse.json(
-          {
-            error:
-              "Quota Gemini STT dépassé. Réessaie un peu plus tard.",
-          },
-          { status: 429 }
-        );
-      }
-
-      return NextResponse.json(
-        { error: `Erreur Gemini (${status})` },
-        { status: 500 }
-      );
-    }
-
-    let data: any;
-    try {
-      data = JSON.parse(bodyText);
-    } catch {
-      return NextResponse.json(
-        { error: "Réponse invalide de Gemini (JSON)" },
-        { status: 500 }
-      );
-    }
-
-    const transcript: string =
-      data?.candidates?.[0]?.content?.parts
-        ?.map((p: any) => p?.text || "")
-        .join("")
-        .trim() || "";
-
-    return NextResponse.json({ transcript });
-  } catch (err) {
-    console.error("Erreur interne /api/stt:", err);
-    return NextResponse.json(
-      { error: "Erreur interne sur /api/stt" },
-      { status: 500 }
-    );
-  }
-}
-````
-
-## File: app/api/webhook/polar/route.ts
-````typescript
-// @ts-nocheck
-import { NextRequest, NextResponse } from "next/server";
-import {
-  validateEvent,
-  WebhookVerificationError,
-  WebhookHeaders,
-} from "@polar-sh/sdk/webhooks";
-import {
-  addCreditsToUserById,
-  addCreditsToUserByEmail,
-} from "@/lib/credits";
-
-export const runtime = "nodejs";
-
-// ✅ mapping product_id -> crédits (depuis tes .env)
-const PRODUCT_ID_TO_CREDITS: Record<string, number> = {};
-
-if (process.env.POLAR_PRODUCT_20_ID) {
-  PRODUCT_ID_TO_CREDITS[process.env.POLAR_PRODUCT_20_ID] = 20;
-}
-if (process.env.POLAR_PRODUCT_50_ID) {
-  PRODUCT_ID_TO_CREDITS[process.env.POLAR_PRODUCT_50_ID] = 50;
-}
-if (process.env.POLAR_PRODUCT_100_ID) {
-  PRODUCT_ID_TO_CREDITS[process.env.POLAR_PRODUCT_100_ID] = 100;
-}
-
-// GET juste pour tester depuis le navigateur
-export async function GET() {
-  return NextResponse.json({
-    ok: true,
-    env: process.env.POLAR_ENV,
-    mappedProducts: PRODUCT_ID_TO_CREDITS,
-    message:
-      "Endpoint webhook Polar OK. Utilisé en POST par Polar, pas en GET par le navigateur.",
-  });
-}
-
-// Webhook POST appelé par Polar
-export async function POST(req: NextRequest) {
-  const secret = process.env.POLAR_WEBHOOK_SECRET;
-  if (!secret) {
-    console.error("POLAR_WEBHOOK_SECRET manquant");
-    return new NextResponse("Config manquante", { status: 500 });
-  }
-
-  // 1) Body brut (texte) pour la vérification de signature
-  const body = await req.text();
-
-  // 2) Headers envoyés par Polar
-  const headers: WebhookHeaders = {
-    "webhook-id": req.headers.get("webhook-id") ?? "",
-    "webhook-timestamp": req.headers.get("webhook-timestamp") ?? "",
-    "webhook-signature": req.headers.get("webhook-signature") ?? "",
-  };
-
-  let event: any;
-  try {
-    // 3) Vérifier la signature + parser l'event
-    event = validateEvent(body, headers, secret);
-  } catch (error) {
-    if (error instanceof WebhookVerificationError) {
-      console.error("Signature Polar invalide");
-      return new NextResponse("Signature invalide", { status: 403 });
-    }
-    console.error("Erreur webhook Polar:", error);
-    return new NextResponse("Erreur interne", { status: 500 });
-  }
-
-  console.log("📬 Webhook Polar reçu:", event.type);
-
-  // 4) Gestion des événements
-  switch (event.type) {
-    case "order.paid": {
-      const data = event.data;
-
-      console.log("💰 order.paid data brut:", JSON.stringify(data, null, 2));
-
-      const productId = data.product_id as string | undefined;
-      const creditsToAdd =
-        (productId && PRODUCT_ID_TO_CREDITS[productId]) ?? 0;
-
-      const externalId: string | undefined =
-        (data.customer?.external_id as string | undefined) ?? undefined;
-      const email: string | undefined =
-        (data.customer?.email as string | undefined) ?? undefined;
-
-      console.log("👤 Client pour crédit:", {
-        productId,
-        creditsToAdd,
-        externalId,
-        email,
-      });
-
-      if (creditsToAdd > 0) {
-        try {
-          if (externalId) {
-            await addCreditsToUserById(externalId, creditsToAdd);
-          } else if (email) {
-            await addCreditsToUserByEmail(email, creditsToAdd);
-          } else {
-            console.warn(
-              "⚠️ Aucun externalId ni email dans l'order.paid, impossible de créditer l'utilisateur."
-            );
-          }
-        } catch (e) {
-          console.error("Erreur lors de l'ajout de crédits Firestore:", e);
-          // On n'échoue pas le webhook : Polar considère le paiement OK
-        }
-      } else {
-        console.log(
-          "Produit non mappé dans PRODUCT_ID_TO_CREDITS, aucun crédit ajouté."
-        );
-      }
-
-      break;
-    }
-
-    default:
-      console.log("Event non géré explicitement:", event.type);
-  }
-
-  // 5) Réponse OK pour Polar
-  return NextResponse.json({ received: true });
 }
 ````
 
@@ -8323,6 +9600,8 @@ import { useRouter, useSearchParams } from "next/navigation";
 import {
   signInWithEmailAndPassword,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   GoogleAuthProvider,
 } from "firebase/auth";
 import { auth, googleProvider, db } from "@/lib/firebase";
@@ -8334,10 +9613,113 @@ import { getRecaptchaToken, verifyRecaptcha } from "@/lib/recaptcha";
 const MAX_ATTEMPTS = 5;
 const LOCK_DURATION_MS = 60_000; // 1 minute
 
+function isProbablyMobile() {
+  if (typeof navigator === "undefined") return false;
+  return /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent);
+}
+
+function isInAppBrowser() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  // Instagram / Facebook / Messenger / LinkedIn / Twitter(X) webviews etc.
+  return /FBAN|FBAV|Instagram|Line|LinkedInApp|Twitter|X;/i.test(ua);
+}
+
+function shouldUseRedirectFlow() {
+  // On ne l'utilise plus pour forcer le redirect Google,
+  // juste pour savoir si on est dans un contexte mobile/webview
+  return isProbablyMobile() || isInAppBrowser();
+}
+
+function formatRecaptchaDetails(check: any) {
+  const reason = String(check?.reason || "unknown");
+  const score =
+    typeof check?.score === "number" ? `score=${check.score.toFixed(2)}` : null;
+  const expected = check?.expected ? `expected=${check.expected}` : null;
+  const got = check?.got ? `got=${check.got}` : null;
+
+  const parts = [reason, score, expected, got].filter(Boolean);
+  return parts.length ? `(${parts.join(", ")})` : "";
+}
+
+async function checkRecaptchaOrDegrade(params: {
+  action: string;
+  emailForLog: string;
+  providerForLog: "password" | "google";
+  onError: (msg: string) => void;
+}) {
+  const { action, emailForLog, providerForLog, onError } = params;
+
+  // Sur mobile/webview, on peut passer en mode dégradé
+  const allowDegraded = shouldUseRedirectFlow();
+
+  let token = "";
+  try {
+    token = await getRecaptchaToken(action);
+  } catch (e: any) {
+    logAuthFailed({
+      email: emailForLog,
+      provider: providerForLog,
+      errorCode: "recaptcha:token_error",
+      errorMessage: e?.message || "getRecaptchaToken failed",
+    });
+
+    if (allowDegraded) {
+      onError(
+        "⚠️ reCAPTCHA bloquée sur ce navigateur (webview / bloqueur). Connexion en mode dégradé. Si possible, ouvre le site dans Chrome/Safari."
+      );
+      return { ok: true, degraded: true };
+    }
+
+    onError(
+      "Sécurité: impossible de valider reCAPTCHA (script bloqué ?). Désactive l’adblock ou ouvre dans Chrome/Safari puis réessaie."
+    );
+    return { ok: false, degraded: false };
+  }
+
+  const check: any = await verifyRecaptcha(token, action);
+  if (!check.ok) {
+    const reason = String(check?.reason || "unknown");
+    const details = formatRecaptchaDetails(check);
+
+    logAuthFailed({
+      email: emailForLog,
+      provider: providerForLog,
+      errorCode: `recaptcha:${reason}`,
+      errorMessage: `score=${check.score ?? "?"}`,
+    });
+
+    // 🔁 Mode dégradé sur mobile : timeout / indispo / erreur réseau
+    if (
+      allowDegraded &&
+      (reason === "timeout" ||
+        reason === "unavailable" ||
+        reason === "network_error")
+    ) {
+      onError(
+        `⚠️ reCAPTCHA instable sur mobile. Connexion en mode dégradé. ${details}`.trim()
+      );
+      return { ok: true, degraded: true };
+    }
+
+    // 🟡 Sur desktop, message plus clair si c'est juste le réseau
+    if (reason === "network_error") {
+      onError(
+        `Impossible de vérifier la sécurité (problème réseau). Vérifie ta connexion Internet et réessaie. ${details}`.trim()
+      );
+    } else {
+      onError(`Connexion refusée par sécurité. Réessayez. ${details}`.trim());
+    }
+
+    return { ok: false, degraded: false };
+  }
+
+  return { ok: true, degraded: false };
+}
+
 function LoginPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
-
   const { user, loading, blocked } = useAuth();
 
   const [email, setEmail] = useState("");
@@ -8357,7 +9739,7 @@ function LoginPageInner() {
     if (!blocked) return;
     setInfo(null);
     setError(
-      "Votre compte est bloqué. Si vous pensez que c'est une erreur, contactez l'administrateur."
+      "Votre compte est bloqué. Si vous pensez que c’est une erreur, contactez l’administrateur."
     );
   }, [blocked]);
 
@@ -8380,7 +9762,7 @@ function LoginPageInner() {
     if (blockedParam === "1") {
       setInfo(null);
       setError(
-        "Votre compte a été bloqué par l'administrateur. Si vous pensez que c'est une erreur, contactez le support."
+        "Votre compte a été bloqué par l’administrateur. Si vous pensez que c’est une erreur, contactez le support."
       );
     } else if (justSignedUp === "1") {
       setError(null);
@@ -8440,6 +9822,45 @@ function LoginPageInner() {
     return () => window.clearInterval(id);
   }, [isLocked, lockEnd]);
 
+  // ✅ Finalise le login Google quand on revient de signInWithRedirect()
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    (async () => {
+      try {
+        setSubmitting(true);
+        const result = await getRedirectResult(auth);
+        if (!result) return;
+
+        const u = result.user;
+
+        // Vérif blocage Firestore
+        const ref = doc(db, "users", u.uid);
+        const snap = await getDoc(ref);
+        const data = snap.data() as any | undefined;
+
+        if (data?.blocked) {
+          await auth.signOut();
+          setError(
+            "Votre compte est bloqué. Si vous pensez que c’est une erreur, contactez l’administrateur."
+          );
+          return;
+        }
+
+        const displayName = u.displayName || u.email || "";
+        setInfo(`Bienvenue ${displayName} 👋`);
+
+        const redirectTo = searchParams.get("redirect") || "/app";
+        router.replace(redirectTo);
+      } catch (err: any) {
+        console.error("getRedirectResult error:", err);
+      } finally {
+        setSubmitting(false);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // -------------------------
   //  LOGIN EMAIL / PASSWORD
   // -------------------------
@@ -8452,33 +9873,16 @@ function LoginPageInner() {
     setSubmitting(true);
 
     try {
-      // ✅ reCAPTCHA avant Firebase Auth
-      const action = "LOGIN";
-      let token = "";
-      try {
-        token = await getRecaptchaToken(action);
-      } catch {
-        setError(
-          "Sécurité: impossible de valider reCAPTCHA (script bloqué ?). Désactive l'adblock et réessaie."
-        );
-        return;
-      }
-
-      const check = await verifyRecaptcha(token, action);
-      if (!check.ok) {
-        setError("Connexion refusée par sécurité. Réessayez dans quelques secondes.");
-        logAuthFailed({
-          email,
-          provider: "password",
-          errorCode: `recaptcha:${check.reason}`,
-          errorMessage: `score=${check.score ?? "?"}`,
-        });
-        return;
-      }
+      const cap = await checkRecaptchaOrDegrade({
+        action: "login",
+        emailForLog: email,
+        providerForLog: "password",
+        onError: (msg) => setInfo(msg),
+      });
+      if (!cap.ok) return;
 
       const cred = await signInWithEmailAndPassword(auth, email, password);
 
-      // Vérif blocage Firestore (optionnel, mais ok)
       const ref = doc(db, "users", cred.user.uid);
       const snap = await getDoc(ref);
       const data = snap.data() as any | undefined;
@@ -8486,12 +9890,11 @@ function LoginPageInner() {
       if (data?.blocked) {
         await auth.signOut();
         setError(
-          "Votre compte est bloqué. Si vous pensez que c'est une erreur, contactez l'administrateur."
+          "Votre compte est bloqué. Si vous pensez que c’est une erreur, contactez l’administrateur."
         );
         return;
       }
 
-      // ✅ Reset lock
       setAttempts(0);
       setIsLocked(false);
       setLockEnd(null);
@@ -8529,15 +9932,19 @@ function LoginPageInner() {
       });
 
       if (code === "auth/wrong-password" || code === "auth/user-not-found") {
-        setError("Email ou mot de passe incorrect. Vérifiez vos identifiants puis réessayez.");
+        setError(
+          "Email ou mot de passe incorrect. Vérifiez vos identifiants puis réessayez."
+        );
       } else if (code === "auth/too-many-requests") {
         setError(
-          "Trop de tentatives échouées. Votre compte est temporairement bloqué côté serveur. Réessayez dans quelques minutes ou réinitialisez votre mot de passe."
+          "Trop de tentatives échouées. Blocage temporaire côté serveur. Réessayez dans quelques minutes ou réinitialisez votre mot de passe."
         );
       } else if (code === "auth/network-request-failed") {
         setError("Problème de connexion réseau. Vérifiez votre connexion Internet.");
       } else {
-        setError("Impossible de vous connecter pour le moment. Réessayez dans quelques instants.");
+        setError(
+          "Impossible de vous connecter pour le moment. Réessayez dans quelques instants."
+        );
       }
     } finally {
       setSubmitting(false);
@@ -8553,51 +9960,53 @@ function LoginPageInner() {
     setSubmitting(true);
 
     try {
-      // ✅ reCAPTCHA avant Firebase Auth
-      const action = "LOGIN_GOOGLE";
-      let token = "";
-      try {
-        token = await getRecaptchaToken(action);
-      } catch {
-        setError(
-          "Sécurité: impossible de valider reCAPTCHA (script bloqué ?). Désactive l'adblock et réessaie."
-        );
-        return;
-      }
-
-      const check = await verifyRecaptcha(token, action);
-      if (!check.ok) {
-        setError("Connexion refusée par sécurité. Réessayez dans quelques secondes.");
-        logAuthFailed({
-          email,
-          provider: "google",
-          errorCode: `recaptcha:${check.reason}`,
-          errorMessage: `score=${check.score ?? "?"}`,
-        });
-        return;
-      }
+      const cap = await checkRecaptchaOrDegrade({
+        action: "login_google",
+        emailForLog: email,
+        providerForLog: "google",
+        onError: (msg) => setInfo(msg),
+      });
+      if (!cap.ok) return;
 
       const provider = googleProvider || new GoogleAuthProvider();
-      const result = await signInWithPopup(auth, provider);
-      const u = result.user;
 
-      const ref = doc(db, "users", u.uid);
-      const snap = await getDoc(ref);
-      const data = snap.data() as any | undefined;
+      // 1️⃣ On essaie TOUJOURS le popup (desktop + mobile)
+      try {
+        const result = await signInWithPopup(auth, provider);
+        const u = result.user;
 
-      if (data?.blocked) {
-        await auth.signOut();
-        setError(
-          "Votre compte est bloqué. Si vous pensez que c'est une erreur, contactez l'administrateur."
-        );
+        const ref = doc(db, "users", u.uid);
+        const snap = await getDoc(ref);
+        const data = snap.data() as any | undefined;
+
+        if (data?.blocked) {
+          await auth.signOut();
+          setError(
+            "Votre compte est bloqué. Si vous pensez que c’est une erreur, contactez l’administrateur."
+          );
+          return;
+        }
+
+        const displayName = u.displayName || u.email || "";
+        setInfo(`Bienvenue ${displayName} 👋`);
+
+        const redirectTo = searchParams.get("redirect") || "/app";
+        router.replace(redirectTo);
         return;
+      } catch (err: any) {
+        const code = err?.code as string | undefined;
+
+        // 2️⃣ Popup bloquée (mobile / navigateur strict) → fallback redirect
+        if (
+          code === "auth/popup-blocked" ||
+          code === "auth/cancelled-popup-request"
+        ) {
+          await signInWithRedirect(auth, provider);
+          return; // le résultat sera récupéré dans getRedirectResult()
+        }
+
+        throw err;
       }
-
-      const displayName = u.displayName || u.email || "";
-      setInfo(`Bienvenue ${displayName} 👋`);
-
-      const redirectTo = searchParams.get("redirect") || "/app";
-      router.replace(redirectTo);
     } catch (err: any) {
       console.error("Google login error:", err);
       const code = err?.code as string | undefined;
@@ -8611,12 +10020,16 @@ function LoginPageInner() {
 
       if (code === "auth/account-exists-with-different-credential") {
         setError(
-          "Un compte existe déjà pour cette adresse email avec une autre méthode de connexion. Essayez avec votre mot de passe habituel."
+          "Un compte existe déjà pour cette adresse email avec une autre méthode. Essayez avec votre mot de passe habituel."
         );
       } else if (code === "auth/popup-closed-by-user") {
         setError("La fenêtre Google a été fermée avant la fin du processus.");
       } else if (code === "auth/network-request-failed") {
         setError("Problème de connexion réseau. Vérifiez votre connexion Internet.");
+      } else if (code === "auth/operation-not-supported-in-this-environment") {
+        setError(
+          "Ce navigateur ne supporte pas correctement la fenêtre de connexion Google. Essayez dans Chrome/Safari ou utilisez votre mot de passe."
+        );
       } else {
         setError("Impossible de vous connecter avec Google pour le moment.");
       }
@@ -8777,7 +10190,9 @@ function LoginPageInner() {
 
           <div className="flex items-center gap-2 my-4">
             <div className="h-px flex-1 bg-slate-800" />
-            <span className="text-[10px] text-slate-500 uppercase tracking-[0.16em]">ou</span>
+            <span className="text-[10px] text-slate-500 uppercase tracking-[0.16em]">
+              ou
+            </span>
             <div className="h-px flex-1 bg-slate-800" />
           </div>
 
@@ -8792,7 +10207,10 @@ function LoginPageInner() {
 
           <p className="mt-4 text-[11px] text-slate-400 text-center">
             Pas encore de compte ?{" "}
-            <Link href="/signup" className="text-sky-400 hover:text-sky-300 hover:underline font-medium">
+            <Link
+              href="/signup"
+              className="text-sky-400 hover:text-sky-300 hover:underline font-medium"
+            >
               Créer un compte
             </Link>
           </p>
@@ -12044,14 +13462,12 @@ function setCors(req, res) {
 
   if (allowed.includes(origin)) {
     res.set("Access-Control-Allow-Origin", origin);
-  } else {
-    // (Option) tu peux mettre ton domaine custom ici si tu en as un
-    // res.set("Access-Control-Allow-Origin", "https://tondomaine.com");
   }
 
   res.set("Vary", "Origin");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  // ✅ ajoute X-Recaptcha-Token au cas où
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Recaptcha-Token");
 }
 
 /* ============================
@@ -12082,8 +13498,10 @@ function getClientIp(req) {
   );
 }
 
+// ✅ IMPORTANT : on ne lower-case plus ici.
+// On garde l’action telle qu’envoyée, et on compare en lowercase plus bas.
 function normalizeAction(action) {
-  return String(action || "").trim().toLowerCase();
+  return String(action || "").trim();
 }
 
 /**
@@ -12111,7 +13529,8 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
       event: {
         token,
         siteKey,
-        expectedAction: expectedAction || undefined,
+        // ✅ on n’envoie plus expectedAction à Google (évite mismatch sur casse iOS)
+        // expectedAction: expectedAction || undefined,
         userAgent: userAgent || undefined,
         userIpAddress: userIp || undefined,
       },
@@ -12127,14 +13546,14 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
     };
   }
 
-  // Action check (reCAPTCHA est case-sensitive)
-  if (expectedAction && tokenProps.action && String(tokenProps.action) !== String(expectedAction)) {
-    return {
-      ok: false,
-      reason: "action_mismatch",
-      expected: expectedAction,
-      got: tokenProps.action,
-    };
+  // ✅ Action check case-insensitive
+  // reCAPTCHA Enterprise est souvent case-sensitive côté token/action.
+  // On compare en lowercase pour éviter les refus "Login" vs "login".
+  const got = String(tokenProps.action || "").trim().toLowerCase();
+  const exp = String(expectedAction || "").trim().toLowerCase();
+
+  if (exp && got && got !== exp) {
+    return { ok: false, reason: "action_mismatch", expected: exp, got };
   }
 
   const score =
@@ -12207,15 +13626,13 @@ exports.interview = functions
     try {
       const body = req.body || {};
 
-      // ✅ on accepte plusieurs noms côté front
       const token =
         body.recaptchaToken ||
         body.token ||
         (body.recaptcha && body.recaptcha.token) ||
         null;
 
-      // ✅ action: on force une convention stable
-      // IMPORTANT : le front doit générer un token avec CETTE action
+      // ✅ On garde l’action telle qu’envoyée, et la vérif est case-insensitive dans verifyRecaptchaToken
       const expectedAction = normalizeAction(body.recaptchaAction || body.actionName || "interview");
 
       if (!token) {
@@ -12236,10 +13653,6 @@ exports.interview = functions
           extra: r,
         });
       }
-
-      // ✅ Ici, tu continues TON code interview (Gemini / sessions / credits etc.)
-      // Pour que ça compile direct, je renvoie juste un OK:
-      // Remplace cette partie par ton handler actuel (start/answer) si tu l’as déjà ici.
 
       return res.status(200).json({ ok: true, message: "interview OK", score: r.score ?? null });
     } catch (e) {
@@ -12749,719 +14162,6 @@ export function buildCvAtsPdf(
     defaultStyle: { font: "Roboto", fontSize, lineHeight: lineH, color: colors.ink },
     content,
   };
-}
-````
-
-## File: lib/pdf/templates/cvTemplates.ts
-````typescript
-// src/lib/pdf/templates/cvTemplates.ts
-import { buildCvAtsPdf, type CvDocModel } from "@/lib/pdf/templates/cvAts";
-
-export type Lang = "fr" | "en";
-
-export type CvTemplateId =
-  | "ats"
-  | "classic"
-  | "modern"
-  | "minimalist"
-  | "creative"
-  | "elegant"
-  | "tech"
-  | "pro_max";
-
-export type PdfColorsLike = Record<string, string | undefined> & {
-  brand?: string;
-  ink?: string;
-  muted?: string;
-  line?: string;
-  bg?: string;
-  bgSoft?: string;
-  white?: string;
-};
-
-export type CvTemplateMeta = {
-  id: CvTemplateId;
-  label: string;
-  description: string;
-  previewSrc: string; // ex: "/cv-templates/cv-template-modern.png"
-  badge?: string;
-};
-
-// ----------------------------------------------------
-// Liste des templates disponibles (UI)
-// ----------------------------------------------------
-
-export const CV_TEMPLATES: CvTemplateMeta[] = [
-  {
-    id: "ats",
-    label: "ATS (Standard)",
-    description: "Template 1 colonne très lisible, optimisé pour les ATS.",
-    previewSrc: "/cv-templates/cv-template-ats.png",
-    badge: "Recommandé",
-  },
-  {
-    id: "classic",
-    label: "Classic (Sidebar)",
-    description: "Colonne latérale, structure pro et lisible.",
-    previewSrc: "/cv-templates/cv-template-classic.png",
-  },
-  {
-    id: "modern",
-    label: "Modern (Design)",
-    description: "Header moderne, blocs aérés, idéal profils tech/produit.",
-    previewSrc: "/cv-templates/cv-template-modern.png",
-  },
-  {
-    id: "minimalist",
-    label: "Minimalist",
-    description: "CV ultra épuré, typographie clean, parfait pour cabinets.",
-    previewSrc: "/cv-templates/cv-template-minimalist.png",
-  },
-  {
-    id: "creative",
-    label: "Creative",
-    description: "Mise en page en cartes / blocs, look plus dynamique.",
-    previewSrc: "/cv-templates/cv-template-creative.png",
-  },
-  {
-    id: "elegant",
-    label: "Elegant",
-    description: "Style plus premium, hiérarchie douce, très corporate.",
-    previewSrc: "/cv-templates/cv-template-elegant.png",
-  },
-  {
-    id: "tech",
-    label: "Tech (Dark)",
-    description: "Palette sombre, vibe engineering / cybersécurité.",
-    previewSrc: "/cv-templates/cv-template-tech.png",
-  },
-  {
-    id: "pro_max",
-    label: "Pro Max",
-    description: "Version premium inspirée des CV design (header fort, cartes).",
-    previewSrc: "/cv-templates/cv-template-pro-max.png",
-    badge: "Nouveau",
-  },
-];
-
-// utilisé par l’UI
-export function getCvTemplates(): CvTemplateMeta[] {
-  return CV_TEMPLATES;
-}
-
-// ----------------------------------------------------
-// Helpers génériques
-// ----------------------------------------------------
-
-function normLang(lang: Lang): Lang {
-  return lang === "en" ? "en" : "fr";
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function safeText(v: unknown): string {
-  return String(v ?? "")
-    .replace(/\u00A0/g, " ")
-    .trim();
-}
-
-function pick(colors: PdfColorsLike | undefined, key: keyof PdfColorsLike, fallback: string): string {
-  if (!colors) return fallback;
-  const v = colors[key];
-  return typeof v === "string" && v ? v : fallback;
-}
-
-function joinDot(list: string[] | undefined, maxChars = 80): string {
-  const arr = Array.isArray(list)
-    ? list.map((s: string) => safeText(s)).filter(Boolean)
-    : [];
-
-  if (!arr.length) return "—";
-
-  const out: string[] = [];
-  let used = 0;
-
-  for (const item of arr) {
-    const extra = (out.length ? 3 : 0) + item.length; // " • "
-    if (out.length && used + extra > maxChars) break;
-    out.push(item);
-    used += extra;
-  }
-
-  return out.join(" • ");
-}
-
-function hr(scale: number, color: string) {
-  return {
-    canvas: [
-      {
-        type: "line",
-        x1: 0,
-        y1: 0,
-        x2: 515,
-        y2: 0,
-        lineWidth: 0.6,
-        lineColor: color,
-      },
-    ],
-    margin: [0, 4 * scale, 0, 4 * scale],
-  };
-}
-
-function sectionTitle(label: string, scale: number, color: string) {
-  return {
-    text: label,
-    fontSize: 10.5 * scale,
-    bold: true,
-    color,
-    margin: [0, 4 * scale, 0, 3 * scale],
-  };
-}
-
-function collectSkills(model: CvDocModel): string[] {
-  const s: any = (model as any).skills || {};
-  const keys = ["cloud", "sec", "sys", "auto", "tools", "soft"];
-  const out: string[] = [];
-
-  for (const key of keys) {
-    const value = s[key];
-    if (Array.isArray(value)) {
-      for (const item of value as string[]) {
-        const txt = safeText(item);
-        if (txt) out.push(txt);
-      }
-    }
-  }
-
-  return out;
-}
-
-function renderXp(model: CvDocModel, scale: number, ink: string, muted: string) {
-  const xpRaw: unknown = (model as any).xp;
-  const xpArr: CvDocModel["xp"] = Array.isArray(xpRaw) ? (xpRaw as CvDocModel["xp"]) : [];
-
-  if (!xpArr.length) {
-    return [
-      {
-        text: "—",
-        fontSize: 9 * scale,
-        color: muted,
-      },
-    ];
-  }
-
-  return xpArr.map((x: CvDocModel["xp"][number]) => {
-    const titleParts: string[] = [];
-    if (x.role) titleParts.push(safeText(x.role));
-    if (x.company) titleParts.push(safeText(x.company));
-    const title = titleParts.join(" — ") || "—";
-
-    const metaParts: string[] = [];
-    if (x.city) metaParts.push(safeText(x.city));
-    if (x.dates) metaParts.push(safeText(x.dates));
-    const meta = metaParts.join(" • ");
-
-    const bulletsRaw: unknown = x.bullets;
-    const bullets: string[] = Array.isArray(bulletsRaw)
-      ? (bulletsRaw as string[]).map((b: string) => safeText(b)).filter(Boolean)
-      : [];
-
-    const stack: any[] = [
-      {
-        text: title,
-        fontSize: 9.8 * scale,
-        bold: true,
-        color: ink,
-        margin: [0, 0, 0, 1.5 * scale],
-      },
-    ];
-
-    if (meta) {
-      stack.push({
-        text: meta,
-        fontSize: 9 * scale,
-        color: muted,
-        margin: [0, 0, 0, 2 * scale],
-      });
-    }
-
-    if (bullets.length) {
-      stack.push({
-        ul: bullets,
-        fontSize: 9 * scale,
-        color: ink,
-        margin: [0, 0, 0, 4 * scale],
-      });
-    }
-
-    return { stack };
-  });
-}
-
-function renderEducation(model: CvDocModel, scale: number, ink: string, muted: string) {
-  const eduRaw: unknown = (model as any).education;
-  let eduArr: string[] = [];
-
-  if (Array.isArray(eduRaw)) {
-    eduArr = (eduRaw as unknown as string[]).map((v: string) => safeText(v)).filter(Boolean);
-  } else {
-    const one = safeText(eduRaw);
-    if (one) {
-      eduArr = one
-        .split("\n")
-        .map((l: string) => l.trim())
-        .filter(Boolean);
-    }
-  }
-
-  if (!eduArr.length) {
-    return [
-      {
-        text: "—",
-        fontSize: 9 * scale,
-        color: muted,
-      },
-    ];
-  }
-
-  return eduArr.slice(0, 4).map((line: string) => ({
-    text: line,
-    fontSize: 9 * scale,
-    color: ink,
-    margin: [0, 0, 0, 4 * scale],
-  }));
-}
-
-// ----------------------------------------------------
-// Base docDefinition
-// ----------------------------------------------------
-
-function baseDocDefinition(
-  _model: CvDocModel,
-  colors: PdfColorsLike,
-  scale: number,
-  pageMargins: [number, number, number, number]
-) {
-  const brand = pick(colors, "brand", "#2563eb");
-  const ink = pick(colors, "ink", "#111827");
-  const muted = pick(colors, "muted", "#6b7280");
-  const line = pick(colors, "line", "#e5e7eb");
-  const bgSoft = pick(colors, "bgSoft", "#f3f4f6");
-  const white = pick(colors, "white", "#ffffff");
-
-  return {
-    pageSize: "A4",
-    pageMargins,
-    defaultStyle: { font: "Roboto", fontSize: 10 * scale, color: ink },
-    styles: {
-      name: { fontSize: 18 * scale, bold: true, color: ink },
-      title: { fontSize: 11 * scale, bold: true, color: brand },
-      contact: { fontSize: 9 * scale, color: muted },
-      section: { fontSize: 10.5 * scale, bold: true, color: ink },
-      small: { fontSize: 9 * scale, color: muted },
-    },
-    _palette: { brand, ink, muted, line, bgSoft, white },
-    content: [] as any[],
-  } as any;
-}
-
-// ----------------------------------------------------
-// Templates
-// ----------------------------------------------------
-
-function buildClassic(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  const L = normLang(lang);
-  const brand = pick(colors, "brand", "#ef4444");
-  const ink = pick(colors, "ink", "#111827");
-  const muted = pick(colors, "muted", "#6b7280");
-  const line = pick(colors, "line", "#e5e7eb");
-
-  const doc = baseDocDefinition(model, colors, scale, [
-    34 * scale,
-    30 * scale,
-    34 * scale,
-    26 * scale,
-  ]);
-
-  const leftWidth = 170 * scale;
-
-  const skills = collectSkills(model);
-
-  (doc.content as any[]).push({
-    columns: [
-      {
-        width: leftWidth,
-        stack: [
-          {
-            text: safeText(model.name),
-            style: "name",
-          },
-          {
-            text: safeText((model as any).title),
-            style: "title",
-            margin: [0, 2 * scale, 0, 0],
-          },
-          {
-            text: safeText((model as any).contactLine ?? (model as any).contact),
-            style: "contact",
-            margin: [0, 6 * scale, 0, 8 * scale],
-          },
-          hr(scale, line),
-
-          sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
-          {
-            text: joinDot(skills, 120),
-            fontSize: 9 * scale,
-            color: muted,
-            margin: [0, 2 * scale, 0, 6 * scale],
-          },
-
-          sectionTitle(L === "en" ? "Languages" : "Langues", scale, ink),
-          {
-            text: safeText((model as any).langLine),
-            fontSize: 9 * scale,
-            color: muted,
-            margin: [0, 2 * scale, 0, 6 * scale],
-          },
-
-          sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
-          {
-            text: joinDot((model as any).hobbies as string[] | undefined, 120),
-            fontSize: 9 * scale,
-            color: muted,
-            margin: [0, 2 * scale, 0, 0],
-          },
-        ],
-      },
-      {
-        width: "*",
-        stack: [
-          sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
-          {
-            text: safeText((model as any).profile),
-            fontSize: 9.5 * scale,
-            color: ink,
-            margin: [0, 2 * scale, 0, 8 * scale],
-            alignment: "justify",
-          },
-
-          hr(scale, line),
-
-          sectionTitle(L === "en" ? "Experience" : "Expérience professionnelle", scale, ink),
-          {
-            stack: renderXp(model, scale, ink, muted),
-          },
-
-          hr(scale, line),
-
-          sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
-          {
-            stack: renderEducation(model, scale, ink, muted),
-          },
-
-          sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
-          {
-            text: safeText((model as any).certs),
-            fontSize: 9 * scale,
-            color: ink,
-            margin: [0, 2 * scale, 0, 0],
-          },
-        ],
-      },
-    ],
-    columnGap: 18 * scale,
-  });
-
-  return doc;
-}
-
-function buildModern(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  const L = normLang(lang);
-  const brand = pick(colors, "brand", "#2563eb");
-  const ink = pick(colors, "ink", "#0f172a");
-  const muted = pick(colors, "muted", "#6b7280");
-  const line = pick(colors, "line", "#e5e7eb");
-  const bgSoft = pick(colors, "bgSoft", "#eff6ff");
-
-  const doc = baseDocDefinition(model, colors, scale, [
-    30 * scale,
-    28 * scale,
-    30 * scale,
-    28 * scale,
-  ]);
-
-  const skills = collectSkills(model);
-
-  (doc.content as any[]).push(
-    {
-      // Header bande colorée
-      table: {
-        widths: ["*", "*"],
-        body: [
-          [
-            {
-              stack: [
-                {
-                  text: safeText(model.name),
-                  fontSize: 20 * scale,
-                  bold: true,
-                  color: ink,
-                },
-                {
-                  text: safeText((model as any).title),
-                  fontSize: 11 * scale,
-                  bold: true,
-                  color: brand,
-                  margin: [0, 2 * scale, 0, 0],
-                },
-              ],
-            },
-            {
-              stack: [
-                {
-                  text: safeText((model as any).contactLine ?? (model as any).contact),
-                  fontSize: 9 * scale,
-                  color: muted,
-                  alignment: "right",
-                },
-                {
-                  text: safeText((model as any).langLine),
-                  fontSize: 9 * scale,
-                  color: muted,
-                  alignment: "right",
-                  margin: [0, 2 * scale, 0, 0],
-                },
-              ],
-            },
-          ],
-        ],
-      },
-      layout: "noBorders",
-      fillColor: bgSoft,
-      margin: [-6 * scale, -6 * scale, -6 * scale, 10 * scale],
-    },
-
-    {
-      columns: [
-        {
-          width: "*",
-          stack: [
-            sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
-            {
-              text: safeText((model as any).profile),
-              fontSize: 9.5 * scale,
-              color: ink,
-              margin: [0, 2 * scale, 0, 6 * scale],
-              alignment: "justify",
-            },
-
-            sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
-            {
-              stack: renderXp(model, scale, ink, muted),
-            },
-          ],
-        },
-        {
-          width: 180 * scale,
-          margin: [16 * scale, 0, 0, 0],
-          stack: [
-            sectionTitle(L === "en" ? "Key Skills" : "Compétences clés", scale, ink),
-            {
-              text: joinDot(skills, 140),
-              fontSize: 9 * scale,
-              color: muted,
-              margin: [0, 2 * scale, 0, 6 * scale],
-            },
-
-            sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
-            {
-              stack: renderEducation(model, scale, ink, muted),
-            },
-
-            sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
-            {
-              text: safeText((model as any).certs),
-              fontSize: 9 * scale,
-              color: muted,
-              margin: [0, 2 * scale, 0, 6 * scale],
-            },
-
-            sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
-            {
-              text: joinDot((model as any).hobbies as string[] | undefined, 140),
-              fontSize: 9 * scale,
-              color: muted,
-            },
-          ],
-        },
-      ],
-      columnGap: 18 * scale,
-    }
-  );
-
-  return doc;
-}
-
-function buildMinimalist(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  const L = normLang(lang);
-  const ink = pick(colors, "ink", "#111827");
-  const muted = pick(colors, "muted", "#6b7280");
-  const line = pick(colors, "line", "#e5e7eb");
-
-  const doc = baseDocDefinition(model, colors, scale, [
-    40 * scale,
-    32 * scale,
-    40 * scale,
-    32 * scale,
-  ]);
-
-  const skills = collectSkills(model);
-
-  (doc.content as any[]).push(
-    {
-      text: safeText(model.name),
-      fontSize: 20 * scale,
-      bold: true,
-      color: ink,
-      margin: [0, 0, 0, 2 * scale],
-    },
-    {
-      text: safeText((model as any).title),
-      fontSize: 11 * scale,
-      color: muted,
-      margin: [0, 0, 0, 4 * scale],
-    },
-    {
-      text: safeText((model as any).contactLine ?? (model as any).contact),
-      fontSize: 9 * scale,
-      color: muted,
-      margin: [0, 0, 0, 8 * scale],
-    },
-    hr(scale, line),
-    sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
-    {
-      text: safeText((model as any).profile),
-      fontSize: 9.5 * scale,
-      color: ink,
-      margin: [0, 2 * scale, 0, 6 * scale],
-      alignment: "justify",
-    },
-    sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
-    {
-      stack: renderXp(model, scale, ink, muted),
-      margin: [0, 0, 0, 4 * scale],
-    },
-    sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
-    {
-      stack: renderEducation(model, scale, ink, muted),
-    },
-    sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
-    {
-      text: joinDot(skills, 160),
-      fontSize: 9 * scale,
-      color: muted,
-      margin: [0, 2 * scale, 0, 4 * scale],
-    },
-    sectionTitle(L === "en" ? "Languages" : "Langues", scale, ink),
-    {
-      text: safeText((model as any).langLine),
-      fontSize: 9 * scale,
-      color: muted,
-      margin: [0, 2 * scale, 0, 4 * scale],
-    },
-    sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
-    {
-      text: joinDot((model as any).hobbies as string[] | undefined, 160),
-      fontSize: 9 * scale,
-      color: muted,
-    }
-  );
-
-  return doc;
-}
-
-// pour l’instant, on réutilise les layouts existants
-function buildCreative(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  // Style plus "design" : on réutilise Modern (tu pourras raffiner plus tard)
-  return buildModern(model, lang, colors, scale);
-}
-
-function buildElegant(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  // Style premium mais sobre : on part du Classic
-  return buildClassic(model, lang, colors, scale);
-}
-
-function buildTech(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  // Palette plus sombre pour un look "tech"
-  const overridden: PdfColorsLike = {
-    ...colors,
-    brand: colors.brand || "#22c55e",
-    ink: colors.ink || "#f9fafb",
-    muted: colors.muted || "#94a3b8",
-    bgSoft: colors.bgSoft || "#020617",
-    line: colors.line || "#1e293b",
-  };
-  return buildModern(model, lang, overridden, scale);
-}
-
-function buildProMax(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  // Version "premium" basée sur Modern, avec léger zoom
-  const overridden: PdfColorsLike = {
-    ...colors,
-    brand: colors.brand || "#0ea5e9",
-  };
-  const boostedScale = clamp(scale * 1.02, 0.75, 1.6);
-  return buildModern(model, lang, overridden, boostedScale);
-}
-
-// ----------------------------------------------------
-// Public API
-// ----------------------------------------------------
-
-export function buildCvPdf(
-  templateId: CvTemplateId,
-  model: CvDocModel,
-  lang: Lang,
-  colors: PdfColorsLike,
-  layout: "auto" | "tight" | "spacious" = "auto",
-  scale = 1
-) {
-  const L = normLang(lang);
-
-  // mapping layout -> styleMode attendu par buildCvAtsPdf
-  const styleMode: "auto" | "compact" | "expanded" =
-    layout === "tight" ? "compact" : layout === "spacious" ? "expanded" : "auto";
-
-  // ATS = ton template existant
-  if (templateId === "ats") {
-    return buildCvAtsPdf(model, L, colors as any, styleMode, scale);
-  }
-
-  // ajustement global de l’échelle selon layout
-  const mul = layout === "tight" ? 0.92 : layout === "spacious" ? 1.08 : 1.0;
-  const s = clamp(scale * mul, 0.75, 1.6);
-
-  switch (templateId) {
-    case "classic":
-      return buildClassic(model, L, colors, s);
-    case "modern":
-      return buildModern(model, L, colors, s);
-    case "minimalist":
-      return buildMinimalist(model, L, colors, s);
-    case "creative":
-      return buildCreative(model, L, colors, s);
-    case "elegant":
-      return buildElegant(model, L, colors, s);
-    case "tech":
-      return buildTech(model, L, colors, s);
-    case "pro_max":
-      return buildProMax(model, L, colors, s);
-    default:
-      // fallback safe
-      return buildClassic(model, L, colors, s);
-  }
 }
 ````
 
@@ -14046,32 +14746,30 @@ export default admin;
 
 ## File: lib/firestore.ts
 ````typescript
-import { db } from "./firebase";
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  updateDoc,
-  addDoc,
-  query,
-  where
-} from "firebase/firestore";
+// src/lib/firebase.ts
+import { initializeApp, getApps, getApp } from "firebase/app";
+import { getAuth } from "firebase/auth";
+import { initializeFirestore } from "firebase/firestore";
 
-// Placeholders pour tes futures fonctions Firestore (users, candidatures, etc.)
-export {
-  db,
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  updateDoc,
-  addDoc,
-  query,
-  where
+const firebaseConfig = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY!,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN!,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID!,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET!,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID!,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID!,
 };
+
+export const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
+
+export const auth = getAuth(app);
+
+// ✅ IMPORTANT iOS/mobile: force long-polling (corrige Listen/channel sur Safari / réseaux stricts)
+export const db = initializeFirestore(app, {
+  experimentalForceLongPolling: true,
+  // si tu as encore des soucis sur certains mobiles, tu peux aussi activer ça :
+  // useFetchStreams: false,
+});
 ````
 
 ## File: lib/interviewPrompt.ts
@@ -15490,1198 +16188,113 @@ module.exports = {
 
 ## File: .firebase/hosting.b3V0.cache
 ````
-tech.txt,1766516748973,3cc77dc7579ee301c79c58a1da5d988087fb019c57e0d78f73a119a26fc00a4d
-tech.html,1766516748967,70478536984048f8c6baf85a4058f211be215908aa302b25aaed9a52c5f222ac
-signup.txt,1766516748973,67d7b353b52eddfad89558b7f87fa0ed0a8b9d01d3ac4a26af8f5c46c0aaaec0
-signup.html,1766516748966,13a430bdcfa6a23c937d07424d9976cba1c378d7fba5af9d709247d55dbae711
-manifest.webmanifest,1766516747523,b125a9afb1b3c4b81daaf5442dd9d589e2367c37c2fd3305fa23247173975337
-login.txt,1766516748972,caa566efee024b3a35054ae05a6f221d8495f025d7f380ea77aff75eb5fb3d5e
-login.html,1766516748966,d3998e585966bec43ed93623d16627486f69f8fab60f572b28cae0418e40727f
-index.txt,1766516748972,b0952ef67cb6b99e6c2afeaba613ffad79cb81f327adcc17ba2d877afab592dc
-index.html,1766516748965,9b9072f01f7c7b5092cee0c56e4e838dc370c49d1045768f26997eea029c3b26
-forgot-password.txt,1766516748971,88c0dd789a3046334a7199dcfcc9854cfc2551f6e0a3d67bde03695847b139c7
-forgot-password.html,1766516748964,c7999480bd7f5ecd38846e31c73bbc5a4d85cbdd954181b7b45e85e724dbcad9
-assistance-candidature.txt,1766516748972,571b66de82c739ba22388b13fa2683eeae37641c1f05ae600f98f1b66317d7b8
-assistance-candidature.html,1766516748964,497d9247344cccd26da023e712845771c7462cde598b6fe5e82f9c1d6435265c
-app.txt,1766516748972,7850b8a9e9ba265b34809ed488fba35e5e68db7e503f661eb1ac59a346b9067a
-app.html,1766516748966,73a6efe79ce7b661efb9f95998c80a538a98e79b73297ddf15162766e1fa4f58
-admin.txt,1766516748970,f803e183918a3f2766bc90dd598061cee600d5c7ee28285e0baf519cfd6cf810
-admin.html,1766516748962,e27231a563db9416d934f284b9a06cf556c887632aad85a59678fdbc833e139d
-404.html,1766516748361,0626120cd6599b9be504fa03b62df50001f4d6b7ad6f8cb18f42ef5bff48a7f3
-debug/polar.txt,1766516748967,162c79c96a088d3835c7deff2f7ee56b4824f4ff666e9cc3950531bb47524fc4
-debug/polar.html,1766516748960,9c12de9b764a377658e9776ec0b1b788f9a210cdbad24e04cb26a23b14ad27ac
-auth/verify-email.txt,1766516748967,63b1366132c2b0e2c175635e0649c2db808d8ec7667749d2639f53b758e377c7
-auth/verify-email.html,1766516748960,2f2ee707b9bc799fd433a74e7cb6dc81852665f6465c45576704e0988b31b106
-app/tracker.txt,1766516748970,18126b57901f775004395836548f7a73751e83b18b81872442dee1c87370dc22
-app/tracker.html,1766516748963,30b6204034b11845cb893ff05443198864a7adb00070b9adb7dd2ec98b08bcb3
-app/settings.txt,1766516748973,ccef11346e1bbd3e3b7ae52f767cba6a1aa6d92d4fcfd3793593ee8b7d9ccde9
-app/settings.html,1766516748966,5266df0af37d8fa6709cc6d2c863bbe4ab89b08efcac97998501d65a9b3d7b7b
-app/pitch.txt,1766516748969,36f5315cfc294be3857aa266a1740f5221496df763e9778ec8725bffd1a03544
-app/pitch.html,1766516748962,d6a772b420bd301d88a2ca95ae58b8e8cef8f1066b195f6141c8c37d3ecb53bf
-app/lm.txt,1766516748972,ab8e094152014d928f4b1837948edf892f04ac8a19b3a353a6ad42582165eb2f
-app/lm.html,1766516748964,e1ff1821ef676c6bba3853b7351d77bae4a3d321d16d9266707ecd3b0bf1f180
-app/interview.txt,1766516748971,fe4689f8802db6b00679134b9ee6b202e9e5f04e9f4bdc8cb6f1fa5920467554
-app/interview.html,1766516748964,f58af150bc197f2fd5351b159b958ad7c3d3a6b7f0aef7b7786cece06b0249f1
-app/history.txt,1766516748969,3d99fecc6e8369deb2ac7ff03c4b17d90cde33080bbc48ca2ca6cb30c8515953
-app/history.html,1766516748962,e13c02f140849dbd105464a044416fd5cecaf07c72d7f3cc9f9be4f1a2d5789a
-app/cv.txt,1766516748971,ae59d2a5c6c8bc3d41dca902c3119ff1dc33b3aeb63bef75758cf15824c15d58
-app/cv.html,1766516748964,6527edd251c87b7ca2c2310a42dca7da53e14ecb664b1e3d287d6616514f81c1
-app/credits.txt,1766516748968,24d4978dee084c63c1cbb323155cd4c70f6d02ca243de961f90d7e6b467f71fe
-app/credits.html,1766516748961,3cc63222ed5df58478beb80f7efb773c4d3b47f4af69d398f621ff2b2208e337
-app/apply.txt,1766516748969,8ea0c8e96099d408f8d6335b00bfa7124ac76c0c6c83be7dccd9dddfc4190d81
-app/apply.html,1766516748961,71be18f951c8b9bdf78fa5ffd11e7d108a8b6ef4ef461e65298d54e759f3f5e4
-api/polar/test,1766516748967,35d1b34b7807696b8413c672871fcf26b35d968667e349dfbe811cedc67ac17a
-admin/logs.txt,1766516748968,4193cfac968d950cd1d60e21536d13877be82d5fda4b328877374dcf3ffb6bbf
-admin/logs.html,1766516748961,7d85f1598fa19eb04fd7f41d2319e17fca3b8c1d30c79ba2e78bae763e7b8d1a
-admin/login.txt,1766516748966,fc9efe2a6fb3cbc9a59bc9c9a6f15f8407bc4554cb41a0b9a83ad59717910c6a
-admin/login.html,1766516748959,b77fe6a483e5cc895e0545a8dfa15d00ad77e642c37809d773749102a7da8e24
-_next/static/css/faac00ea2ad55afa.css,1766516747505,6d7858f4fcc4e1e9989a644e8cf8a19bb627645fdf7cac7bb293cc4e6ae1ada3
-_next/static/chunks/webpack-94aa307a0c675022.js,1766516747501,39d51b0f67df400cf90160e3e74e56e3b3ac0d30af506085df8bee1092e91cab
-_next/static/chunks/polyfills-42372ed130431b0a.js,1766516747505,67dee1c02c6a6700d63b5c1898cf2df618101a68a395db469192763d24925a23
-_next/static/chunks/main-app-7466cb2517b2ac24.js,1766516747498,3dad6f439d8b157d2427b4087aaeff0fef56e1e1041ee3b5f0fad10bf506a92d
-_next/static/chunks/main-76e1bcb595671093.js,1766516747504,bbcdc180a07d600a7f8dcfa6d3267afdec0b918f9bc722e4764b72782a68d238
-_next/static/chunks/framework-aec844d2ccbe7592.js,1766516747501,36f12099915a78862f76158596a2aac7e86dd87ba94f4d3b896a7749c5e4c9d6
-_next/static/chunks/fd9d1056-b4129a380d1be68f.js,1766516747498,8b73f2ae4babb3d70adf200a16329555cd03b390ca97f3fa3368428ebc73c549
-_next/static/chunks/ebf8faf4-eb27ebf8c37d4d67.js,1766516747497,a107c6566fbc2f52b78a30e52b2ae3b7b84b0da4ffe8d15f24849c217e372a5d
-_next/static/chunks/ca377847-044365abace2608d.js,1766516747496,c6e43c770559cc5ee6605295131dc3e9de57d9fda82d7043e9b70b2f97bc8002
-_next/static/chunks/941-da853eb9ae4bc965.js,1766516747494,f4b97a2711ed98aa8723dcc66969fec23e3ebc576ff38e09fd1f1cd10bd20a82
-_next/static/chunks/810-039b9229cc1a2fae.js,1766516747488,2f29a61132b062dab1e63516e7337a67aede0bce268795b569dfccfc5c400bab
-_next/static/chunks/7508b87c-2affb3ad7b55ab3d.js,1766516747486,798ec3d71f923e838d157bf4dd01e76244b35e1c9634e28e77c89c9df89a676d
-_next/static/chunks/648-a41745ebae293ba3.js,1766516747483,d08de5f20a30c50b96e1cb68dfbec730d23ae67cba384f345e34c09b6adddaf3
-_next/static/chunks/63b94182.662a1bbff33f68c9.js,1766516747489,86c28eeebf9d1883bb5afe89168408b3ccf891d873e2ac67eec46ef5baa42a41
-_next/static/chunks/600-2ae2ab76ace4e875.js,1766516747480,ea47caf34ad27d1a524604c65a1c0ecc0f6fb1f64426749920e60ac529a33563
-_next/static/chunks/5493da1b.e7544b77cf3a7468.js,1766516747486,76cae2b4134f6f89522b80ad97b81eb8b093f50a047c7faa2e0512533d603784
-_next/static/chunks/500-c984c19836bde651.js,1766516747477,94a6d0ca98e707e577d1f1b6336dcdf87e35f2c1be72c787845aad3abfdab19b
-_next/static/chunks/323-54d09e3358a73f44.js,1766516747481,2aae14a1d235667a06206f344a3f76216206cb0f4697ccc38edc1923e27c5d58
-_next/static/chunks/276-a01f3bf27c64a121.js,1766516747479,7959269d2568322cb0a6253c58e7242b54d27d373aa32b7b0c05474bf95e8fd1
-_next/static/chunks/pages/_error-7ba65e1336b92748.js,1766516747506,0402d6340a70945d851b2d22e156d955fbee54c1d8ec8b379f35fd464a8d08bf
-_next/static/chunks/pages/_app-72b849fbd24ac258.js,1766516747506,dae29acdf0128939e571909a9228115276818bce739f4d0f98c1da8ed68ba91d
-_next/static/chunks/app/page-04078e5e4ba66b1d.js,1766516747506,fd845f84ec7c187a3bb3e82cd5a690aa75f0b4ca0c53a65495ea449a96c15991
-_next/static/chunks/app/not-found-74a90fc08ab9437a.js,1766516747506,8ec8fde655d80c0e5d37c7714dac9911aa99f5add99e26b2820f5afcda111b2a
-_next/static/chunks/app/layout-9e322ebc6c69974b.js,1766516747505,57a38ab6c6c143610c4c5c55fe368f60c5aed79c207f486eb9d75bf8763d6394
-_next/static/chunks/app/tech/page-cc145f1ea41d0f3b.js,1766516747515,9782dc820a4127292f16e053f0bcc1695227f9ba956897623c527946b7b8fdc5
-_next/static/chunks/app/signup/page-8c48925c3f3c52ca.js,1766516747512,636d7396bfba3179391c46dc2cadcfe85fcd5c9955e05cb88622170aa8b44f23
-_next/static/chunks/app/login/page-8a1f8646938577f8.js,1766516747512,45da851b1c759ecdc39470f681d20a1f67bd96b97ce88568df91a0aff4ca6696
-_next/static/chunks/app/forgot-password/page-7ba7f56b957b3ead.js,1766516747512,59c307ab28b715a638e9ac9d484b2d73ac8bd3b271b1db0fb16ce4716a556865
-_next/static/chunks/app/debug/polar/page-e28997809c70dae8.js,1766516747519,eae0b7def982e0bf3068fde94e7f0f34defeceee17e2646fb7a9cb846c72169e
-_next/static/chunks/app/auth/verify-email/page-c03af4984154988e.js,1766516747519,6b22e7525d83798f87b4b2b1d90798e6972b3edc575929ee1352938bfa718515
-_next/static/chunks/app/assistance-candidature/page-f38626f0664fd689.js,1766516747510,81d9766776f30fbac7fbd008ba3ab85a44d797761bc1a6972d105a47c69f101f
-_next/static/chunks/app/app/page-3d33f0691cc7052c.js,1766516747512,f79254300ae18826e790c276848a5aa9223b69f41cb2b8516b8841a1e43a435b
-_next/static/chunks/app/app/layout-7aa6ad0f76d78662.js,1766516747509,47da4ba9f8b5600fd9cb70eb46bf190b3ea02b503488dfb3560c83c2a3d7b7b8
-_next/static/chunks/app/app/tracker/page-8f13d48cb47ca503.js,1766516747519,0b68abda42bcfe86ea7274e10859d1964851010b96b165ed852ecfd58ae16571
-_next/static/chunks/app/app/settings/page-654d883b731b8e6b.js,1766516747518,a65265b14afa8476fb7b78ff2f3f18b8989aec6b6b50f4b02960185d8fca1d76
-_next/static/chunks/app/app/pitch/page-a42bf5337283b380.js,1766516747517,8bb08510d6cd6129e33e6ec8e6fbd346c590b1fce79e8c3fd1af1c8492f985d1
-_next/static/chunks/app/app/lm/page-a1057059c1ffab1f.js,1766516747518,34ed764c2ca1bf552158c78b6a6350f2cdd4411a752d4d7b3661952c6d1772f2
-_next/static/chunks/app/app/interview/page-5d2b46a3565c14fc.js,1766516747517,e004acddbc6b4612633faad87f187fd7fccee1994dfd7a383d0134b3ba6e8e69
-_next/static/chunks/app/app/history/page-b44f1b622671fb6b.js,1766516747516,2b50c7db092b6dc9ae36249d114bd85396746f0b795a72f18bc9e9432fdd325b
-_next/static/chunks/app/app/cv/page-492c1c2b5ea110d3.js,1766516747517,27b93316c1ef03d32314815e1199788b00fbc1166d05264ad35be6c9b1aed703
-_next/static/chunks/app/app/credits/page-afe0ce4cf8da1f59.js,1766516747516,7572d8149de19adcb718582a8fbe62aacc563f5bf5998fc4683b678a5ad3af9c
-_next/static/chunks/app/app/apply/page-cf0ee0e768561642.js,1766516747516,1b88d79376396f77cdfb2520e7eec3848bd4533744dcf0d4638c8768c5073c5f
-_next/static/chunks/app/admin/page-f161718d3c048788.js,1766516747509,8bc2d31560e4e32b0c29fd167e4bda2a4c421fdbf15a83fe5ad1253555f62b2a
-_next/static/chunks/app/admin/logs/page-e8c5c4ae49457b18.js,1766516747515,554379c156358ee21df7e2bad9172a59004c4a34179d606eec21ae1da9d2e808
-_next/static/chunks/app/admin/login/page-d0fa36fddfc7acd4.js,1766516747515,b90b810232b2619ad3be8ca04464545ed5bee12883d847e4577c1320ac8f4e14
-_next/static/chunks/app/_not-found/page-7494094633467ef3.js,1766516747508,dcfa115b285fc1e7d920913e1a0464349f8c270c107df17678afbcaee62abec0
-_next/static/IlA4IUG3fQpM1zdQiAMyW/_ssgManifest.js,1766516747501,02dbc1aeab6ef0a6ff2ff9a1643158cf9bb38929945eaa343a3627dee9ba6778
-_next/static/IlA4IUG3fQpM1zdQiAMyW/_buildManifest.js,1766516747503,f46b17d6e2e887329d388286773626796e64b52f4cd965c9b0fe037e97f3ad58
-````
-
-## File: app/api/generate-cv/route.ts
-````typescript
-import { NextResponse } from "next/server";
-
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-// URL de ta Cloud Function Google
-const UPSTREAM =
-  process.env.GENERATE_LETTER_UPSTREAM ||
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
-
-export async function POST(req: Request) {
-  try {
-    // 1. Récupération des headers (Auth + Recaptcha)
-    const auth = req.headers.get("authorization") || "";
-    const headerRecaptcha = req.headers.get("x-recaptcha-token") || "";
-
-    const body = await req.json().catch(() => null);
-    if (!body) {
-      return NextResponse.json({ error: "Body JSON invalide." }, { status: 400 });
-    }
-
-    // 2. Support recaptcha dans header OU body
-    const bodyRecaptcha =
-      typeof body?.recaptchaToken === "string" ? body.recaptchaToken : "";
-    const recaptcha = headerRecaptcha || bodyRecaptcha;
-
-    // 3. Appel Cloud Function (Server-to-Server)
-    const upstreamRes = await fetch(UPSTREAM, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(auth ? { Authorization: auth } : {}), // On transmet le token
-        ...(recaptcha ? { "X-Recaptcha-Token": recaptcha } : {}),
-      },
-      body: JSON.stringify(body),
-      cache: "no-store",
-    });
-
-    // 4. Renvoi de la réponse
-    const contentType =
-      upstreamRes.headers.get("content-type") || "application/json";
-    const text = await upstreamRes.text();
-
-    return new NextResponse(text, {
-      status: upstreamRes.status,
-      headers: { "Content-Type": contentType },
-    });
-  } catch (e: any) {
-    console.error("API /generateLetterAndPitch error:", e);
-    return NextResponse.json({ error: "internal_error" }, { status: 500 });
-  }
-}
-````
-
-## File: app/api/generate-zip/route.ts
-````typescript
-// app/api/generate-zip/route.ts
-
-import { NextResponse } from "next/server";
-import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
-import { getAuth } from "firebase-admin/auth";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
-import JSZip from "jszip";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
-
-// ⚠️ Pour typer proprement le cast à la fin
-type BodyInitCompat = BodyInit | null | undefined;
-
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-function getAdminApp() {
-  if (getApps().length) return getApps()[0];
-
-  const projectId = process.env.FIREBASE_ADMIN_PROJECT_ID || process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_ADMIN_CLIENT_EMAIL;
-  const privateKeyRaw = process.env.FIREBASE_ADMIN_PRIVATE_KEY;
-
-  if (projectId && clientEmail && privateKeyRaw) {
-    const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
-    return initializeApp({
-      credential: cert({ projectId, clientEmail, privateKey }),
-    });
-  }
-
-  return initializeApp({
-    credential: applicationDefault(),
-  });
-}
-
-async function requireUser(req: Request) {
-  getAdminApp();
-
-  const authHeader = req.headers.get("authorization") || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
-
-  if (!token) {
-    return { ok: false as const, status: 401, error: "Missing Authorization Bearer token" };
-  }
-
-  try {
-    const decoded = await getAuth().verifyIdToken(token);
-    return { ok: true as const, uid: decoded.uid, email: decoded.email || "" };
-  } catch (e) {
-    console.error("verifyIdToken error:", e);
-    return { ok: false as const, status: 401, error: "Invalid token" };
-  }
-}
-
-async function consumeCreditsAndLog(params: {
-  uid: string;
-  email: string;
-  cost: number; // ex 2
-  tool: string; // generateCvLmZip
-  docType: "cv" | "lm" | "other";
-  meta?: any;
-}) {
-  getAdminApp();
-  const db = getFirestore();
-
-  const userRef = db.collection("users").doc(params.uid);
-  const usageRef = db.collection("usageLogs").doc();
-  const now = Date.now();
-
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(userRef);
-    const data = snap.exists ? snap.data() || {} : {};
-    const currentCredits = typeof data.credits === "number" ? data.credits : 0;
-
-    if (currentCredits < params.cost) {
-      const err: any = new Error("NO_CREDITS");
-      err.code = "NO_CREDITS";
-      throw err;
-    }
-
-    tx.set(
-      userRef,
-      {
-        credits: currentCredits - params.cost,
-        totalIaCalls: FieldValue.increment(1),
-        totalDocumentsGenerated: FieldValue.increment(2), // zip = 2 docs (cv + lm)
-        totalCvGenerated: FieldValue.increment(1),
-        totalLmGenerated: FieldValue.increment(1),
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    tx.set(
-      usageRef,
-      {
-        userId: params.uid,
-        email: params.email || "",
-        action: "generate_document",
-        docType: params.docType,
-        eventType: "generate",
-        tool: params.tool,
-        creditsDelta: -params.cost,
-        meta: params.meta || null,
-        createdAt: now,
-        createdAtServer: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-  });
-}
-
-function buildProfileContextForIA(profile: any) {
-  const p = profile || {};
-
-  let skillsArr: any[] = [];
-  if (Array.isArray(p.skills)) {
-    skillsArr = p.skills;
-  } else if (p.skills && typeof p.skills === "object") {
-    if (Array.isArray(p.skills.sections)) {
-      p.skills.sections.forEach((sec: any) => {
-        if (Array.isArray(sec.items)) skillsArr = skillsArr.concat(sec.items);
-      });
-    }
-    if (Array.isArray(p.skills.tools)) skillsArr = skillsArr.concat(p.skills.tools);
-  }
-
-  const skillsStr = (skillsArr || []).join(", ");
-
-  const expStr = Array.isArray(p.experiences)
-    ? p.experiences
-        .map(
-          (e: any) =>
-            `${e.role || e.title || ""} chez ${e.company || ""} (${e.dates || ""}): ${(e.bullets || []).join(" ")}`
-        )
-        .join("; \n")
-    : "";
-
-  const eduStr = Array.isArray(p.education)
-    ? p.education
-        .map((e: any) => `${e.degree || e.title || ""} - ${e.school || e.institution || ""} (${e.dates || ""})`)
-        .join("; \n")
-    : "";
-
-  return `Nom: ${p.fullName || p.name || ""}
-Titre: ${p.profileHeadline || p.title || ""}
-Contact: ${p.email || ""} | ${p.phone || ""} | ${p.linkedin || ""} | ${p.city || ""}
-Résumé de profil: ${p.profileSummary || p.summary || ""}
-Compétences: ${skillsStr}
-Expériences: 
-${expStr}
-Formations: 
-${eduStr}
-Certifications: ${p.certs || ""}
-Langues: ${p.langLine || p.lang || ""}`.trim();
-}
-
-async function callGeminiText(
-  prompt: string,
-  apiKey: string,
-  temperature = 0.65,
-  maxOutputTokens = 1400
-) {
-  const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-
-  const body = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { temperature, maxOutputTokens },
-  };
-
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const errorText = await resp.text();
-    throw new Error("Erreur Gemini (texte): " + errorText);
-  }
-
-  const data = await resp.json();
-  const parts = data?.candidates?.[0]?.content?.parts || [];
-  const text = parts
-    .map((p: any) => (typeof p.text === "string" ? p.text : ""))
-    .join("\n")
-    .trim();
-
-  if (!text) throw new Error("Réponse Gemini (texte) vide");
-  return text;
-}
-
-function buildFallbackLetterBody(profile: any, jobTitle: string, companyName: string, lang: string) {
-  const p = profile || {};
-  const primaryDomain = p.primaryDomain || "";
-  const summary = p.profileSummary || "";
-  const firstExp = Array.isArray(p.experiences) && p.experiences.length ? p.experiences[0] : null;
-  const role = firstExp?.role || firstExp?.title || "";
-  const company = firstExp?.company || "";
-  const years = Array.isArray(p.experiences) && p.experiences.length > 0 ? p.experiences.length : null;
-
-  if (lang === "en") {
-    return `I am writing to express my interest in the position of ${jobTitle || "your advertised role"} at ${
-      companyName || "your company"
-    }. ${summary || ""}
-
-With ${years ? years + " years of experience" : "solid experience"} in ${primaryDomain || "my field"}, I have developed skills relevant to this opportunity.
-
-In my previous experience at ${company || "my last company"}, I contributed to projects and collaborated with different stakeholders.
-
-I would be delighted to discuss how I can contribute to your team.`;
-  }
-
-  return `Je vous écris pour vous faire part de mon intérêt pour le poste de ${jobTitle || "..."} au sein de ${
-    companyName || "votre entreprise"
-  }. ${summary || ""}
-
-Avec ${years ? years + " ans d’expérience" : "une expérience significative"} ${
-    primaryDomain ? "dans " + primaryDomain : "dans mon domaine"
-  }, j’ai développé des compétences solides en ${role || "gestion de projets, collaboration et suivi d’objectifs"}.
-
-Je serais ravi(e) d’échanger plus en détail lors d’un entretien.`;
-}
-
-async function createSimpleCvPdf(profile: any, options: any) {
-  const { targetJob = "", lang = "fr", contract = "", jobLink = "", jobDescription = "" } = options || {};
-
-  const p = profile || {};
-  const pdfDoc = await PDFDocument.create();
-  const page = pdfDoc.addPage([595.28, 841.89]); // A4
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-  const { width, height } = page.getSize();
-  const marginX = 50;
-  let y = height - 60;
-
-  function drawLine(text: string, size = 11, bold = false) {
-    if (!text || y < 50) return;
-    const f = bold ? fontBold : font;
-    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
-    y -= size + 4;
-  }
-
-  function drawParagraph(text: string, size = 10) {
-    if (!text) return;
-    const f = font;
-    const maxWidth = width - marginX * 2;
-    const paragraphs = text.split(/\n{2,}/);
-
-    for (const paragraph of paragraphs) {
-      const words = paragraph.split(/\s+/);
-      let line = "";
-
-      for (const w of words) {
-        const testLine = line ? line + " " + w : w;
-        const testWidth = f.widthOfTextAtSize(testLine, size);
-        if (testWidth > maxWidth) {
-          if (y < 50) return;
-          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
-          y -= size + 3;
-          line = w;
-        } else {
-          line = testLine;
-        }
-      }
-
-      if (line && y >= 50) {
-        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.1, 0.12, 0.16) });
-        y -= size + 6;
-      }
-      y -= 2;
-    }
-  }
-
-  function drawSectionTitle(title: string) {
-    if (!title || y < 60) return;
-    page.drawText(title, { x: marginX, y, size: 11, font: fontBold, color: rgb(0.08, 0.15, 0.45) });
-    y -= 14;
-  }
-
-  function drawBullet(text: string, size = 9) {
-    if (!text || y < 50) return;
-    const f = font;
-    const bulletX = marginX + 8;
-    const maxWidth = width - marginX * 2 - 10;
-    const words = text.split(/\s+/);
-    let line = "";
-    let firstLine = true;
-
-    for (const w of words) {
-      const testLine = line ? line + " " + w : w;
-      const testWidth = f.widthOfTextAtSize(testLine, size);
-      if (testWidth > maxWidth) {
-        if (y < 50) return;
-        page.drawText(firstLine ? "• " + line : "  " + line, {
-          x: bulletX,
-          y,
-          size,
-          font: f,
-          color: rgb(0.1, 0.12, 0.16),
-        });
-        y -= size + 3;
-        line = w;
-        firstLine = false;
-      } else {
-        line = testLine;
-      }
-    }
-
-    if (line && y >= 50) {
-      page.drawText(firstLine ? "• " + line : "  " + line, {
-        x: bulletX,
-        y,
-        size,
-        font: f,
-        color: rgb(0.1, 0.12, 0.16),
-      });
-      y -= size + 3;
-    }
-  }
-
-  // Header
-  drawLine(p.fullName || "", 16, true);
-  const jobLine = targetJob || contract || p.contractType || (lang === "en" ? "Target position" : "Poste recherché");
-  drawLine(jobLine, 11, false);
-
-  const contactParts = [p.email || "", p.phone || "", p.city || "", p.linkedin || ""].filter(Boolean);
-  if (contactParts.length) drawLine(contactParts.join(" · "), 9, false);
-
-  if (jobLink) drawLine((lang === "en" ? "Job link: " : "Lien de l'offre : ") + jobLink, 8, false);
-
-  y -= 6;
-
-  if (p.profileSummary) {
-    drawSectionTitle(lang === "en" ? "Profile" : "Profil");
-    drawParagraph(p.profileSummary, 9.5);
-    y -= 4;
-  }
-
-  if (p.skills && Array.isArray(p.skills.sections) && p.skills.sections.length) {
-    drawSectionTitle(lang === "en" ? "Key skills" : "Compétences clés");
-    p.skills.sections.forEach((sec: any) => {
-      if (!sec || (!sec.title && !Array.isArray(sec.items))) return;
-      if (sec.title) drawLine(sec.title, 9.5, true);
-      if (Array.isArray(sec.items)) drawParagraph(sec.items.join(" · "), 9);
-      y -= 2;
-    });
-  }
-
-  if (Array.isArray(p.experiences) && p.experiences.length) {
-    drawSectionTitle(lang === "en" ? "Experience" : "Expériences professionnelles");
-    p.experiences.forEach((exp: any) => {
-      if (y < 90) return;
-      const header = [exp.role, exp.company].filter(Boolean).join(" — ");
-      if (header) drawLine(header, 10, true);
-      if (exp.dates) drawLine(exp.dates, 8.5, false);
-      if (Array.isArray(exp.bullets)) exp.bullets.slice(0, 4).forEach((b: string) => drawBullet(b, 8.5));
-      y -= 4;
-    });
-  }
-
-  if (Array.isArray(p.education) && p.education.length && y > 80) {
-    drawSectionTitle(lang === "en" ? "Education" : "Formation");
-    p.education.forEach((ed: any) => {
-      if (y < 60) return;
-      const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
-      if (header) drawLine(header, 9.5, true);
-      if (ed.dates) drawLine(ed.dates, 8.5, false);
-      y -= 4;
-    });
-  }
-
-  if (p.langLine && y > 60) {
-    drawSectionTitle(lang === "en" ? "Languages" : "Langues");
-    drawParagraph(p.langLine, 9);
-  }
-
-  if (Array.isArray(p.hobbies) && p.hobbies.length && y > 60) {
-    drawSectionTitle(lang === "en" ? "Interests" : "Centres d'intérêt");
-    drawParagraph(p.hobbies.join(" · "), 9);
-  }
-
-  const pdfBytes = await pdfDoc.save();
-  return Buffer.from(pdfBytes);
-}
-
-async function createLetterPdf(coverLetter: string, meta: any) {
-  const { jobTitle = "", companyName = "", candidateName = "", lang = "fr" } = meta || {};
-
-  const pdfDoc = await PDFDocument.create();
-  const page = pdfDoc.addPage([595.28, 841.89]); // A4
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-  const { width, height } = page.getSize();
-  const marginX = 60;
-  let y = height - 70;
-
-  function drawLine(text: string, size = 11, bold = false) {
-    if (!text || y < 60) return;
-    const f = bold ? fontBold : font;
-    page.drawText(text, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
-    y -= size + 4;
-  }
-
-  function drawParagraph(text: string, size = 11) {
-    if (!text) return;
-    const f = font;
-    const maxWidth = width - marginX * 2;
-    const paragraphs = text.split(/\n{2,}/);
-
-    for (const paragraph of paragraphs) {
-      const words = paragraph.split(/\s+/);
-      let line = "";
-
-      for (const w of words) {
-        const testLine = line ? line + " " + w : w;
-        const testWidth = f.widthOfTextAtSize(testLine, size);
-        if (testWidth > maxWidth) {
-          if (y < 60) return;
-          page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
-          y -= size + 4;
-          line = w;
-        } else {
-          line = testLine;
-        }
-      }
-
-      if (line && y >= 60) {
-        page.drawText(line, { x: marginX, y, size, font: f, color: rgb(0.15, 0.17, 0.23) });
-        y -= size + 8;
-      }
-
-      y -= 4;
-    }
-  }
-
-  if (candidateName) drawLine(candidateName, 14, true);
-
-  if (jobTitle || companyName) {
-    const titleLine =
-      lang === "en"
-        ? `Application for ${jobTitle || "the position"} – ${companyName || "Company"}`
-        : `Candidature : ${jobTitle || "poste"} – ${companyName || "Entreprise"}`;
-    drawLine(titleLine, 11, false);
-  }
-
-  y -= 10;
-  drawParagraph(coverLetter, 11);
-
-  const pdfBytes = await pdfDoc.save();
-  return Buffer.from(pdfBytes);
-}
-
-export async function POST(req: Request) {
-  const auth = await requireUser(req);
-  if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
-
-  let body: any = null;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
-  }
-
-  const profile = body?.profile;
-  const targetJob = body?.targetJob || "";
-  const langRaw = body?.lang || "fr";
-  const contract = body?.contract || "";
-  const jobLink = body?.jobLink || "";
-  const jobDescription = body?.jobDescription || "";
-
-  const lm = body?.lm || {};
-  const companyName = lm?.companyName || "";
-  const jobTitle = lm?.jobTitle || targetJob || "";
-  const lmJobDescription = lm?.jobDescription || jobDescription || "";
-  const lmLangRaw = lm?.lang || langRaw;
-
-  const lang = String(langRaw).toLowerCase().startsWith("en") ? "en" : "fr";
-  const lmLang = String(lmLangRaw).toLowerCase().startsWith("en") ? "en" : "fr";
-
-  if (!profile) return NextResponse.json({ ok: false, error: "Missing profile" }, { status: 400 });
-
-  // ✅ Débit -2 crédits (CV + LM) + log
-  try {
-    await consumeCreditsAndLog({
-      uid: auth.uid,
-      email: auth.email,
-      cost: 2,
-      tool: "generateCvLmZip",
-      docType: "other",
-      meta: { targetJob, jobTitle, companyName, lang, lmLang },
-    });
-  } catch (e: any) {
-    if (e?.code === "NO_CREDITS" || e?.message === "NO_CREDITS") {
-      return NextResponse.json({ ok: false, error: "NO_CREDITS" }, { status: 402 });
-    }
-    console.error("consumeCreditsAndLog error:", e);
-    return NextResponse.json({ ok: false, error: "CREDITS_ERROR" }, { status: 500 });
-  }
-
-  // CV PDF
-  let cvBuffer: Buffer;
-  try {
-    cvBuffer = await createSimpleCvPdf(profile, {
-      targetJob,
-      lang,
-      contract,
-      jobLink,
-      jobDescription,
-    });
-  } catch (e: any) {
-    console.error("CV PDF error:", e);
-    return NextResponse.json({ ok: false, error: e?.message || "CV_PDF_ERROR" }, { status: 500 });
-  }
-
-  // LM BODY via Gemini
-  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-  const cvText = buildProfileContextForIA(profile);
-
-  let coverLetterBody = "";
-
-  if (GEMINI_API_KEY) {
-    const promptLm =
-      lmLang === "en"
-        ? `
-You are a senior career coach and recruiter.
-
-TASK:
-Write ONLY the BODY of a cover letter tailored to the job, using ONLY the provided information (CV + job description).
-
-INPUTS:
-- Job title: "${jobTitle || "the role"}"
-- Company: "${companyName || "your company"}"
-- Job description:
-${lmJobDescription || "—"}
-
-- Candidate profile (source of truth):
-${cvText}
-
-STRICT RULES:
-- Do NOT invent facts (no fake metrics, clients, tools, dates).
-- 3 to 5 paragraphs separated by ONE blank line.
-- No header, no subject line, no greeting, no signature.
-- Output MUST be STRICT JSON only:
-{ "body": "..." }
-`.trim()
-        : `
-Tu es un coach carrières senior et recruteur.
-
-MISSION :
-Rédige UNIQUEMENT le CORPS d’une lettre de motivation adaptée au poste, basée UNIQUEMENT sur les infos fournies (CV + fiche de poste).
-
-ENTRÉES :
-- Intitulé : "${jobTitle || targetJob || "le poste"}"
-- Entreprise : "${companyName || "votre entreprise"}"
-- Fiche de poste :
-${lmJobDescription || "—"}
-
-- Profil candidat :
-${cvText}
-
-RÈGLES :
-- Ne pas inventer (pas de chiffres/clients/technos non présents).
-- 3 à 5 paragraphes séparés par une ligne vide.
-- Pas d’en-tête, pas d’objet, pas de salutation, pas de signature.
-- Réponds STRICTEMENT en JSON :
-{ "body": "..." }
-`.trim();
-
-    try {
-      const rawLm = await callGeminiText(promptLm, GEMINI_API_KEY, 0.65, 1400);
-      const cleaned = String(rawLm).replace(/```json|```/gi, "").trim();
-      try {
-        const parsed = JSON.parse(cleaned);
-        coverLetterBody = typeof parsed.body === "string" ? parsed.body.trim() : "";
-      } catch {
-        coverLetterBody = String(rawLm || "").trim();
-      }
-    } catch (e) {
-      console.error("Gemini LM error:", e);
-    }
-  }
-
-  if (!coverLetterBody) {
-    coverLetterBody = buildFallbackLetterBody(profile, jobTitle, companyName, lmLang);
-  }
-
-  // LM PDF
-  let lmBuffer: Buffer;
-  try {
-    lmBuffer = await createLetterPdf(coverLetterBody, {
-      jobTitle,
-      companyName,
-      candidateName: profile.fullName || "",
-      lang: lmLang,
-    });
-  } catch (e: any) {
-    console.error("LM PDF error:", e);
-    return NextResponse.json({ ok: false, error: e?.message || "LM_PDF_ERROR" }, { status: 500 });
-  }
-
-  // ZIP ✅ (avec cast pour calmer TypeScript)
-  try {
-    const zip = new JSZip();
-    zip.file("cv-ia.pdf", cvBuffer);
-    zip.file(lmLang === "en" ? "cover-letter.pdf" : "lettre-motivation.pdf", lmBuffer);
-
-    const zipContent = await zip.generateAsync({ type: "uint8array" });
-
-    return new NextResponse(zipContent as unknown as BodyInitCompat, {
-      status: 200,
-      headers: {
-        "Content-Type": "application/zip",
-        "Content-Disposition": 'attachment; filename="cv-lm-ia.zip"',
-        "Content-Length": String(zipContent.byteLength),
-      },
-    });
-  } catch (e: any) {
-    console.error("ZIP error:", e);
-    return NextResponse.json({ ok: false, error: e?.message || "ZIP_ERROR" }, { status: 500 });
-  }
-}
-````
-
-## File: app/api/interview/route.ts
-````typescript
-// app/api/interview/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import {
-  buildPrompt,
-  InterviewLevel,
-  InterviewChannel,
-  HistoryItem,
-} from "@/lib/interviewPrompt";
-import { verifyUserAndCredits, consumeCredit } from "@/lib/server/credits";
-
-export const runtime = "nodejs";
-
-/**
- * ✅ reCAPTCHA OFF par défaut
- * -> Active uniquement si INTERVIEW_REQUIRE_RECAPTCHA=true
- */
-const REQUIRE_RECAPTCHA =
-  (process.env.INTERVIEW_REQUIRE_RECAPTCHA || "").toLowerCase().trim() ===
-  "true";
-
-// ---- Sessions en mémoire (DEV) ---- //
-type InterviewSession = {
-  userId: string;
-  createdAt: string;
-  lastUpdated: string;
-  jobDesc: string;
-  cvSummary: string;
-  mode: string;
-  level: InterviewLevel;
-  channel: InterviewChannel;
-  status: "active" | "completed";
-  currentStep: number;
-  history: HistoryItem[];
-  score?: number | null;
-  finalSummary?: string | null;
-};
-
-const memorySessions = new Map<string, InterviewSession>();
-
-function createSessionId() {
-  try {
-    // @ts-ignore
-    return crypto.randomUUID();
-  } catch {
-    return Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
-  }
-}
-
-function purgeOldSessions(maxAgeMs = 1000 * 60 * 60 * 6) {
-  const now = Date.now();
-  for (const [sid, s] of memorySessions.entries()) {
-    const t = Date.parse(s.lastUpdated || s.createdAt);
-    if (!Number.isNaN(t) && now - t > maxAgeMs) memorySessions.delete(sid);
-  }
-}
-
-// ---------------- reCAPTCHA (Enterprise via CF recaptchaVerify) ----------------
-type RecaptchaVerifyResult =
-  | { ok: true; score?: number }
-  | { ok: false; reason: string; score?: number };
-
-function stripTrailingSlash(s: string) {
-  return s.endsWith("/") ? s.slice(0, -1) : s;
-}
-
-function getApiBaseServer(): string {
-  return stripTrailingSlash(
-    process.env.CLOUD_FUNCTIONS_BASE_URL ||
-      process.env.API_BASE_URL ||
-      "https://europe-west1-assistant-ia-v4.cloudfunctions.net"
-  );
-}
-
-async function verifyRecaptchaEnterpriseViaCF(
-  token: string,
-  action: string
-): Promise<RecaptchaVerifyResult> {
-  const base = getApiBaseServer();
-  try {
-    const res = await fetch(`${base}/recaptchaVerify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token, action: (action || "").trim() }),
-      cache: "no-store",
-    });
-
-    const data: any = await res.json().catch(() => null);
-
-    if (!res.ok || !data?.ok) {
-      return {
-        ok: false,
-        reason: String(data?.reason || data?.error || "recaptcha_failed"),
-        score: typeof data?.score === "number" ? data.score : undefined,
-      };
-    }
-
-    return {
-      ok: true,
-      score: typeof data?.score === "number" ? data.score : undefined,
-    };
-  } catch (e: any) {
-    return { ok: false, reason: e?.message || "network_error" };
-  }
-}
-
-// ---- Handler principal ---- //
-export async function POST(req: NextRequest) {
-  try {
-    purgeOldSessions();
-
-    const body = await req.json().catch(() => null);
-    if (!body || typeof body !== "object") {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-    }
-
-    const { action } = body as any;
-
-    // ✅ token peut venir de plusieurs endroits (selon ton front)
-    const recaptchaToken =
-      (body as any)?.recaptchaToken ||
-      (body as any)?.token ||
-      (body as any)?.recaptcha?.token ||
-      null;
-
-    const recaptchaAction =
-      (body as any)?.recaptchaAction ||
-      (body as any)?.recaptcha?.action ||
-      "interview";
-
-    // ✅ reCAPTCHA (optionnel)
-    if (REQUIRE_RECAPTCHA) {
-      if (!recaptchaToken || typeof recaptchaToken !== "string") {
-        return NextResponse.json(
-          {
-            error: "reCAPTCHA failed",
-            details: "token_missing_or_invalid",
-            requireRecaptcha: true,
-            expectedAction: recaptchaAction,
-          },
-          { status: 403 }
-        );
-      }
-
-      const rec = await verifyRecaptchaEnterpriseViaCF(
-        recaptchaToken,
-        recaptchaAction
-      );
-
-      if (!rec.ok) {
-        return NextResponse.json(
-          {
-            error: "reCAPTCHA failed",
-            details: rec.reason,
-            score: rec.score ?? null,
-            requireRecaptcha: true,
-            expectedAction: recaptchaAction,
-          },
-          { status: 403 }
-        );
-      }
-    }
-
-    // ---------- START ---------- //
-    if (action === "start") {
-      const { userId, jobDesc, cvSummary, mode, channel, level } = body as any;
-
-      if (!userId) {
-        return NextResponse.json({ error: "Missing userId" }, { status: 400 });
-      }
-
-      const user = await verifyUserAndCredits(userId);
-      if (!user) {
-        return NextResponse.json(
-          { error: "Unauthorized or no credits" },
-          { status: 401 }
-        );
-      }
-
-      const nowIso = new Date().toISOString();
-      const safeMode = (mode || "mixed") as string;
-      const safeChannel = (channel || "written") as InterviewChannel;
-      const safeLevel = (level || "junior") as InterviewLevel;
-
-      const sessionId = createSessionId();
-
-      const sessionData: InterviewSession = {
-        userId,
-        createdAt: nowIso,
-        lastUpdated: nowIso,
-        jobDesc: jobDesc || "",
-        cvSummary: cvSummary || "",
-        mode: safeMode,
-        level: safeLevel,
-        channel: safeChannel,
-        status: "active",
-        currentStep: 1,
-        history: [],
-      };
-
-      memorySessions.set(sessionId, sessionData);
-
-      const prompt = buildPrompt({
-        cvSummary: sessionData.cvSummary,
-        jobDesc: sessionData.jobDesc,
-        mode: sessionData.mode,
-        level: sessionData.level,
-        channel: sessionData.channel,
-        history: [],
-        step: 1,
-      });
-
-      const llmResponseText = await callLLM(prompt);
-
-      let parsed: any;
-      try {
-        parsed = JSON.parse(llmResponseText);
-      } catch {
-        parsed = { next_question: "Parlez-moi de vous.", short_analysis: null };
-      }
-
-      const firstQuestion = parsed.next_question || "Parlez-moi de vous.";
-
-      const historyItem: HistoryItem = {
-        role: "interviewer",
-        text: firstQuestion,
-        createdAt: new Date().toISOString(),
-      };
-
-      const updatedSession = memorySessions.get(sessionId);
-      if (updatedSession) {
-        updatedSession.history.push(historyItem);
-        updatedSession.currentStep = 1;
-        updatedSession.lastUpdated = new Date().toISOString();
-        memorySessions.set(sessionId, updatedSession);
-      }
-
-      await consumeCredit(userId);
-
-      return NextResponse.json({
-        sessionId,
-        firstQuestion,
-        shortAnalysis: parsed.short_analysis ?? null,
-      });
-    }
-
-    // ---------- ANSWER ---------- //
-    if (action === "answer") {
-      const { userId, sessionId, userMessage, channel, step } = body as any;
-
-      if (!userId || !sessionId || !userMessage?.trim()) {
-        return NextResponse.json(
-          { error: "Missing userId, sessionId or userMessage" },
-          { status: 400 }
-        );
-      }
-
-      const user = await verifyUserAndCredits(userId);
-      if (!user) {
-        return NextResponse.json(
-          { error: "Unauthorized or no credits" },
-          { status: 401 }
-        );
-      }
-
-      const session = memorySessions.get(sessionId);
-      if (!session) {
-        return NextResponse.json({ error: "Session not found" }, { status: 404 });
-      }
-
-      if (session.userId !== userId) {
-        return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-      }
-
-      const history = Array.isArray(session.history) ? [...session.history] : [];
-
-      history.push({
-        role: "candidate",
-        text: userMessage,
-        createdAt: new Date().toISOString(),
-      });
-
-      const nextStep =
-        typeof step === "number" && Number.isFinite(step)
-          ? step
-          : (session.currentStep || 1) + 1;
-
-      const prompt = buildPrompt({
-        cvSummary: session.cvSummary,
-        jobDesc: session.jobDesc,
-        mode: session.mode,
-        level: (session.level || "junior") as InterviewLevel,
-        channel: (channel || session.channel || "written") as InterviewChannel,
-        history,
-        step: nextStep,
-      });
-
-      const llmResponseText = await callLLM(prompt);
-
-      let parsed: any;
-      try {
-        parsed = JSON.parse(llmResponseText);
-      } catch {
-        parsed = {
-          next_question: "Merci. Peux-tu illustrer avec un exemple concret ?",
-          short_analysis: "",
-          final_summary: null,
-          final_score: null,
-        };
-      }
-
-      const nextQuestion =
-        parsed.next_question || "Merci, l’entretien est terminé.";
-      const shortAnalysis = parsed.short_analysis ?? "";
-      const isFinal = Boolean(parsed.final_summary);
-
-      history.push({
-        role: "interviewer",
-        text: nextQuestion,
-        createdAt: new Date().toISOString(),
-      });
-
-      const updated: InterviewSession = {
-        ...session,
-        history,
-        lastUpdated: new Date().toISOString(),
-        currentStep: nextStep,
-      };
-
-      if (isFinal) {
-        updated.status = "completed";
-        updated.score = parsed.final_score ?? null;
-        updated.finalSummary = parsed.final_summary ?? null;
-      }
-
-      memorySessions.set(sessionId, updated);
-
-      await consumeCredit(userId);
-
-      return NextResponse.json({
-        nextQuestion,
-        shortAnalysis,
-        finalSummary: parsed.final_summary ?? null,
-        finalScore: parsed.final_score ?? null,
-        isFinal,
-      });
-    }
-
-    return NextResponse.json({ error: "Unknown action" }, { status: 400 });
-  } catch (err) {
-    console.error("Interview API error:", err);
-    return NextResponse.json({ error: "Internal error" }, { status: 500 });
-  }
-}
-
-// ---- APPEL GEMINI ---- //
-async function callLLM(prompt: string): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY;
-
-  if (!apiKey) {
-    return JSON.stringify({
-      next_question:
-        "Mode démo : peux-tu me résumer ton expérience la plus récente en lien avec ce poste ?",
-      short_analysis:
-        "Mode démo sans Gemini : configure GEMINI_API_KEY pour avoir l’analyse réelle.",
-      final_summary: null,
-      final_score: null,
-    });
-  }
-
-  const modelRaw = process.env.GEMINI_MODEL || "models/gemini-2.5-flash";
-  const model = modelRaw.startsWith("models/") ? modelRaw : `models/${modelRaw}`;
-  const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
-
-  const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!resp.ok) {
-    const errorText = await resp.text().catch(() => "");
-    console.error("Gemini error (interview):", resp.status, errorText);
-    return JSON.stringify({
-      next_question:
-        "Je n'arrive pas à joindre l’IA. Donne-moi : contexte / actions / résultats (STAR).",
-      short_analysis: `Fallback Gemini HTTP ${resp.status}`,
-      final_summary: null,
-      final_score: null,
-    });
-  }
-
-  const data = await resp.json().catch(() => null);
-
-  const textRaw: string =
-    data?.candidates?.[0]?.content?.parts
-      ?.map((p: any) => p.text || "")
-      .join("")
-      .trim() || "";
-
-  if (!textRaw) {
-    return JSON.stringify({
-      next_question: "Peux-tu préciser ?",
-      short_analysis: "",
-      final_summary: null,
-      final_score: null,
-    });
-  }
-
-  return textRaw.trim();
-}
+manifest.webmanifest,1767588473603,b125a9afb1b3c4b81daaf5442dd9d589e2367c37c2fd3305fa23247173975337
+tech.txt,1767588474759,ea07dd89894f526ec051b634730a07af441ab29128e31364850d02eb26c6a1d4
+login.txt,1767588474760,9e78b26cd1dcace308f3786580dbec67ffe70959d5d93622c9b5af6fb96ca0ef
+index.txt,1767588474760,bdc5b3b546c6a7e1a4c9b53c0f5373bf26a474627035ac0d26e0f938466ba80c
+signup.html,1767588474753,85b0ca1a3a556632c440b1aa5b06658ca30e9edb1f5a1709485c52c96512f7ac
+signup.txt,1767588474760,01c11d1abcf0c175079f482487cf173afa32c761bf161960fcb2b4d2c409431c
+forgot-password.txt,1767588474759,12863c6a7f33501e77479711df376fd3881eb14a658aca73fb1a897867ffd725
+forgot-password.html,1767588474750,e3bc8862aa1044867f5e7476cc35f47f3a12f1ff6bd86bc017be114a43eeea2e
+assistance-candidature.txt,1767588474758,f87c70b5209ed92709ae05293f4bdb278496f579a4b8551788712bcb4fd32cef
+index.html,1767588474753,0f420d30ca964d9cd04c31c8eb6fa089413ad0811f89c640e7f915fa32478ad2
+assistance-candidature.html,1767588474749,ae5db74ab4cd7c35b6df396c75d74ad27b4c4b8924dfe3ae09f00ff18f4f0da4
+app.txt,1767588474757,d94b53c9133629988bdadb8ab044a902457be0e33776879278322e9a21dedaa0
+admin.txt,1767588474756,53782394942523eb91211d4ef65f7ad6f9c1cb65737e87ed5c3c3c00d108cea1
+app.html,1767588474749,1801deeb14e49121531df35514449e0be15fe9577b521e6e0b9d3459b19ca5d6
+tech.html,1767588474752,a6c01638422a352c3f8320651b8df9711f0530149240b7079294de5caf2eaa7d
+login.html,1767588474750,b0bf9c8a37d11d0d681c2469a70ce8b56071869d3e9eede8b515657ca5df8d98
+404.html,1767588474261,9da38117e262a661f0807506ce89dea9ccd4ea1b869e7c131e94fbef00165a40
+cv-templates/cv-template-minimalist.png,1767588473607,5e1a824dbfa3537003c3b2d9b5ce3b244253f32c5403153fd496c901d47ea28f
+debug/polar.txt,1767588474754,dd1229772ab24399ade140d3fdbc3d9d9627bc924bcca3428cb12e1db2d6703e
+cv-templates/cv-template-elegant.png,1767588473606,9f56ec1a96b91d1bc91d875ed07569e817fcbb290eef1ff8b76cc97eb0b4b27d
+cv-templates/cv-template-creative.png,1767588473606,924e02137ce0d0afda709a5247293b725d87cd523cb6bcae14e20790fdbba2ad
+debug/polar.html,1767588474747,20d92e7de627f798ee1a4cf2ad9182adda72d50100870c7c31628a624a73baf5
+cv-templates/cv-template-ats.png,1767588473605,c358fdd3e132d5ba776be356d2c74da2c49ec90cb49e9fd45dfbafaefb2eae4a
+auth/verify-email.txt,1767588474757,3cef894cb99bcc0dd17d4f4f6aa501e3e0ea5d348ce37517207f595dfebf3871
+auth/verify-email.html,1767588474747,c273dd500ecb70b31375b1484d3e50816c6b5dd172acb0274836d6637ac8e660
+app/tracker.txt,1767588474759,ab1a41cbd2c5a512c7279185e1aad17d89a84ce4457f4d533f09656625675d41
+app/tracker.html,1767588474750,bc8fac95b1266109a40c0cbb97385a3be0ba7faea265b85c118d7b00682383ea
+app/settings.txt,1767588474756,1de9df3dec5d36e09512bf2203efef6ba9294193f386c8fcc41c45b57f9ac8ef
+app/settings.html,1767588474748,6e7c928fec6da2ed7c03468fe0cc587c5c51f351141c1b38d1100fe85a7ca4e4
+app/pitch.txt,1767588474758,a15bf0cdc2db341c929d68a8e4179d0d03e8ad9890d5fd46c7e1ec5f9541fad5
+app/pitch.html,1767588474749,dc0c5b8757e08656169feadf9c9e6196fa625a0a4c0d084d7ecac1e8a13f9bde
+app/lm.txt,1767588474760,53585e824765114bf00d12ab65bbedc1a84c0f7ebfa717e0086c10467747a21d
+app/interview.txt,1767588474756,e4296c593ad121bab166f63ac4c4fb32d93cedd1172ef4f25b85923bbd80194a
+app/lm.html,1767588474752,52424ab752e9867199cf43b846d27b5a1a2fc638a7ded0ad57cc42881b5f8ace
+app/interview.html,1767588474748,e96e5792997ea89aa6434f94377230ade015262bbfd68fccb3d6fcbb635ee51a
+app/history.txt,1767588474758,467ed9c63e5fb653932634e10c43b400316da6d647f8c23cfb79d603757b989e
+app/history.html,1767588474749,dd0f10292704977c8f768d26e3316605ea788fa345b16883080448c730ebc51e
+app/cv.txt,1767588474760,51d27f8f22f92605224f76ed0ebde813b18b64bdcac2b6f5d8977147ff8d30f6
+admin.html,1767588474748,16d98babe23822351e582170b8b1a11961a55bedfbb5543e0bc3142969ace0aa
+cv-templates/cv-template-tech.png,1767588473608,c7d2cb14c3905a394d1882fae0fbfa5e1b55a63438b3466ced59ad437aedb67a
+cv-templates/cv-template-modern.png,1767588473607,2d625d43e3581184df4a184894a2813794ab5c89d6a8d1b56e7d9ebf82d72851
+cv-templates/cv-template-classic.png,1767588473605,bb3cba308b039bf8a3bca7fee78ce320c2d4838f86ba25236ee7f87fec8a42e3
+cv-templates/cv-template-projects.png,1767588473607,e16e21a6cf8ecbdc41fd920ca61720f7df7e080ce38b4159e654b4852c9a42b4
+cv-templates/cv-template-timeline.png,1767588473609,a81a91982b03bd81b5c8fe8161bcc9ff2b89e472362de4719755febda861efcb
+cv-templates/cv-template-skills-matrix.png,1767588473608,fa90e74cd9540e8a7152dab0cf8899be1c404d75da4f9c0e179c54427eee75b2
+cv-templates/cv-template-executive.png,1767588473608,fbde3302d2568bee621eba6cc4e1ade4e52c488c2624ba1439ada2f6597bdc6f
+cv-templates/cv-template-pro-max.png,1767588473607,68f7557ab05db6a30c793718c2e70092d33d469aa56d64ba4644c9dc5bf03286
+cv-templates/cv-template-consulting.png,1767588473606,9a22f10a6df9315664fce1c2de7700cd5f9793907bfbf5d14ad4b7a49dbb8612
+cv-templates/cv-template-compact.png,1767588473605,3ec28de898b120ac0eba3492043216bbfcb72ca25e06ee12e6581d0c4539b839
+app/credits.txt,1767588474757,ecc1db65f711a7c9d4864c3aa24c7fe27cf00803d71d8a7e81901292b386d806
+app/cv.html,1767588474758,caaa02581aa9d66028f4e8b124271844f98b283a3e50ce29ef65a836bbf39491
+app/credits.html,1767588474745,fd5017e1c65f1b63cadd2b535b3d1b04c530b4342207e7a26a7dee6681749ab2
+app/apply.txt,1767588474754,ac09ae4e090d9d2b6b439416afd46123293b8fad8b5354ff4764c2ffa31755ff
+admin/logs.txt,1767588474758,585da9d621dcda65158f8f4f0fdbc180c8c79b3754fd3190c1ada2aa37598382
+app/apply.html,1767588474747,bbf4fc84734f703c0d50bd32d4c2620cb40d6bfd63ee4ff6be36711581e1b39e
+admin/login.txt,1767588474760,0065ee0ee6498f4b175b8cb9af3104f70ffa01cc336507472d96b850d34deb4a
+admin/logs.html,1767588474749,37b2a566418d5282577320e31311b058e6db9dd6925ce4b93f0a930b5fdbb96b
+_next/static/chunks/webpack-68d128f78d0676ff.js,1767588473581,371e37067336e5f1a592c43ae1ca923fd537b8fc9ca35dccccf889a7552e71f5
+admin/login.html,1767588474753,7688ae5b09d7ee74a7a4189a0a72e68ef30aaafc69f5dad16d92de9a16f2eabd
+_next/static/chunks/main-app-7466cb2517b2ac24.js,1767588473580,3dad6f439d8b157d2427b4087aaeff0fef56e1e1041ee3b5f0fad10bf506a92d
+_next/static/css/3f0030ed7f4422f7.css,1767588473581,6ab7d7dd360d842abb09093865799a6d78f6ec765f5adf84d1909095e2c2674c
+_next/static/chunks/648-a41745ebae293ba3.js,1767588473569,d08de5f20a30c50b96e1cb68dfbec730d23ae67cba384f345e34c09b6adddaf3
+_next/static/chunks/500-c984c19836bde651.js,1767588473563,94a6d0ca98e707e577d1f1b6336dcdf87e35f2c1be72c787845aad3abfdab19b
+_next/static/chunks/pages/_error-7ba65e1336b92748.js,1767588473584,0402d6340a70945d851b2d22e156d955fbee54c1d8ec8b379f35fd464a8d08bf
+_next/static/chunks/pages/_app-72b849fbd24ac258.js,1767588473584,dae29acdf0128939e571909a9228115276818bce739f4d0f98c1da8ed68ba91d
+_next/static/chunks/app/not-found-1d1df9071a20824a.js,1767588473582,8ec8fde655d80c0e5d37c7714dac9911aa99f5add99e26b2820f5afcda111b2a
+_next/static/chunks/app/page-79b2df021fab8794.js,1767588473583,fd845f84ec7c187a3bb3e82cd5a690aa75f0b4ca0c53a65495ea449a96c15991
+_next/static/chunks/app/layout-dd31069295222096.js,1767588473582,57a38ab6c6c143610c4c5c55fe368f60c5aed79c207f486eb9d75bf8763d6394
+_next/static/chunks/276-a01f3bf27c64a121.js,1767588473563,7959269d2568322cb0a6253c58e7242b54d27d373aa32b7b0c05474bf95e8fd1
+_next/static/chunks/app/tech/page-cc145f1ea41d0f3b.js,1767588473589,9782dc820a4127292f16e053f0bcc1695227f9ba956897623c527946b7b8fdc5
+_next/static/chunks/app/debug/polar/page-635e8faf8dbf031a.js,1767588473597,eae0b7def982e0bf3068fde94e7f0f34defeceee17e2646fb7a9cb846c72169e
+_next/static/chunks/app/forgot-password/page-40323fed0f62eb02.js,1767588473588,93f99882c87b8204799f717ddd1f784350ff074d7709488bcd9c936e33e3d073
+_next/static/chunks/app/signup/page-c8d0b8ef86163be3.js,1767588473589,964fe261b3728a0d3703a62215eee8e522c5748e8eb45824cbcf7d69de44aeb2
+_next/static/chunks/app/login/page-061053328fc96965.js,1767588473588,902a521b21b859b761f14a2aa69a2214ecc9d1d689102f73e7508c301b12d5a3
+_next/static/chunks/app/auth/verify-email/page-d3f235494016a3c7.js,1767588473597,6b22e7525d83798f87b4b2b1d90798e6972b3edc575929ee1352938bfa718515
+_next/static/chunks/app/assistance-candidature/page-f38626f0664fd689.js,1767588473587,81d9766776f30fbac7fbd008ba3ab85a44d797761bc1a6972d105a47c69f101f
+_next/static/chunks/app/app/layout-bb7eaf8e8bb95262.js,1767588473586,47da4ba9f8b5600fd9cb70eb46bf190b3ea02b503488dfb3560c83c2a3d7b7b8
+_next/static/chunks/app/app/tracker/page-b1ac49085b4eca6f.js,1767588473595,0b68abda42bcfe86ea7274e10859d1964851010b96b165ed852ecfd58ae16571
+_next/static/chunks/ebf8faf4-abffcf7098821415.js,1767588473574,2e67a27c06bc9fe3985f74115d5a1f5a0bef4e83e616be6615fb52ae6379f9df
+_next/static/chunks/app/app/page-1728c7b534a26f36.js,1767588473587,b41eef7cb290b774b2b5150b5ea3dc2e0a59454f386011de30e52af842045327
+_next/static/chunks/app/app/settings/page-2590316c23919e9a.js,1767588473596,a65265b14afa8476fb7b78ff2f3f18b8989aec6b6b50f4b02960185d8fca1d76
+_next/static/chunks/app/app/pitch/page-a42bf5337283b380.js,1767588473596,8bb08510d6cd6129e33e6ec8e6fbd346c590b1fce79e8c3fd1af1c8492f985d1
+_next/static/chunks/polyfills-42372ed130431b0a.js,1767588473585,67dee1c02c6a6700d63b5c1898cf2df618101a68a395db469192763d24925a23
+_next/static/chunks/main-99b5844079a416a5.js,1767588473580,f0daa2691928db8562a269d5f8bf029c773dc15cf31116463a0b29e4cdd28403
+_next/static/chunks/app/app/history/page-b44f1b622671fb6b.js,1767588473594,2b50c7db092b6dc9ae36249d114bd85396746f0b795a72f18bc9e9432fdd325b
+_next/static/chunks/app/app/cv/page-3cf855017e8922c9.js,1767588473593,2901ebbb458081800a0efc14c5a01695b0a3a29e70006993e7fc2e8280c1dce6
+_next/static/chunks/941-da853eb9ae4bc965.js,1767588473574,f4b97a2711ed98aa8723dcc66969fec23e3ebc576ff38e09fd1f1cd10bd20a82
+_next/static/chunks/app/app/credits/page-5f233521f5d68c63.js,1767588473593,943b9e38555d7d364cfb42ff6bb2e2f9d95d9f1920db333cf626e2bff2fc4ba6
+_next/static/chunks/app/app/interview/page-a1041b1af97e84e9.js,1767588473594,918388833fc021e7fc6fd1807d85347d5f49f66bcdc49e4e332965de1094474e
+_next/static/chunks/810-039b9229cc1a2fae.js,1767588473570,2f29a61132b062dab1e63516e7337a67aede0bce268795b569dfccfc5c400bab
+_next/static/chunks/app/app/apply/page-7e8a402939d663bb.js,1767588473593,b9eac257193850c3111ab3f7b85ee26fccd45c69226d789111065547cbefddb8
+_next/static/chunks/app/admin/login/page-b79cc34421accd7d.js,1767588473593,b90b810232b2619ad3be8ca04464545ed5bee12883d847e4577c1320ac8f4e14
+_next/static/chunks/app/admin/logs/page-32eec3516436c662.js,1767588473593,554379c156358ee21df7e2bad9172a59004c4a34179d606eec21ae1da9d2e808
+_next/static/chunks/app/_not-found/page-7494094633467ef3.js,1767588473585,dcfa115b285fc1e7d920913e1a0464349f8c270c107df17678afbcaee62abec0
+_next/static/cfM9XcREmydQPKiy2U6Kx/_ssgManifest.js,1767588473562,02dbc1aeab6ef0a6ff2ff9a1643158cf9bb38929945eaa343a3627dee9ba6778
+_next/static/chunks/app/admin/page-edb225c8c7023406.js,1767588473586,8bc2d31560e4e32b0c29fd167e4bda2a4c421fdbf15a83fe5ad1253555f62b2a
+cv-templates/cv-previews-grid-new.png,1767588473605,6f382ce28f68e3371c2ec399b5dce5ed8d251074183fbd2638c4df39ecfb0bdd
+_next/static/cfM9XcREmydQPKiy2U6Kx/_buildManifest.js,1767588473563,f46b17d6e2e887329d388286773626796e64b52f4cd965c9b0fe037e97f3ad58
+_next/static/chunks/600-b26beb7436e15456.js,1767588473565,be817ebb98af01e820d126d6d300667221b52f7be8ad7587bd879a19da96779a
+_next/static/chunks/framework-aec844d2ccbe7592.js,1767588473575,36f12099915a78862f76158596a2aac7e86dd87ba94f4d3b896a7749c5e4c9d6
+_next/static/chunks/app/app/lm/page-709884c2ed95b17c.js,1767588473595,20d3b10623ffc10c0833e5a0058e9a2cbc46d214400ffe8412320c57d926bdb0
+_next/static/chunks/fd9d1056-b4129a380d1be68f.js,1767588473575,8b73f2ae4babb3d70adf200a16329555cd03b390ca97f3fa3368428ebc73c549
+_next/static/chunks/ca377847-044365abace2608d.js,1767588473575,c6e43c770559cc5ee6605295131dc3e9de57d9fda82d7043e9b70b2f97bc8002
+_next/static/chunks/7508b87c-2affb3ad7b55ab3d.js,1767588473570,798ec3d71f923e838d157bf4dd01e76244b35e1c9634e28e77c89c9df89a676d
+_next/static/chunks/323-54d09e3358a73f44.js,1767588473564,2aae14a1d235667a06206f344a3f76216206cb0f4697ccc38edc1923e27c5d58
+_next/static/chunks/63b94182-0b71b7d5be618145.js,1767588473568,86c28eeebf9d1883bb5afe89168408b3ccf891d873e2ac67eec46ef5baa42a41
+_next/static/chunks/5493da1b-773a6facf441f357.js,1767588473567,76cae2b4134f6f89522b80ad97b81eb8b093f50a047c7faa2e0512533d603784
 ````
 
 ## File: app/app/credits/page.tsx
@@ -21869,6 +21482,719 @@ export default function InterviewChat() {
 }
 ````
 
+## File: lib/pdf/templates/cvTemplates.ts
+````typescript
+// src/lib/pdf/templates/cvTemplates.ts
+import { buildCvAtsPdf, type CvDocModel } from "@/lib/pdf/templates/cvAts";
+
+export type Lang = "fr" | "en";
+
+export type CvTemplateId =
+  | "ats"
+  | "classic"
+  | "modern"
+  | "minimalist"
+  | "creative"
+  | "elegant"
+  | "tech"
+  | "pro_max";
+
+export type PdfColorsLike = Record<string, string | undefined> & {
+  brand?: string;
+  ink?: string;
+  muted?: string;
+  line?: string;
+  bg?: string;
+  bgSoft?: string;
+  white?: string;
+};
+
+export type CvTemplateMeta = {
+  id: CvTemplateId;
+  label: string;
+  description: string;
+  previewSrc: string; // ex: "/cv-templates/cv-template-modern.png"
+  badge?: string;
+};
+
+// ----------------------------------------------------
+// Liste des templates disponibles (UI)
+// ----------------------------------------------------
+
+export const CV_TEMPLATES: CvTemplateMeta[] = [
+  {
+    id: "ats",
+    label: "ATS (Standard)",
+    description: "Template 1 colonne très lisible, optimisé pour les ATS.",
+    previewSrc: "/cv-templates/cv-template-ats.png",
+    badge: "Recommandé",
+  },
+  {
+    id: "classic",
+    label: "Classic (Sidebar)",
+    description: "Colonne latérale, structure pro et lisible.",
+    previewSrc: "/cv-templates/cv-template-classic.png",
+  },
+  {
+    id: "modern",
+    label: "Modern (Design)",
+    description: "Header moderne, blocs aérés, idéal profils tech/produit.",
+    previewSrc: "/cv-templates/cv-template-modern.png",
+  },
+  {
+    id: "minimalist",
+    label: "Minimalist",
+    description: "CV ultra épuré, typographie clean, parfait pour cabinets.",
+    previewSrc: "/cv-templates/cv-template-minimalist.png",
+  },
+  {
+    id: "creative",
+    label: "Creative",
+    description: "Mise en page en cartes / blocs, look plus dynamique.",
+    previewSrc: "/cv-templates/cv-template-creative.png",
+  },
+  {
+    id: "elegant",
+    label: "Elegant",
+    description: "Style plus premium, hiérarchie douce, très corporate.",
+    previewSrc: "/cv-templates/cv-template-elegant.png",
+  },
+  {
+    id: "tech",
+    label: "Tech (Dark)",
+    description: "Palette sombre, vibe engineering / cybersécurité.",
+    previewSrc: "/cv-templates/cv-template-tech.png",
+  },
+  {
+    id: "pro_max",
+    label: "Pro Max",
+    description: "Version premium inspirée des CV design (header fort, cartes).",
+    previewSrc: "/cv-templates/cv-template-pro-max.png",
+    badge: "Nouveau",
+  },
+];
+
+// utilisé par l’UI
+export function getCvTemplates(): CvTemplateMeta[] {
+  return CV_TEMPLATES;
+}
+
+// ----------------------------------------------------
+// Helpers génériques
+// ----------------------------------------------------
+
+function normLang(lang: Lang): Lang {
+  return lang === "en" ? "en" : "fr";
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function safeText(v: unknown): string {
+  return String(v ?? "")
+    .replace(/\u00A0/g, " ")
+    .trim();
+}
+
+function pick(colors: PdfColorsLike | undefined, key: keyof PdfColorsLike, fallback: string): string {
+  if (!colors) return fallback;
+  const v = colors[key];
+  return typeof v === "string" && v ? v : fallback;
+}
+
+function joinDot(list: string[] | undefined, maxChars = 80): string {
+  const arr = Array.isArray(list)
+    ? list.map((s: string) => safeText(s)).filter(Boolean)
+    : [];
+
+  if (!arr.length) return "—";
+
+  const out: string[] = [];
+  let used = 0;
+
+  for (const item of arr) {
+    const extra = (out.length ? 3 : 0) + item.length; // " • "
+    if (out.length && used + extra > maxChars) break;
+    out.push(item);
+    used += extra;
+  }
+
+  return out.join(" • ");
+}
+
+function hr(scale: number, color: string) {
+  return {
+    canvas: [
+      {
+        type: "line",
+        x1: 0,
+        y1: 0,
+        x2: 515,
+        y2: 0,
+        lineWidth: 0.6,
+        lineColor: color,
+      },
+    ],
+    margin: [0, 4 * scale, 0, 4 * scale],
+  };
+}
+
+function sectionTitle(label: string, scale: number, color: string) {
+  return {
+    text: label,
+    fontSize: 10.5 * scale,
+    bold: true,
+    color,
+    margin: [0, 4 * scale, 0, 3 * scale],
+  };
+}
+
+function collectSkills(model: CvDocModel): string[] {
+  const s: any = (model as any).skills || {};
+  const keys = ["cloud", "sec", "sys", "auto", "tools", "soft"];
+  const out: string[] = [];
+
+  for (const key of keys) {
+    const value = s[key];
+    if (Array.isArray(value)) {
+      for (const item of value as string[]) {
+        const txt = safeText(item);
+        if (txt) out.push(txt);
+      }
+    }
+  }
+
+  return out;
+}
+
+function renderXp(model: CvDocModel, scale: number, ink: string, muted: string) {
+  const xpRaw: unknown = (model as any).xp;
+  const xpArr: CvDocModel["xp"] = Array.isArray(xpRaw) ? (xpRaw as CvDocModel["xp"]) : [];
+
+  if (!xpArr.length) {
+    return [
+      {
+        text: "—",
+        fontSize: 9 * scale,
+        color: muted,
+      },
+    ];
+  }
+
+  return xpArr.map((x: CvDocModel["xp"][number]) => {
+    const titleParts: string[] = [];
+    if (x.role) titleParts.push(safeText(x.role));
+    if (x.company) titleParts.push(safeText(x.company));
+    const title = titleParts.join(" — ") || "—";
+
+    const metaParts: string[] = [];
+    if (x.city) metaParts.push(safeText(x.city));
+    if (x.dates) metaParts.push(safeText(x.dates));
+    const meta = metaParts.join(" • ");
+
+    const bulletsRaw: unknown = x.bullets;
+    const bullets: string[] = Array.isArray(bulletsRaw)
+      ? (bulletsRaw as string[]).map((b: string) => safeText(b)).filter(Boolean)
+      : [];
+
+    const stack: any[] = [
+      {
+        text: title,
+        fontSize: 9.8 * scale,
+        bold: true,
+        color: ink,
+        margin: [0, 0, 0, 1.5 * scale],
+      },
+    ];
+
+    if (meta) {
+      stack.push({
+        text: meta,
+        fontSize: 9 * scale,
+        color: muted,
+        margin: [0, 0, 0, 2 * scale],
+      });
+    }
+
+    if (bullets.length) {
+      stack.push({
+        ul: bullets,
+        fontSize: 9 * scale,
+        color: ink,
+        margin: [0, 0, 0, 4 * scale],
+      });
+    }
+
+    return { stack };
+  });
+}
+
+function renderEducation(model: CvDocModel, scale: number, ink: string, muted: string) {
+  const eduRaw: unknown = (model as any).education;
+  let eduArr: string[] = [];
+
+  if (Array.isArray(eduRaw)) {
+    eduArr = (eduRaw as unknown as string[]).map((v: string) => safeText(v)).filter(Boolean);
+  } else {
+    const one = safeText(eduRaw);
+    if (one) {
+      eduArr = one
+        .split("\n")
+        .map((l: string) => l.trim())
+        .filter(Boolean);
+    }
+  }
+
+  if (!eduArr.length) {
+    return [
+      {
+        text: "—",
+        fontSize: 9 * scale,
+        color: muted,
+      },
+    ];
+  }
+
+  return eduArr.slice(0, 4).map((line: string) => ({
+    text: line,
+    fontSize: 9 * scale,
+    color: ink,
+    margin: [0, 0, 0, 4 * scale],
+  }));
+}
+
+// ----------------------------------------------------
+// Base docDefinition
+// ----------------------------------------------------
+
+function baseDocDefinition(
+  _model: CvDocModel,
+  colors: PdfColorsLike,
+  scale: number,
+  pageMargins: [number, number, number, number]
+) {
+  const brand = pick(colors, "brand", "#2563eb");
+  const ink = pick(colors, "ink", "#111827");
+  const muted = pick(colors, "muted", "#6b7280");
+  const line = pick(colors, "line", "#e5e7eb");
+  const bgSoft = pick(colors, "bgSoft", "#f3f4f6");
+  const white = pick(colors, "white", "#ffffff");
+
+  return {
+    pageSize: "A4",
+    pageMargins,
+    defaultStyle: { font: "Roboto", fontSize: 10 * scale, color: ink },
+    styles: {
+      name: { fontSize: 18 * scale, bold: true, color: ink },
+      title: { fontSize: 11 * scale, bold: true, color: brand },
+      contact: { fontSize: 9 * scale, color: muted },
+      section: { fontSize: 10.5 * scale, bold: true, color: ink },
+      small: { fontSize: 9 * scale, color: muted },
+    },
+    _palette: { brand, ink, muted, line, bgSoft, white },
+    content: [] as any[],
+  } as any;
+}
+
+// ----------------------------------------------------
+// Templates
+// ----------------------------------------------------
+
+function buildClassic(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  const L = normLang(lang);
+  const brand = pick(colors, "brand", "#ef4444");
+  const ink = pick(colors, "ink", "#111827");
+  const muted = pick(colors, "muted", "#6b7280");
+  const line = pick(colors, "line", "#e5e7eb");
+
+  const doc = baseDocDefinition(model, colors, scale, [
+    34 * scale,
+    30 * scale,
+    34 * scale,
+    26 * scale,
+  ]);
+
+  const leftWidth = 170 * scale;
+
+  const skills = collectSkills(model);
+
+  (doc.content as any[]).push({
+    columns: [
+      {
+        width: leftWidth,
+        stack: [
+          {
+            text: safeText(model.name),
+            style: "name",
+          },
+          {
+            text: safeText((model as any).title),
+            style: "title",
+            margin: [0, 2 * scale, 0, 0],
+          },
+          {
+            text: safeText((model as any).contactLine ?? (model as any).contact),
+            style: "contact",
+            margin: [0, 6 * scale, 0, 8 * scale],
+          },
+          hr(scale, line),
+
+          sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
+          {
+            text: joinDot(skills, 120),
+            fontSize: 9 * scale,
+            color: muted,
+            margin: [0, 2 * scale, 0, 6 * scale],
+          },
+
+          sectionTitle(L === "en" ? "Languages" : "Langues", scale, ink),
+          {
+            text: safeText((model as any).langLine),
+            fontSize: 9 * scale,
+            color: muted,
+            margin: [0, 2 * scale, 0, 6 * scale],
+          },
+
+          sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
+          {
+            text: joinDot((model as any).hobbies as string[] | undefined, 120),
+            fontSize: 9 * scale,
+            color: muted,
+            margin: [0, 2 * scale, 0, 0],
+          },
+        ],
+      },
+      {
+        width: "*",
+        stack: [
+          sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
+          {
+            text: safeText((model as any).profile),
+            fontSize: 9.5 * scale,
+            color: ink,
+            margin: [0, 2 * scale, 0, 8 * scale],
+            alignment: "justify",
+          },
+
+          hr(scale, line),
+
+          sectionTitle(L === "en" ? "Experience" : "Expérience professionnelle", scale, ink),
+          {
+            stack: renderXp(model, scale, ink, muted),
+          },
+
+          hr(scale, line),
+
+          sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
+          {
+            stack: renderEducation(model, scale, ink, muted),
+          },
+
+          sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
+          {
+            text: safeText((model as any).certs),
+            fontSize: 9 * scale,
+            color: ink,
+            margin: [0, 2 * scale, 0, 0],
+          },
+        ],
+      },
+    ],
+    columnGap: 18 * scale,
+  });
+
+  return doc;
+}
+
+function buildModern(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  const L = normLang(lang);
+  const brand = pick(colors, "brand", "#2563eb");
+  const ink = pick(colors, "ink", "#0f172a");
+  const muted = pick(colors, "muted", "#6b7280");
+  const line = pick(colors, "line", "#e5e7eb");
+  const bgSoft = pick(colors, "bgSoft", "#eff6ff");
+
+  const doc = baseDocDefinition(model, colors, scale, [
+    30 * scale,
+    28 * scale,
+    30 * scale,
+    28 * scale,
+  ]);
+
+  const skills = collectSkills(model);
+
+  (doc.content as any[]).push(
+    {
+      // Header bande colorée
+      table: {
+        widths: ["*", "*"],
+        body: [
+          [
+            {
+              stack: [
+                {
+                  text: safeText(model.name),
+                  fontSize: 20 * scale,
+                  bold: true,
+                  color: ink,
+                },
+                {
+                  text: safeText((model as any).title),
+                  fontSize: 11 * scale,
+                  bold: true,
+                  color: brand,
+                  margin: [0, 2 * scale, 0, 0],
+                },
+              ],
+            },
+            {
+              stack: [
+                {
+                  text: safeText((model as any).contactLine ?? (model as any).contact),
+                  fontSize: 9 * scale,
+                  color: muted,
+                  alignment: "right",
+                },
+                {
+                  text: safeText((model as any).langLine),
+                  fontSize: 9 * scale,
+                  color: muted,
+                  alignment: "right",
+                  margin: [0, 2 * scale, 0, 0],
+                },
+              ],
+            },
+          ],
+        ],
+      },
+      layout: "noBorders",
+      fillColor: bgSoft,
+      margin: [-6 * scale, -6 * scale, -6 * scale, 10 * scale],
+    },
+
+    {
+      columns: [
+        {
+          width: "*",
+          stack: [
+            sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
+            {
+              text: safeText((model as any).profile),
+              fontSize: 9.5 * scale,
+              color: ink,
+              margin: [0, 2 * scale, 0, 6 * scale],
+              alignment: "justify",
+            },
+
+            sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
+            {
+              stack: renderXp(model, scale, ink, muted),
+            },
+          ],
+        },
+        {
+          width: 180 * scale,
+          margin: [16 * scale, 0, 0, 0],
+          stack: [
+            sectionTitle(L === "en" ? "Key Skills" : "Compétences clés", scale, ink),
+            {
+              text: joinDot(skills, 140),
+              fontSize: 9 * scale,
+              color: muted,
+              margin: [0, 2 * scale, 0, 6 * scale],
+            },
+
+            sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
+            {
+              stack: renderEducation(model, scale, ink, muted),
+            },
+
+            sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
+            {
+              text: safeText((model as any).certs),
+              fontSize: 9 * scale,
+              color: muted,
+              margin: [0, 2 * scale, 0, 6 * scale],
+            },
+
+            sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
+            {
+              text: joinDot((model as any).hobbies as string[] | undefined, 140),
+              fontSize: 9 * scale,
+              color: muted,
+            },
+          ],
+        },
+      ],
+      columnGap: 18 * scale,
+    }
+  );
+
+  return doc;
+}
+
+function buildMinimalist(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  const L = normLang(lang);
+  const ink = pick(colors, "ink", "#111827");
+  const muted = pick(colors, "muted", "#6b7280");
+  const line = pick(colors, "line", "#e5e7eb");
+
+  const doc = baseDocDefinition(model, colors, scale, [
+    40 * scale,
+    32 * scale,
+    40 * scale,
+    32 * scale,
+  ]);
+
+  const skills = collectSkills(model);
+
+  (doc.content as any[]).push(
+    {
+      text: safeText(model.name),
+      fontSize: 20 * scale,
+      bold: true,
+      color: ink,
+      margin: [0, 0, 0, 2 * scale],
+    },
+    {
+      text: safeText((model as any).title),
+      fontSize: 11 * scale,
+      color: muted,
+      margin: [0, 0, 0, 4 * scale],
+    },
+    {
+      text: safeText((model as any).contactLine ?? (model as any).contact),
+      fontSize: 9 * scale,
+      color: muted,
+      margin: [0, 0, 0, 8 * scale],
+    },
+    hr(scale, line),
+    sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
+    {
+      text: safeText((model as any).profile),
+      fontSize: 9.5 * scale,
+      color: ink,
+      margin: [0, 2 * scale, 0, 6 * scale],
+      alignment: "justify",
+    },
+    sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
+    {
+      stack: renderXp(model, scale, ink, muted),
+      margin: [0, 0, 0, 4 * scale],
+    },
+    sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
+    {
+      stack: renderEducation(model, scale, ink, muted),
+    },
+    sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
+    {
+      text: joinDot(skills, 160),
+      fontSize: 9 * scale,
+      color: muted,
+      margin: [0, 2 * scale, 0, 4 * scale],
+    },
+    sectionTitle(L === "en" ? "Languages" : "Langues", scale, ink),
+    {
+      text: safeText((model as any).langLine),
+      fontSize: 9 * scale,
+      color: muted,
+      margin: [0, 2 * scale, 0, 4 * scale],
+    },
+    sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
+    {
+      text: joinDot((model as any).hobbies as string[] | undefined, 160),
+      fontSize: 9 * scale,
+      color: muted,
+    }
+  );
+
+  return doc;
+}
+
+// pour l’instant, on réutilise les layouts existants
+function buildCreative(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  // Style plus "design" : on réutilise Modern (tu pourras raffiner plus tard)
+  return buildModern(model, lang, colors, scale);
+}
+
+function buildElegant(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  // Style premium mais sobre : on part du Classic
+  return buildClassic(model, lang, colors, scale);
+}
+
+function buildTech(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  // Palette plus sombre pour un look "tech"
+  const overridden: PdfColorsLike = {
+    ...colors,
+    brand: colors.brand || "#22c55e",
+    ink: colors.ink || "#f9fafb",
+    muted: colors.muted || "#94a3b8",
+    bgSoft: colors.bgSoft || "#020617",
+    line: colors.line || "#1e293b",
+  };
+  return buildModern(model, lang, overridden, scale);
+}
+
+function buildProMax(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  // Version "premium" basée sur Modern, avec léger zoom
+  const overridden: PdfColorsLike = {
+    ...colors,
+    brand: colors.brand || "#0ea5e9",
+  };
+  const boostedScale = clamp(scale * 1.02, 0.75, 1.6);
+  return buildModern(model, lang, overridden, boostedScale);
+}
+
+// ----------------------------------------------------
+// Public API
+// ----------------------------------------------------
+
+export function buildCvPdf(
+  templateId: CvTemplateId,
+  model: CvDocModel,
+  lang: Lang,
+  colors: PdfColorsLike,
+  layout: "auto" | "tight" | "spacious" = "auto",
+  scale = 1
+) {
+  const L = normLang(lang);
+
+  // mapping layout -> styleMode attendu par buildCvAtsPdf
+  const styleMode: "auto" | "compact" | "expanded" =
+    layout === "tight" ? "compact" : layout === "spacious" ? "expanded" : "auto";
+
+  // ATS = ton template existant
+  if (templateId === "ats") {
+    return buildCvAtsPdf(model, L, colors as any, styleMode, scale);
+  }
+
+  // ajustement global de l’échelle selon layout
+  const mul = layout === "tight" ? 0.92 : layout === "spacious" ? 1.08 : 1.0;
+  const s = clamp(scale * mul, 0.75, 1.6);
+
+  switch (templateId) {
+    case "classic":
+      return buildClassic(model, L, colors, s);
+    case "modern":
+      return buildModern(model, L, colors, s);
+    case "minimalist":
+      return buildMinimalist(model, L, colors, s);
+    case "creative":
+      return buildCreative(model, L, colors, s);
+    case "elegant":
+      return buildElegant(model, L, colors, s);
+    case "tech":
+      return buildTech(model, L, colors, s);
+    case "pro_max":
+      return buildProMax(model, L, colors, s);
+    default:
+      // fallback safe
+      return buildClassic(model, L, colors, s);
+  }
+}
+````
+
 ## File: lib/pdf/templates/letter.ts
 ````typescript
 // lib/pdf/templates/letter.ts
@@ -22417,10 +22743,15 @@ googleProvider.setCustomParameters({ prompt: "select_account" });
 
 /**
  * ✅ Single source of truth reCAPTCHA (v3 standard ou Enterprise)
- * - Loader robuste (si script pas encore chargé)
+ * - Loader robuste (script injecté si absent + attente réelle de grecaptcha)
  * - tryGetRecaptchaToken(): non bloquant => retourne null si adblock/timeout…
  * - getRecaptchaToken(): strict => throw si impossible
- * - verifyRecaptcha(): optionnel via ton endpoint CF /recaptchaVerify (Enterprise)
+ * - verifyRecaptcha(): optionnel via endpoint CF /recaptchaVerify (Enterprise côté serveur)
+ *
+ * Notes :
+ * - Côté Cloud Functions, tes endpoints acceptent le token via body.recaptchaToken|token
+ *   OU via header "x-recaptcha-token".
+ * - L’action est normalisée côté client, et envoyée au /recaptchaVerify (optionnel).
  */
 
 declare global {
@@ -22442,12 +22773,12 @@ export type VerifyResult =
   | { ok: true; score?: number }
   | { ok: false; reason: string; score?: number };
 
-const DEFAULT_API_BASE =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+const DEFAULT_API_BASE = "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
 
-export const API_BASE = (
-  process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE
-).replace(/\/+$/, "");
+export const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE).replace(
+  /\/+$/,
+  ""
+);
 
 const SITE_KEY =
   process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY ||
@@ -22455,26 +22786,43 @@ const SITE_KEY =
   "";
 
 const USE_ENTERPRISE =
-  (process.env.NEXT_PUBLIC_RECAPTCHA_ENTERPRISE || "")
-    .toLowerCase()
-    .trim() === "true";
+  (process.env.NEXT_PUBLIC_RECAPTCHA_ENTERPRISE || "").toLowerCase().trim() === "true";
+
+/**
+ * Optionnel : certains environnements bloquent google.com mais autorisent recaptcha.net
+ * (même si, souvent, les deux sont filtrés). Tu peux forcer via env si besoin.
+ */
+const USE_RECAPTCHA_NET =
+  (process.env.NEXT_PUBLIC_RECAPTCHA_USE_NET || "").toLowerCase().trim() === "true";
 
 let recaptchaLoadPromise: Promise<void> | null = null;
 
-function isBrowser() {
+function isBrowser(): boolean {
   return typeof window !== "undefined" && typeof document !== "undefined";
 }
 
-function normalizeAction(action: string) {
+function normalizeAction(action: string): string {
   return (action || "").trim().toLowerCase();
 }
 
-function describeRecaptchaLoadFailure() {
+function describeRecaptchaLoadFailure(): string {
   return [
     "Sécurité: impossible de valider reCAPTCHA.",
     "Le script reCAPTCHA n’a pas pu être chargé ou est bloqué.",
     "Causes fréquentes: bloqueur de pubs, DNS filtrant, proxy/corporate, CSP trop stricte, ou réseau qui bloque google.com.",
   ].join(" ");
+}
+
+function getScriptSelector(): string {
+  return USE_ENTERPRISE ? 'script[data-recaptcha="enterprise"]' : 'script[data-recaptcha="v3"]';
+}
+
+function getScriptSrc(): string {
+  const host = USE_RECAPTCHA_NET ? "https://www.recaptcha.net" : "https://www.google.com";
+  const base = USE_ENTERPRISE
+    ? `${host}/recaptcha/enterprise.js`
+    : `${host}/recaptcha/api.js`;
+  return `${base}?render=${encodeURIComponent(SITE_KEY)}`;
 }
 
 function hasUsableRecaptcha(): boolean {
@@ -22502,8 +22850,9 @@ function pickRecaptchaClient(): GrecaptchaClient | null {
 }
 
 /**
- * ✅ Loader robuste:
- * - attend que grecaptcha soit réellement dispo (poll)
+ * ✅ Loader robuste :
+ * - injecte le script si absent
+ * - attend que grecaptcha soit réellement dispo
  * - retentable (reset promise en cas d’échec)
  */
 async function ensureRecaptchaLoaded(): Promise<void> {
@@ -22517,25 +22866,26 @@ async function ensureRecaptchaLoaded(): Promise<void> {
   if (recaptchaLoadPromise) return recaptchaLoadPromise;
 
   recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
-    const selector = USE_ENTERPRISE
-      ? 'script[data-recaptcha="enterprise"]'
-      : 'script[data-recaptcha="v3"]';
-
+    const selector = getScriptSelector();
     const existing = document.querySelector<HTMLScriptElement>(selector);
 
-    const pollUntilReady = (ms: number) => {
+    const waitUntil = (timeoutMs: number) => {
       const t0 = Date.now();
+
       const tick = () => {
         if (hasUsableRecaptcha()) return resolve();
-        if (Date.now() - t0 > ms) return reject(new Error(describeRecaptchaLoadFailure()));
-        requestAnimationFrame(tick);
+        if (Date.now() - t0 > timeoutMs) return reject(new Error(describeRecaptchaLoadFailure()));
+
+        // requestAnimationFrame peut être throttlé en onglet inactif, on mixe avec setTimeout.
+        window.setTimeout(tick, 50);
       };
+
       tick();
     };
 
     // Script déjà présent => on attend juste l'exposition de grecaptcha
     if (existing) {
-      pollUntilReady(10_000);
+      waitUntil(12_000);
       return;
     }
 
@@ -22543,20 +22893,15 @@ async function ensureRecaptchaLoaded(): Promise<void> {
     script.async = true;
     script.defer = true;
     script.setAttribute("data-recaptcha", USE_ENTERPRISE ? "enterprise" : "v3");
-
-    const base = USE_ENTERPRISE
-      ? "https://www.google.com/recaptcha/enterprise.js"
-      : "https://www.google.com/recaptcha/api.js";
-
-    script.src = `${base}?render=${encodeURIComponent(SITE_KEY)}`;
+    script.src = getScriptSrc();
 
     const timeout = window.setTimeout(() => {
       reject(new Error(describeRecaptchaLoadFailure()));
-    }, 12_000);
+    }, 15_000);
 
     script.onload = () => {
       window.clearTimeout(timeout);
-      pollUntilReady(8_000);
+      waitUntil(10_000);
     };
 
     script.onerror = () => {
@@ -22587,6 +22932,7 @@ export async function tryGetRecaptchaToken(action: string): Promise<string | nul
 
   try {
     await ensureRecaptchaLoaded();
+
     const client = pickRecaptchaClient();
     if (!client) return null;
 
@@ -22606,7 +22952,7 @@ export async function tryGetRecaptchaToken(action: string): Promise<string | nul
       }
     });
 
-    return typeof token === "string" && token ? token : null;
+    return typeof token === "string" && token.trim() ? token : null;
   } catch {
     return null;
   }
@@ -22615,17 +22961,29 @@ export async function tryGetRecaptchaToken(action: string): Promise<string | nul
 /** Version stricte */
 export async function getRecaptchaToken(action: string): Promise<string> {
   const token = await tryGetRecaptchaToken(action);
-  if (!token) {
-    throw new Error(describeRecaptchaLoadFailure());
-  }
+  if (!token) throw new Error(describeRecaptchaLoadFailure());
   return token;
 }
 
+/** Précharge le script (utile au mount) */
 export async function warmupRecaptcha(): Promise<void> {
   await ensureRecaptchaLoaded();
 }
 
-/** Vérif optionnelle via endpoint /recaptchaVerify */
+/**
+ * Helper pratique pour tes appels Cloud Functions:
+ * - met le token en header (tes CF le lisent via x-recaptcha-token)
+ * - ou tu peux aussi le mettre dans le body (recaptchaToken)
+ */
+export function buildRecaptchaHeaders(token: string | null): HeadersInit {
+  if (!token) return {};
+  return {
+    "X-Recaptcha-Token": token,
+    "x-recaptcha-token": token,
+  };
+}
+
+/** Vérif optionnelle via endpoint /recaptchaVerify (serveur) */
 export async function verifyRecaptcha(token: string, action: string): Promise<VerifyResult> {
   const normalizedAction = normalizeAction(action);
 
@@ -22643,14 +23001,17 @@ export async function verifyRecaptcha(token: string, action: string): Promise<Ve
     const data: any = await res.json().catch(() => ({}));
 
     if (!res.ok || !data?.ok) {
-      return {
-        ok: false,
-        reason: String(data?.reason || data?.details?.reason || "recaptcha_failed"),
-        score: typeof data?.score === "number"
+      const score =
+        typeof data?.score === "number"
           ? data.score
           : typeof data?.details?.score === "number"
             ? data.details.score
-            : undefined,
+            : undefined;
+
+      return {
+        ok: false,
+        reason: String(data?.reason || data?.details?.reason || "recaptcha_failed"),
+        score,
       };
     }
 
@@ -22704,60 +23065,35 @@ export async function verifyRecaptcha(token: string, action: string): Promise<Ve
 }
 ````
 
-## File: next.config.mjs
-````javascript
-/** @type {import('next').NextConfig} */
-const nextConfig = {
-  reactStrictMode: true,
-
-  // 🔴 IMPORTANT : active le mode export statique
-  // => `next build` va générer un dossier `out/`
-  output: "export",
-
-  // 🔴 IMPORTANT pour un hébergement statique (Firebase Hosting)
-  // Pas d'image optimizer côté serveur
-  images: {
-    unoptimized: true,
-  },
-
-  // Tu l'avais déjà pour pdfjs
-  transpilePackages: ["pdfjs-dist"],
-
-  webpack: (config, { dev, isServer }) => {
-    // Workaround qui était déjà dans ton projet
-    if (dev && !isServer) {
-      config.devtool = "source-map"; // ou "cheap-module-source-map"
-    }
-    return config;
-  },
-
-  experimental: {},
-};
-
-export default nextConfig;
-````
-
 ## File: functions/index.js
 ````javascript
+// functions/index.js
 "use strict";
 
 /**
- * ✅ VERSION "FULL IA CONNECTÉE" (Smart2) — FIXED + PATCH COMPLET
+ * ✅ Smart2 — Firebase Functions (FULL FILE)
+ * - Gemini (CV extraction + lettres + pitch + interview + Q&A)
+ * - PDF (CV + Lettre)
+ * - ZIP (CV+LM)
+ * - reCAPTCHA Enterprise (avec bypass si user authentifié sur endpoints sensibles)
+ * - Admin (setAdminRole, adminUpdateCredits)
+ * - Jobs (Adzuna)
+ * - Paiements (Polar checkout + webhook)
  *
- * Fix inclus :
- * - ✅ LM/PITCH via IA en JSON strict (response_mime_type) + parsing robuste (AI_BAD_JSON)
- * - ✅ Plus de "<body>" dans la lettre (prompt + nettoyage)
- * - ✅ Lettre mieux ciblée (limite de mots + anti-copie + JD mieux nettoyée)
- * - ✅ Signatures en double/triple : normalisation + dédup renforcée
- * - ✅ En-têtes duplicats (Service Recrutement / Entreprise) : sanitization
- * - ✅ reCAPTCHA 403 : bypass si user authentifié + action mismatch non bloquant (configurable)
- * - ✅ PATCH: generateLetterAndPitch protégé par reCAPTCHA (action "generate_letter_pitch")
- * - ✅ PATCH: looksLikeFullLetter() FR corrigé (regex \b autour de virgule supprimé)
- * - ✅ PATCH: sanitizeLmBodyFromModel() améliore <br> + suppression HTML résiduel
+ * ⚠️ Pré-requis package.json functions:
+ * - engines.node: "18"
+ * - deps: firebase-admin, firebase-functions, pdf-lib, jszip, @polar-sh/sdk,
+ *         @google-cloud/recaptcha-enterprise
  *
- * IMPORTANT :
- * - Les PROMPTS IA demandent "corps uniquement" (sans salutation, sans signature).
- * - Le serveur peut recomposer une lettre complète "exemple" via composeFullCoverLetterDoc().
+ * ⚠️ Secrets:
+ * - GEMINI_API_KEY (runWith secrets)
+ *
+ * ⚠️ Env/config:
+ * - RECAPTCHA_PROJECT_ID / RECAPTCHA_SITE_KEY / RECAPTCHA_THRESHOLD / RECAPTCHA_BYPASS / RECAPTCHA_STRICT_ACTION
+ * - ADZUNA_APP_ID / ADZUNA_APP_KEY (ou functions.config().adzuna.*)
+ * - POLAR_ACCESS_TOKEN / POLAR_ENV / POLAR_PRODUCT_*_ID / POLAR_PRICE_*_ID
+ * - NEXT_PUBLIC_APP_URL ou functions.config().app.base_url
+ * - CORS_ALLOW_ORIGINS (csv) ou functions.config().app.cors_allow_origins (csv)
  */
 
 const functions = require("firebase-functions/v1");
@@ -22770,9 +23106,7 @@ const { RecaptchaEnterpriseServiceClient } = require("@google-cloud/recaptcha-en
 // =============================
 // Firebase Admin init
 // =============================
-if (!admin.apps.length) {
-  admin.initializeApp();
-}
+if (!admin.apps.length) admin.initializeApp();
 const db = admin.firestore();
 
 // =============================
@@ -22854,10 +23188,6 @@ JOB TITLE: {{jobTitle}}
 COMPANY: {{companyName}}
 `.trim();
 
-/**
- * ✅ CV tailoring (optionnel) : résume + compétences ciblées
- * -> ne change PAS les expériences, juste aide à "restructurer" le haut du CV.
- */
 const TEMPLATE_CV_TAILOR_FR = `
 Tu es un expert CV (recruteur senior).
 
@@ -22987,7 +23317,6 @@ function sanitizeJobDescription(raw) {
   t = t.replace(/[ \t]+/g, " ");
   t = t.replace(/\n{3,}/g, "\n\n").trim();
 
-  // Supprime titres trop "collés"
   t = t.replace(/^\s*(description du poste|job description)\s*:?/gim, "").trim();
 
   const cutPatterns = [
@@ -23013,7 +23342,6 @@ function sanitizeJobDescription(raw) {
   }
   if (cutAt !== -1) t = t.slice(0, cutAt).trim();
 
-  // limite (évite que l'IA recopie)
   if (t.length > 1600) t = t.slice(0, 1600).trim() + "…";
   return t;
 }
@@ -23029,28 +23357,22 @@ function stripMarkdownAndBullets(text) {
   let t = String(text || "").replace(/\r/g, "").trim();
   if (!t) return "";
 
-  // remove code fences
   if (t.startsWith("```")) {
     t = t.replace(/^```[a-zA-Z]*\s*/, "").replace(/```$/g, "").trim();
   }
 
-  // light markdown cleanup
   t = t.replace(/\*\*(.*?)\*\*/g, "$1").replace(/__(.*?)__/g, "$1").replace(/`([^`]+)`/g, "$1");
 
-  // bullets at start of lines
   t = t
     .split("\n")
     .map((line) => line.replace(/^\s*[-•]\s+/, "").trimEnd())
     .join("\n")
     .trim();
 
-  // shrink huge blank blocks
   t = t.replace(/\n{3,}/g, "\n\n").trim();
-
   return t;
 }
 
-// ✅ PATCH: looksLikeFullLetter() FR corrigé (pas de \b autour de la virgule)
 function looksLikeFullLetter(text, lang) {
   const t = String(text || "").trim();
   if (!t) return false;
@@ -23073,9 +23395,6 @@ function looksLikeFullLetter(text, lang) {
   );
 }
 
-/**
- * ✅ Dédup bloc signature à la fin (closing + name répétés)
- */
 function dedupeClosingBlockAtEnd(text, lang, candidateName) {
   const L = normalizeLang(lang);
   const name = String(candidateName || "").trim();
@@ -23086,7 +23405,6 @@ function dedupeClosingBlockAtEnd(text, lang, candidateName) {
 
   let t = String(text).replace(/\r/g, "").trim();
 
-  // supprime répétitions exactes de blocs de fin
   if (name) {
     const nameEsc = escapeRegExp(name);
     t = t.replace(
@@ -23101,12 +23419,6 @@ function dedupeClosingBlockAtEnd(text, lang, candidateName) {
   return t;
 }
 
-/**
- * Transforme un "body only" en lettre complète :
- * - Ajoute greeting
- * - Ajoute signature
- * - ✅ Déduplique si déjà présent
- */
 function ensureFullLetterFormat({ letter, lang, candidateName }) {
   let t = stripMarkdownAndBullets(letter || "");
   if (!t) return "";
@@ -23114,23 +23426,19 @@ function ensureFullLetterFormat({ letter, lang, candidateName }) {
   const L = normalizeLang(lang);
   const name = (candidateName || (L === "en" ? "The candidate" : "Le candidat")).trim();
 
-  // greeting
   if (!looksLikeFullLetter(t, L)) {
     const greeting = L === "en" ? "Dear Hiring Manager," : "Madame, Monsieur,";
     t = `${greeting}\n\n${t}`;
   }
 
-  // closing
   const closing = L === "en" ? "Sincerely," : "Cordialement,";
   const closingEsc = escapeRegExp(closing);
 
-  // ✅ FIX: no \b around comma
   const hasClosing = new RegExp(`(?:^|\\n)\\s*${closingEsc}\\s*(?:\\n|$)`, "i").test(t);
 
   if (!hasClosing) {
     t = `${t}\n\n${closing}\n${name}`;
   } else {
-    // If closing exists but no name right after, add it
     const lines = t.split("\n");
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].trim().toLowerCase() === closing.toLowerCase()) {
@@ -23142,27 +23450,19 @@ function ensureFullLetterFormat({ letter, lang, candidateName }) {
     t = lines.join("\n");
   }
 
-  // ✅ De-dup repeated closing+name at end
   t = dedupeClosingBlockAtEnd(t, L, name);
   return t;
 }
 
-// =============================
-// ✅ Nettoyage "body LM" (anti header/greeting/signature doublés)
-// =============================
 function sanitizeLmBodyOnly(raw, lang, candidateName) {
   const L = normalizeLang(lang);
   const name = String(candidateName || "").trim();
   let t = stripMarkdownAndBullets(raw || "");
   if (!t) return "";
 
-  // supprime tags body si jamais
   t = t.replace(/<\/?body>/gi, "").trim();
-
-  // Supprime lignes d'en-tête possibles (Objet / Subject)
   t = t.replace(/^\s*(objet|subject)\s*:\s*.*$/gim, "").trim();
 
-  // Supprime salutations si présentes
   if (L === "fr") {
     t = t.replace(/^\s*madame,\s+monsieur,?\s*/i, "").trim();
     t = t.replace(/^\s*(madame|monsieur)\s*,?\s*(monsieur|madame)?\s*,?\s*$/i, "").trim();
@@ -23170,7 +23470,6 @@ function sanitizeLmBodyOnly(raw, lang, candidateName) {
     t = t.replace(/^\s*dear\s+.*,\s*/i, "").trim();
   }
 
-  // Supprime closing + tout ce qui suit (souvent signature)
   const closings =
     L === "fr"
       ? ["cordialement,", "bien cordialement,", "salutations,", "respectueusement,"]
@@ -23181,7 +23480,6 @@ function sanitizeLmBodyOnly(raw, lang, candidateName) {
     t = t.replace(new RegExp(`\\n\\s*${cEsc}[\\s\\S]*$`, "i"), "").trim();
   }
 
-  // supprime une signature finale = nom seul sur 1 ligne
   if (name) {
     const nEsc = escapeRegExp(name);
     t = t.replace(new RegExp(`\\n\\s*${nEsc}\\s*$`, "i"), "").trim();
@@ -23191,19 +23489,18 @@ function sanitizeLmBodyOnly(raw, lang, candidateName) {
   return t;
 }
 
-// ✅ PATCH: Nettoyage "texte brut modèle" (anti HTML/parasites + <br> + tags résiduels)
 function sanitizeLmBodyFromModel(raw) {
   if (!raw) return "";
   return String(raw)
     .replace(/\r/g, "")
-    .replace(/<br\s*\/?>/gi, "\n") // ✅ important
+    .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/?p>/gi, "")
     .replace(/<\/?body>/gi, "")
     .replace(/^\s*<body>\s*$/gim, "")
     .replace(/^\s*<\/body>\s*$/gim, "")
     .replace(/^\s*body\s*$/gim, "")
-    .replace(/<\/?[^>]+>/g, "") // ✅ supprime HTML résiduel
-    .replace(/^\s*aperçu\b.*$/gim, "") // "Aperçu de la lettre..."
+    .replace(/<\/?[^>]+>/g, "")
+    .replace(/^\s*aperçu\b.*$/gim, "")
     .replace(/\[[^\]]*\]/g, "")
     .replace(/\*+/g, "")
     .replace(/^-{2,}.*$/gmi, "")
@@ -23250,16 +23547,11 @@ function formatLetterDateLine({ city, lang }) {
   return c ? `${c}, ${dateEn}` : `${dateEn}`;
 }
 
-// =============================
-// ✅ Sanitize company name header (évite doublons "Service Recrutement ...")
-// =============================
 function sanitizeCompanyNameForHeader(companyName) {
   let c = String(companyName || "").replace(/\r/g, "").trim();
   if (!c) return "";
-  // supprime phrases parasites possibles
   c = c.replace(/\s+/g, " ").trim();
   c = c.replace(/^(service recrutement|recruitment team)\s*[-:|]?\s*/i, "").trim();
-  // supprime si l'utilisateur a collé deux fois
   c = c.replace(/(.+?)\s+\1$/i, "$1").trim();
   return c;
 }
@@ -23278,9 +23570,6 @@ function uniqueLines(lines) {
   return out;
 }
 
-// =============================
-// ✅ Compose lettre "style exemple" (en-tête + objet + salutation + body + signature)
-// =============================
 function composeFullCoverLetterDoc({ profile, jobTitle, companyName, lang, bodyOnly }) {
   const L = normalizeLang(lang);
   const p = profile || {};
@@ -23291,7 +23580,8 @@ function composeFullCoverLetterDoc({ profile, jobTitle, companyName, lang, bodyO
   const linkedin = String(p.linkedin || "").trim();
   const city = String(p.city || "").trim();
 
-  const compRaw = String(companyName || "").trim() || (L === "en" ? "Your company" : "Votre entreprise");
+  const compRaw =
+    String(companyName || "").trim() || (L === "en" ? "Your company" : "Votre entreprise");
   const comp = sanitizeCompanyNameForHeader(compRaw) || compRaw;
 
   const role = String(jobTitle || "").trim() || (L === "en" ? "the position" : "le poste");
@@ -23307,8 +23597,8 @@ function composeFullCoverLetterDoc({ profile, jobTitle, companyName, lang, bodyO
   const headerRight = headerRightLines.join("\n");
 
   const dateLine = formatLetterDateLine({ city, lang: L });
-
-  const subjectLine = L === "en" ? `Subject: Application for ${role}` : `Objet : Candidature au poste de ${role}`;
+  const subjectLine =
+    L === "en" ? `Subject: Application for ${role}` : `Objet : Candidature au poste de ${role}`;
 
   const greeting = L === "en" ? "Dear Hiring Manager," : "Madame, Monsieur,";
   const closing = L === "en" ? "Sincerely," : "Cordialement,";
@@ -23340,13 +23630,9 @@ function composeFullCoverLetterDoc({ profile, jobTitle, companyName, lang, bodyO
   return doc;
 }
 
-// =============================
-// ✅ Détection lettre déjà complète format "exemple"
-// =============================
 function looksLikeFormattedLetterDoc(text) {
   const t = String(text || "").trim();
   if (!t) return false;
-
   const hasSubject = /(objet\s*:|subject\s*:)/i.test(t);
   const hasGreeting = /(madame,\s+monsieur,|dear\s+)/i.test(t);
   return hasSubject && hasGreeting;
@@ -23368,7 +23654,6 @@ function getRecaptchaConfig() {
   const bypassRaw = cfg.bypass || process.env.RECAPTCHA_BYPASS || "false";
   const bypass = String(bypassRaw).toLowerCase() === "true";
 
-  // ✅ action strict toggle (par défaut OFF pour éviter les 403)
   const strictActionRaw = cfg.strict_action || process.env.RECAPTCHA_STRICT_ACTION || "false";
   const strictAction = String(strictActionRaw).toLowerCase() === "true";
 
@@ -23429,17 +23714,20 @@ async function requireFirebaseUser(req) {
   try {
     const decoded = await admin.auth().verifyIdToken(token);
     return { uid: decoded.uid, email: decoded.email || "" };
-  } catch (e) {
+  } catch {
     const err = new Error("INVALID_AUTH");
     err.code = "INVALID_AUTH";
     throw err;
   }
 }
 
+/**
+ * ✅ PATCH reCAPTCHA : on remonte aussi hostname + action
+ */
 async function verifyRecaptchaToken({ token, expectedAction, req }) {
   const { projectId, siteKey, threshold, bypass, strictAction } = getRecaptchaConfig();
 
-  // ✅ bypass en dev/emulator
+  // bypass en dev/emulator
   if (bypass && (isEmulator() || process.env.NODE_ENV !== "production")) {
     return { ok: true, bypass: true, score: null, threshold };
   }
@@ -23471,15 +23759,18 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
     const [response] = await recaptchaClient.createAssessment(request);
 
     const tokenProps = response && response.tokenProperties;
+
     if (!tokenProps || tokenProps.valid !== true) {
       return {
         ok: false,
         reason: "invalid_token",
         invalidReason: tokenProps ? tokenProps.invalidReason : null,
+        hostname: tokenProps ? tokenProps.hostname : null,
+        action: tokenProps ? tokenProps.action : null,
       };
     }
 
-    // ✅ action mismatch : bloquant seulement si strictAction=true
+    // action mismatch : bloquant seulement si strictAction=true
     if (expectedAction && tokenProps.action && String(tokenProps.action) !== String(expectedAction)) {
       if (strictAction) {
         return {
@@ -23487,6 +23778,8 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
           reason: "action_mismatch",
           got: tokenProps.action,
           expected: expectedAction,
+          hostname: tokenProps.hostname || null,
+          action: tokenProps.action || null,
         };
       }
       console.warn("reCAPTCHA action mismatch (non bloquant):", {
@@ -23501,10 +23794,23 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
         : null;
 
     if (typeof score === "number" && score < threshold) {
-      return { ok: false, reason: "low_score", score, threshold };
+      return {
+        ok: false,
+        reason: "low_score",
+        score,
+        threshold,
+        hostname: tokenProps.hostname || null,
+        action: tokenProps.action || null,
+      };
     }
 
-    return { ok: true, score, threshold };
+    return {
+      ok: true,
+      score,
+      threshold,
+      hostname: tokenProps.hostname || null,
+      action: tokenProps.action || null,
+    };
   } catch (err) {
     console.error("Erreur reCAPTCHA Enterprise:", err);
     return { ok: false, reason: "recaptcha_error" };
@@ -23512,11 +23818,9 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
 }
 
 async function enforceRecaptchaOrReturn(req, res, expectedAction) {
-  // ✅ Bypass si l'utilisateur est authentifié (réduit les 403 en prod)
+  // ✅ Bypass si l'utilisateur est authentifié
   const authed = await tryFirebaseUser(req);
-  if (authed && authed.uid) {
-    return null;
-  }
+  if (authed && authed.uid) return null;
 
   const token =
     (req.body && (req.body.recaptchaToken || req.body.token)) ||
@@ -23524,7 +23828,8 @@ async function enforceRecaptchaOrReturn(req, res, expectedAction) {
     req.headers["x-recaptchatoken"] ||
     "";
 
-  const actionFromBody = (req.body && (req.body.recaptchaAction || req.body.actionRecaptcha || req.body.action)) || "";
+  const actionFromBody =
+    (req.body && (req.body.recaptchaAction || req.body.actionRecaptcha || req.body.action)) || "";
 
   const action = expectedAction || actionFromBody || "";
 
@@ -23649,7 +23954,6 @@ exports.adminUpdateCredits = functions
     }
 
     const userRef = db.collection("users").doc(userId);
-
     await userRef.set({ credits, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 
     return { success: true, userId, credits };
@@ -23694,7 +23998,7 @@ function extractFirstJsonBlock(s) {
 
 function repairJsonString(s) {
   let t = normalizeSmartQuotes(s);
-  t = t.replace(/,\s*([}\]])/g, "$1"); // trailing commas
+  t = t.replace(/,\s*([}\]])/g, "$1");
   return t.trim();
 }
 
@@ -23955,45 +24259,6 @@ RÈGLES IMPORTANTES :
 }
 
 // =============================
-// extractProfile (reCAPTCHA ou auth bypass)
-// =============================
-exports.extractProfile = functions
-  .runWith({ secrets: ["GEMINI_API_KEY"] })
-  .region("europe-west1")
-  .https.onRequest(async (req, res) => {
-    setCors(req, res);
-
-    if (req.method === "OPTIONS") return res.status(204).send("");
-    if (req.method !== "POST") return res.status(405).json({ error: "Méthode non autorisée" });
-    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
-
-    const deny = await enforceRecaptchaOrReturn(req, res, "extract_profile");
-    if (deny) return;
-
-    try {
-      const base64Pdf = req.body?.base64Pdf;
-      if (!base64Pdf) return res.status(400).json({ error: "Champ 'base64Pdf' manquant." });
-
-      const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-      if (!GEMINI_API_KEY) {
-        return res.status(500).json({
-          error: "Clé Gemini manquante côté serveur. Configure le secret GEMINI_API_KEY.",
-        });
-      }
-
-      const profile = await callGeminiWithCv(base64Pdf, GEMINI_API_KEY);
-      return res.status(200).json(profile);
-    } catch (err) {
-      console.error("Erreur analyse CV :", err);
-      const msg = String(err?.message || "");
-      return res.status(500).json({
-        error: msg.startsWith("Erreur Gemini:") ? msg : "Erreur pendant l'analyse du CV.",
-      });
-    }
-  });
-
-// =============================
 // Build profile context for IA
 // =============================
 function buildProfileContextForIA(profile) {
@@ -24196,19 +24461,17 @@ async function createSimpleCvPdf(profile, options) {
     }
   }
 
-  // Header
   drawLine(p.fullName || "", 16, true);
-  const jobLine = targetJob || contract || p.contractType || (lang === "en" ? "Target position" : "Poste recherché");
+  const jobLine =
+    targetJob || contract || p.contractType || (lang === "en" ? "Target position" : "Poste recherché");
   drawLine(jobLine, 11, false);
 
   const contactParts = [p.email || "", p.phone || "", p.city || "", p.linkedin || ""].filter(Boolean);
   if (contactParts.length) drawLine(contactParts.join(" · "), 9, false);
-
   if (jobLink) drawLine((lang === "en" ? "Job link: " : "Lien de l'offre : ") + jobLink, 8, false);
 
   y -= 6;
 
-  // Tailored summary first (if any), else profile summary
   const summaryToUse = tailoredSummary || p.profileSummary;
   if (summaryToUse) {
     drawSectionTitle(lang === "en" ? "Profile" : "Profil");
@@ -24275,7 +24538,6 @@ async function createSimpleCvPdf(profile, options) {
 async function createLetterPdf(coverLetterFull, meta) {
   const { jobTitle = "", companyName = "", candidateName = "", lang = "fr" } = meta || {};
 
-  // ✅ dédup final avant rendu
   let letterText = String(coverLetterFull || "").trim();
   letterText = dedupeClosingBlockAtEnd(letterText, lang, candidateName);
 
@@ -24464,6 +24726,44 @@ function buildFallbackLetterAndPitchBody(profile, jobTitle, companyName, jobDesc
 }
 
 // =============================
+// extractProfile (PDF base64) ✅
+// =============================
+exports.extractProfile = functions
+  .runWith({ secrets: ["GEMINI_API_KEY"] })
+  .region("europe-west1")
+  .https.onRequest(async (req, res) => {
+    setCors(req, res);
+
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Méthode non autorisée" });
+    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
+
+    const deny = await enforceRecaptchaOrReturn(req, res, "extract_profile");
+    if (deny) return;
+
+    try {
+      const base64Pdf = req.body?.base64Pdf;
+      if (!base64Pdf) return res.status(400).json({ error: "Champ 'base64Pdf' manquant." });
+
+      const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+      if (!GEMINI_API_KEY) {
+        return res.status(500).json({
+          error: "Clé Gemini manquante côté serveur. Configure le secret GEMINI_API_KEY.",
+        });
+      }
+
+      const profile = await callGeminiWithCv(base64Pdf, GEMINI_API_KEY);
+      return res.status(200).json(profile);
+    } catch (err) {
+      console.error("Erreur analyse CV :", err);
+      const msg = String(err?.message || "");
+      return res.status(500).json({
+        error: msg.startsWith("Erreur Gemini:") ? msg : "Erreur pendant l'analyse du CV.",
+      });
+    }
+  });
+
+// =============================
 // generateLetterAndPitch ✅ (IA JSON strict + bodyOnly + lettre format exemple)
 // =============================
 exports.generateLetterAndPitch = functions
@@ -24477,7 +24777,6 @@ exports.generateLetterAndPitch = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ PATCH: reCAPTCHA sur cet endpoint aussi (bypass auto si user authentifié)
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_letter_pitch");
     if (deny) return;
 
@@ -24520,21 +24819,18 @@ exports.generateLetterAndPitch = functions
 
       try {
         const parsed = await callGeminiJson(prompt, GEMINI_API_KEY, 0.55, 1800);
-
         coverLetterBody = typeof parsed?.coverLetterBody === "string" ? parsed.coverLetterBody.trim() : "";
         pitch = typeof parsed?.pitch === "string" ? parsed.pitch.trim() : "";
       } catch (e) {
         console.error("Gemini JSON letter/pitch failed:", e?.message || e);
       }
 
-      // fallback si IA KO
       if (!coverLetterBody || !pitch) {
         const fb = buildFallbackLetterAndPitchBody(profile, jobTitle, companyName, jobDescription, lang);
         if (!coverLetterBody) coverLetterBody = fb.body;
         if (!pitch) pitch = fb.pitch;
       }
 
-      // Nettoyage robuste
       const cleanedFromModel = sanitizeLmBodyFromModel(coverLetterBody);
       const bodyOnly = sanitizeLmBodyOnly(cleanedFromModel, lang, profile?.fullName || "");
 
@@ -24542,7 +24838,6 @@ exports.generateLetterAndPitch = functions
         return res.status(502).json({ error: "AI_EMPTY", message: "Lettre vide après nettoyage." });
       }
 
-      // ✅ Lettre complète format exemple (identique attendu côté PDF)
       const coverLetter = composeFullCoverLetterDoc({
         profile,
         jobTitle,
@@ -24553,9 +24848,7 @@ exports.generateLetterAndPitch = functions
 
       return res.status(200).json({
         lang,
-        // ✅ renvoie le body SEUL pour édition front (recommandé)
         letterBody: bodyOnly,
-        // ✅ renvoie aussi la lettre complète pour compat
         coverLetter,
         pitch,
       });
@@ -24565,20 +24858,6 @@ exports.generateLetterAndPitch = functions
     }
   });
 
-/* =============================
-   ✅ LE RESTE DE TON FICHIER EST IDENTIQUE À TA VERSION
-   (interview, generateInterviewQA, credits/logs, recaptchaVerify, generateCvPdf,
-    generateCvLmZip, generateLetterPdf, jobs, polarCheckout, polarWebhook)
-   ============================= */
-
-/**
- * NOTE:
- * Tu peux conserver EXACTEMENT la suite de ton index.js comme tu l'avais.
- * Si tu veux que je te recolle aussi TOUTE la fin (Polar/Webhook/etc.) dans ce même bloc,
- * dis juste "COLLE LA SUITE" et je te la poste d’un coup (sans rien changer).
- *
- * Ici je m’arrête volontairement pour éviter une réponse tronquée par la limite de chat.
- */
 // =============================
 // Interview (simulation) ✅ IA
 // =============================
@@ -24691,9 +24970,7 @@ exports.interview = functions
       const action = body.action;
 
       if (!action)
-        return res
-          .status(400)
-          .json({ error: "Champ 'action' manquant ('start' ou 'answer')." });
+        return res.status(400).json({ error: "Champ 'action' manquant ('start' ou 'answer')." });
 
       const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
@@ -24706,8 +24983,7 @@ exports.interview = functions
 
         if (!userId) return res.status(400).json({ error: "Champ 'userId' manquant." });
 
-        const totalQuestions =
-          INTERVIEW_QUESTION_PLAN[interviewMode] || INTERVIEW_QUESTION_PLAN.complet;
+        const totalQuestions = INTERVIEW_QUESTION_PLAN[interviewMode] || INTERVIEW_QUESTION_PLAN.complet;
         const sessionId = createInterviewSessionId();
         const nowIso = new Date().toISOString();
 
@@ -24737,19 +25013,12 @@ exports.interview = functions
           if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY manquante");
 
           const prompt = buildInterviewPrompt(session, null);
-          const raw = await callGeminiText(
-            prompt,
-            GEMINI_API_KEY,
-            0.6,
-            1200,
-            "application/json"
-          );
+          const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.6, 1200, "application/json");
 
           const parsed = extractInterviewJson(raw) || {};
           if (typeof parsed.next_question === "string" && parsed.next_question.trim())
             nextQuestion = parsed.next_question.trim();
-          if (typeof parsed.short_analysis === "string")
-            shortAnalysis = parsed.short_analysis.trim();
+          if (typeof parsed.short_analysis === "string") shortAnalysis = parsed.short_analysis.trim();
           if (typeof parsed.final_summary === "string" && parsed.final_summary.trim())
             finalSummary = parsed.final_summary.trim();
           if (typeof parsed.final_score === "number" || typeof parsed.final_score === "string") {
@@ -24765,8 +25034,7 @@ exports.interview = functions
             ? `Bonjour ! Pour commencer, pouvez-vous vous présenter et m'expliquer pourquoi vous ciblez le poste de ${jobTitle} ?`
             : "Bonjour ! Pour commencer, pouvez-vous vous présenter en quelques phrases ?";
           if (!shortAnalysis)
-            shortAnalysis =
-              "Mode dégradé sans analyse IA détaillée (erreur ou quota Gemini).";
+            shortAnalysis = "Mode dégradé sans analyse IA détaillée (erreur ou quota Gemini).";
         }
 
         session.history.push({ role: "interviewer", text: nextQuestion, createdAt: nowIso });
@@ -24800,8 +25068,7 @@ exports.interview = functions
         const session = interviewSessions.get(sessionId);
         if (!session) {
           return res.status(404).json({
-            error:
-              "Session d'entretien introuvable ou expirée (instance de fonction différente).",
+            error: "Session d'entretien introuvable ou expirée (instance de fonction différente).",
           });
         }
 
@@ -24830,19 +25097,12 @@ exports.interview = functions
           if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY manquante");
 
           const prompt = buildInterviewPrompt(session, userMessage);
-          const raw = await callGeminiText(
-            prompt,
-            GEMINI_API_KEY,
-            0.6,
-            1200,
-            "application/json"
-          );
+          const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.6, 1200, "application/json");
 
           const parsed = extractInterviewJson(raw) || {};
           if (typeof parsed.next_question === "string" && parsed.next_question.trim())
             nextQuestion = parsed.next_question.trim();
-          if (typeof parsed.short_analysis === "string")
-            shortAnalysis = parsed.short_analysis.trim();
+          if (typeof parsed.short_analysis === "string") shortAnalysis = parsed.short_analysis.trim();
           if (typeof parsed.final_summary === "string" && parsed.final_summary.trim())
             finalSummary = parsed.final_summary.trim();
           if (typeof parsed.final_score === "number" || typeof parsed.final_score === "string") {
@@ -24853,8 +25113,7 @@ exports.interview = functions
           console.error("Erreur Gemini (interview/answer):", err);
         }
 
-        const isLastStep =
-          session.currentStep >= (session.totalQuestions || INTERVIEW_QUESTION_PLAN.complet);
+        const isLastStep = session.currentStep >= (session.totalQuestions || INTERVIEW_QUESTION_PLAN.complet);
 
         if (!nextQuestion && !finalSummary) {
           if (isLastStep) {
@@ -24864,8 +25123,7 @@ exports.interview = functions
           } else {
             nextQuestion =
               "Merci pour ta réponse. Peux-tu me donner un exemple encore plus concret en lien avec ce poste ?";
-            shortAnalysis =
-              shortAnalysis || "Mode dégradé sans analyse IA détaillée (erreur ou quota Gemini).";
+            shortAnalysis = shortAnalysis || "Mode dégradé sans analyse IA détaillée (erreur ou quota Gemini).";
           }
         }
 
@@ -24901,12 +25159,10 @@ exports.interview = functions
   });
 
 // =============================
-// generateInterviewQA ✅ IA (inchangé)
+// generateInterviewQA ✅ IA
 // =============================
 function buildFallbackQuestions(lang, role, company, city, dates, bullets) {
-  const missions = (Array.isArray(bullets) ? bullets : [])
-    .filter((b) => typeof b === "string")
-    .slice(0, 3);
+  const missions = (Array.isArray(bullets) ? bullets : []).filter((b) => typeof b === "string").slice(0, 3);
 
   if (lang === "en") {
     return [
@@ -24918,15 +25174,11 @@ function buildFallbackQuestions(lang, role, company, city, dates, bullets) {
       },
       {
         question: `Tell me about a concrete achievement in this role.`,
-        answer: missions[1]
-          ? `One strong achievement was: ${missions[1]}`
-          : `One of my main achievements was delivering key tasks with measurable impact.`,
+        answer: missions[1] ? `One strong achievement was: ${missions[1]}` : `One of my main achievements was delivering key tasks with measurable impact.`,
       },
       {
         question: `Which tools or technologies did you use most often?`,
-        answer: missions[2]
-          ? `I regularly used tools/technologies such as: ${missions[2]}.`
-          : `I used the main tools and workflows of the role on a daily basis.`,
+        answer: missions[2] ? `I regularly used tools/technologies such as: ${missions[2]}.` : `I used the main tools and workflows of the role on a daily basis.`,
       },
     ];
   }
@@ -24934,23 +25186,17 @@ function buildFallbackQuestions(lang, role, company, city, dates, bullets) {
   return [
     {
       question: `Pouvez-vous me décrire votre rôle de ${role} chez ${company} ?`,
-      answer: `Dans ce poste de ${role} chez ${company}${city ? " à " + city : ""}${
-        dates ? " (" + dates + ")" : ""
-      }, j'étais principalement en charge de ${
+      answer: `Dans ce poste de ${role} chez ${company}${city ? " à " + city : ""}${dates ? " (" + dates + ")" : ""}, j'étais principalement en charge de ${
         missions[0] || "missions clés en lien avec le poste (projets, coordination, suivi, etc.)"
       }.`,
     },
     {
       question: `Parlez-moi d'une réalisation concrète dont vous êtes fier(e).`,
-      answer: missions[1]
-        ? `Une réalisation marquante : ${missions[1]}`
-        : `Une de mes réalisations majeures a eu un impact positif mesurable sur l'équipe et/ou l'entreprise.`,
+      answer: missions[1] ? `Une réalisation marquante : ${missions[1]}` : `Une de mes réalisations majeures a eu un impact positif mesurable sur l'équipe et/ou l'entreprise.`,
     },
     {
       question: `Quels outils ou technologies utilisiez-vous le plus souvent ?`,
-      answer: missions[2]
-        ? `J'utilisais notamment ${missions[2]} au quotidien.`
-        : `J'utilisais au quotidien les principaux outils liés à ce poste.`,
+      answer: missions[2] ? `J'utilisais notamment ${missions[2]} au quotidien.` : `J'utilisais au quotidien les principaux outils liés à ce poste.`,
     },
   ];
 }
@@ -25066,7 +25312,7 @@ ${cvText}`;
   });
 
 // =============================
-// Credits / Logs (inchangé)
+// Credits / Logs
 // =============================
 function getReqPath(req) {
   try {
@@ -25076,18 +25322,7 @@ function getReqPath(req) {
   }
 }
 
-async function debitCreditsAndLog({
-  uid,
-  email,
-  cost,
-  tool,
-  docType,
-  docsGenerated,
-  cvGenerated,
-  lmGenerated,
-  req,
-  meta,
-}) {
+async function debitCreditsAndLog({ uid, email, cost, tool, docType, docsGenerated, cvGenerated, lmGenerated, req, meta }) {
   const userRef = db.collection("users").doc(uid);
   const usageRef = db.collection("usageLogs").doc();
   const now = Date.now();
@@ -25112,15 +25347,9 @@ async function debitCreditsAndLog({
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    if (docsGenerated && docsGenerated > 0) {
-      updates.totalDocumentsGenerated = admin.firestore.FieldValue.increment(docsGenerated);
-    }
-    if (cvGenerated && cvGenerated > 0) {
-      updates.totalCvGenerated = admin.firestore.FieldValue.increment(cvGenerated);
-    }
-    if (lmGenerated && lmGenerated > 0) {
-      updates.totalLmGenerated = admin.firestore.FieldValue.increment(lmGenerated);
-    }
+    if (docsGenerated && docsGenerated > 0) updates.totalDocumentsGenerated = admin.firestore.FieldValue.increment(docsGenerated);
+    if (cvGenerated && cvGenerated > 0) updates.totalCvGenerated = admin.firestore.FieldValue.increment(cvGenerated);
+    if (lmGenerated && lmGenerated > 0) updates.totalLmGenerated = admin.firestore.FieldValue.increment(lmGenerated);
 
     tx.set(userRef, updates, { merge: true });
 
@@ -25147,7 +25376,7 @@ async function debitCreditsAndLog({
 }
 
 // =============================
-// recaptchaVerify endpoint (inchangé)
+// recaptchaVerify endpoint (pour login etc.)
 // =============================
 exports.recaptchaVerify = functions
   .region("europe-west1")
@@ -25171,12 +25400,19 @@ exports.recaptchaVerify = functions
         ok: false,
         reason: result.reason || "recaptcha_failed",
         score: typeof result.score === "number" ? result.score : undefined,
+        threshold: typeof result.threshold === "number" ? result.threshold : undefined,
+        invalidReason: result.invalidReason || null,
+        hostname: result.hostname || null,
+        action: result.action || null,
+        got: result.got || undefined,
+        expected: result.expected || undefined,
       });
     }
 
     return res.status(200).json({
       ok: true,
       score: typeof result.score === "number" ? result.score : undefined,
+      threshold: typeof result.threshold === "number" ? result.threshold : undefined,
     });
   });
 
@@ -25191,8 +25427,7 @@ exports.generateCvPdf = functions
 
     if (req.method === "OPTIONS") return res.status(204).send("");
     if (req.method !== "POST") return res.status(405).json({ error: "Méthode non autorisée" });
-    if (!req.is("application/json"))
-      return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
+    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_cv_pdf");
     if (deny) return;
@@ -25276,7 +25511,7 @@ exports.generateCvPdf = functions
   });
 
 // =============================
-// generateCvLmZip ✅ (auth + credits + recaptcha) — LM via generateLetterAndPitch JSON
+// generateCvLmZip ✅ (auth + credits + recaptcha)
 // =============================
 exports.generateCvLmZip = functions
   .runWith({ secrets: ["GEMINI_API_KEY"] })
@@ -25285,8 +25520,7 @@ exports.generateCvLmZip = functions
     setCors(req, res);
 
     if (req.method === "OPTIONS") return res.status(204).send("");
-    if (!req.is("application/json"))
-      return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
+    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_cv_lm_zip");
     if (deny) return;
@@ -25334,7 +25568,6 @@ exports.generateCvLmZip = functions
 
       const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-      // CV tailor
       let tailoredSummary = "";
       let tailoredKeySkills = [];
       if (GEMINI_API_KEY && (targetJob || jobDescription)) {
@@ -25371,7 +25604,6 @@ exports.generateCvLmZip = functions
       const lmJobDescription = sanitizeJobDescription(lm.jobDescription || jobDescription || "");
       const lmLang = normalizeLang(lm.lang || lang);
 
-      // ✅ Génère body+pitch via JSON strict
       const cvText = buildProfileContextForIA(profile);
       const prompt = buildLetterAndPitchPrompt({
         lang: lmLang,
@@ -25389,11 +25621,7 @@ exports.generateCvLmZip = functions
       }
 
       let coverBody = parsed && typeof parsed.coverLetterBody === "string" ? parsed.coverLetterBody : "";
-      coverBody = sanitizeLmBodyOnly(
-        sanitizeLmBodyFromModel(coverBody),
-        lmLang,
-        profile.fullName || ""
-      );
+      coverBody = sanitizeLmBodyOnly(sanitizeLmBodyFromModel(coverBody), lmLang, profile.fullName || "");
       if (!coverBody) {
         const fb = buildFallbackLetterAndPitchBody(profile, jobTitle, companyName, lmJobDescription, lmLang);
         coverBody = fb.body;
@@ -25430,7 +25658,7 @@ exports.generateCvLmZip = functions
   });
 
 // =============================
-// generateLetterPdf ✅ (recaptcha) — respect format exemple + dedupe
+// generateLetterPdf ✅ (recaptcha)
 // =============================
 exports.generateLetterPdf = functions
   .region("europe-west1")
@@ -25438,8 +25666,7 @@ exports.generateLetterPdf = functions
     setCors(req, res);
 
     if (req.method === "OPTIONS") return res.status(204).send("");
-    if (!req.is("application/json"))
-      return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
+    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_letter_pdf");
     if (deny) return;
@@ -25452,16 +25679,11 @@ exports.generateLetterPdf = functions
       const candidateName = (body.candidateName || "").toString().trim();
       const lang = normalizeLang(body.lang || "fr");
 
-      if (!coverLetterRaw)
-        return res.status(400).json({ error: "Champ 'coverLetter' manquant ou vide." });
+      if (!coverLetterRaw) return res.status(400).json({ error: "Champ 'coverLetter' manquant ou vide." });
 
       const coverLetterFull = looksLikeFormattedLetterDoc(coverLetterRaw)
         ? coverLetterRaw
-        : ensureFullLetterFormat({
-            letter: coverLetterRaw,
-            lang,
-            candidateName,
-          });
+        : ensureFullLetterFormat({ letter: coverLetterRaw, lang, candidateName });
 
       const pdfBuffer = await createLetterPdf(coverLetterFull, {
         jobTitle,
@@ -25470,15 +25692,9 @@ exports.generateLetterPdf = functions
         lang,
       });
 
-      const safeJob = jobTitle
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "");
-
+      const safeJob = jobTitle.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
       const filename =
-        (lang === "en" ? "cover-letter" : "lettre-motivation") +
-        (safeJob ? `-${safeJob}` : "") +
-        ".pdf";
+        (lang === "en" ? "cover-letter" : "lettre-motivation") + (safeJob ? `-${safeJob}` : "") + ".pdf";
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
@@ -25490,7 +25706,7 @@ exports.generateLetterPdf = functions
   });
 
 // =============================
-// jobs (Adzuna) — inchangé
+// jobs (Adzuna)
 // =============================
 exports.jobs = functions
   .region("europe-west1")
@@ -25498,8 +25714,7 @@ exports.jobs = functions
     setCors(req, res);
 
     if (req.method === "OPTIONS") return res.status(204).send("");
-    if (!req.is("application/json"))
-      return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
+    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
     const deny = await enforceRecaptchaOrReturn(req, res, "jobs_search");
     if (deny) return;
@@ -25516,13 +25731,10 @@ exports.jobs = functions
         return res.status(400).json({ error: "Ajoute au moins un mot-clé (query) ou un lieu (location)." });
       }
 
-      const ADZUNA_APP_ID =
-        (functions.config().adzuna && functions.config().adzuna.app_id) || process.env.ADZUNA_APP_ID;
-      const ADZUNA_APP_KEY =
-        (functions.config().adzuna && functions.config().adzuna.app_key) || process.env.ADZUNA_APP_KEY;
+      const ADZUNA_APP_ID = (functions.config().adzuna && functions.config().adzuna.app_id) || process.env.ADZUNA_APP_ID;
+      const ADZUNA_APP_KEY = (functions.config().adzuna && functions.config().adzuna.app_key) || process.env.ADZUNA_APP_KEY;
 
-      if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY)
-        return res.status(500).json({ error: "Clés Adzuna manquantes côté serveur." });
+      if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY) return res.status(500).json({ error: "Clés Adzuna manquantes côté serveur." });
 
       const page =
         typeof pageRaw === "number" && pageRaw > 0
@@ -25559,16 +25771,12 @@ exports.jobs = functions
         return {
           id: job.id || `job-${index}`,
           title: job.title || "Offre sans titre",
-          company:
-            job.company && job.company.display_name ? job.company.display_name : "Entreprise non renseignée",
-          location:
-            job.location && job.location.display_name ? job.location.display_name : "Lieu non précisé",
+          company: job.company && job.company.display_name ? job.company.display_name : "Entreprise non renseignée",
+          location: job.location && job.location.display_name ? job.location.display_name : "Lieu non précisé",
           url: job.redirect_url || "",
           description: job.description || "",
           created: job.created || "",
-          salary: hasSalary
-            ? `${salaryMin.toLocaleString("fr-FR")} – ${salaryMax.toLocaleString("fr-FR")} €`
-            : null,
+          salary: hasSalary ? `${salaryMin.toLocaleString("fr-FR")} – ${salaryMax.toLocaleString("fr-FR")} €` : null,
         };
       });
 
@@ -25580,7 +25788,7 @@ exports.jobs = functions
   });
 
 // =============================
-// Polar checkout + webhook — inchangé (collé tel quel)
+// Polar checkout + webhook
 // =============================
 const POLAR_ACCESS_TOKEN_BOOT =
   process.env.POLAR_ACCESS_TOKEN || (functions.config().polar && functions.config().polar.access_token);
@@ -25616,8 +25824,7 @@ exports.polarCheckout = functions
       const polarAccessToken =
         process.env.POLAR_ACCESS_TOKEN || (functions.config().polar && functions.config().polar.access_token);
 
-      const polarEnv =
-        process.env.POLAR_ENV || (functions.config().polar && functions.config().polar.env) || "sandbox";
+      const polarEnv = process.env.POLAR_ENV || (functions.config().polar && functions.config().polar.env) || "sandbox";
 
       const product20 =
         process.env.POLAR_PRODUCT_20_ID || (functions.config().polar && functions.config().polar.product_20_id);
@@ -25626,8 +25833,7 @@ exports.polarCheckout = functions
       const product100 =
         process.env.POLAR_PRODUCT_100_ID || (functions.config().polar && functions.config().polar.product_100_id);
 
-      if (!polarAccessToken)
-        return res.status(500).json({ ok: false, error: "Configuration Polar manquante côté serveur." });
+      if (!polarAccessToken) return res.status(500).json({ ok: false, error: "Configuration Polar manquante côté serveur." });
 
       const server = polarEnv === "production" ? "production" : "sandbox";
       const polar = new Polar({ accessToken: polarAccessToken, server });
@@ -25665,8 +25871,7 @@ exports.polarCheckout = functions
 
       const checkout = await polar.checkouts.create(payload);
 
-      if (!checkout || !checkout.url)
-        return res.status(500).json({ ok: false, error: "Checkout Polar créé mais URL manquante." });
+      if (!checkout || !checkout.url) return res.status(500).json({ ok: false, error: "Checkout Polar créé mais URL manquante." });
 
       try {
         const checkoutId = checkout.id ? String(checkout.id) : null;
@@ -25767,8 +25972,7 @@ exports.polarWebhook = functions
       const event = req.body || {};
       console.log("Webhook Polar reçu :", JSON.stringify(event, null, 2));
 
-      if (!event || !event.type)
-        return res.status(400).json({ ok: false, error: "Event Polar invalide (type manquant)." });
+      if (!event || !event.type) return res.status(400).json({ ok: false, error: "Event Polar invalide (type manquant)." });
       if (event.type !== "order.paid") return res.status(200).json({ ok: true, ignored: true });
 
       const product20 =
@@ -25873,8 +26077,7 @@ exports.polarWebhook = functions
         }
       }
 
-      if (!userId)
-        return res.status(200).json({ ok: true, ignored: true, reason: "userId introuvable" });
+      if (!userId) return res.status(200).json({ ok: true, ignored: true, reason: "userId introuvable" });
 
       const orderId = (data && (data.id || data.order_id || data.orderId)) || event.id || null;
       const ledgerRef = orderId ? db.collection("polar_orders").doc(String(orderId)) : null;
@@ -25892,11 +26095,7 @@ exports.polarWebhook = functions
 
         const newCredits = currentCredits + creditsToAdd;
 
-        tx.set(
-          userRef,
-          { credits: newCredits, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-          { merge: true }
-        );
+        tx.set(userRef, { credits: newCredits, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 
         if (ledgerRef) {
           tx.set(ledgerRef, {
@@ -25944,369 +26143,520 @@ exports.polarWebhook = functions
 
 ## File: lib/gemini.ts
 ````typescript
-// lib/gemini.ts
-"use client";
+// /lib/gemini.ts
+// Client-side helpers to call Firebase Cloud Functions (Gemini / PDF / Interview / reCAPTCHA / Jobs / Polar).
+// ✅ Fix: exports GenerateInterviewQAResult (required by /app/app/interview/page.tsx)
 
-// Client-side helpers: Cloud Functions / API routes + reCAPTCHA via lib/recaptcha.ts
-// ⚠️ Ce fichier ne doit contenir AUCUN JSX/React. Uniquement du TypeScript.
+export type Lang = "fr" | "en";
 
-import { getRecaptchaToken } from "@/lib/recaptcha";
+export type SkillSection = { title: string; items: string[] };
+export type SkillsBlock = { sections: SkillSection[]; tools: string[] };
 
-export type Language = "fr" | "en";
-
-/** ------ Types domaine ------ */
-export type ProfileData = {
-  fullName?: string;
-  email?: string;
-  phone?: string;
-  location?: string;
+export type Experience = {
+  company?: string;
+  role?: string;
   title?: string;
-  summary?: string;
-
-  links?: Array<{ label?: string; url: string }>;
-  skills?: string[];
-  languages?: Array<{ name: string; level?: string }>;
-
-  experiences?: Array<{
-    company?: string;
-    title?: string;
-    role?: string; // compat
-    location?: string;
-    city?: string; // compat
-    startDate?: string;
-    endDate?: string;
-    dates?: string; // compat
-    description?: string;
-    bullets?: string[];
-  }>;
-  experience?: any; // compat
-  [key: string]: any;
+  dates?: string;
+  city?: string;
+  location?: string;
+  bullets?: string[];
 };
 
-export type LetterAndPitchResponse = {
-  coverLetter: string;
+export type Education = {
+  school?: string;
+  degree?: string;
+  dates?: string;
+};
+
+export type Profile = {
+  fullName?: string;
+  name?: string;
+  email?: string;
+  phone?: string;
+  linkedin?: string;
+  profileSummary?: string;
+  summary?: string;
+
+  city?: string;
+  address?: string;
+
+  contractType?: string;
+  contractTypeStandard?: string;
+  contractTypeFull?: string;
+
+  primaryDomain?: string;
+  secondaryDomains?: string[];
+
+  skills?: SkillsBlock | string[];
+  softSkills?: string[];
+
+  experiences?: Experience[];
+  education?: Education[];
+  educationShort?: string[];
+
+  certs?: string;
+  langLine?: string;
+  lang?: string;
+
+  hobbies?: string[];
+
+  drivingLicense?: string;
+  vehicle?: string;
+};
+
+export type ExtractProfileResult = Profile;
+
+export type GenerateLetterAndPitchResult = {
+  lang: Lang;
+  letterBody: string; // body only
+  coverLetter: string; // fully formatted doc (header/date/objet/salutation/signature)
   pitch: string;
 };
 
-export type InterviewQAResponse = {
-  questions: Array<{
-    question: string;
-    expectedPoints?: string[];
-    sampleAnswer?: string;
-    answer?: string;
-    a?: string;
-    q?: string;
-  }>;
-  lang: Language;
+export type InterviewQAItem = { question: string; answer: string };
+
+// ✅ THIS TYPE WAS MISSING → fixes your build error
+export type GenerateInterviewQAResult = {
+  questions: InterviewQAItem[];
+  lang: Lang;
 };
 
-/** Compat : ancienne page importait ce type */
-export type GenerateInterviewQAResult = InterviewQAResponse;
+export type InterviewStartResult = {
+  sessionId: string;
+  step: number;
+  totalQuestions: number;
+  next_question: string | null;
+  short_analysis: string;
+  final_summary: string | null;
+  final_score: number | null;
+};
 
-/** ------ Config URLs ------ */
-function stripTrailingSlash(s: string) {
-  return s.endsWith("/") ? s.slice(0, -1) : s;
+export type InterviewAnswerResult = InterviewStartResult;
+
+export type RecaptchaVerifyResult =
+  | { ok: true; score?: number }
+  | { ok: false; reason: string; score?: number; invalidReason?: string };
+
+type JsonValue = any;
+
+function getEnv(name: string): string | undefined {
+  // Next exposes only NEXT_PUBLIC_*
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const v = (process.env as any)?.[name];
+  return typeof v === "string" && v.trim() ? v.trim() : undefined;
 }
 
-const CF_BASE =
-  stripTrailingSlash(
-    process.env.NEXT_PUBLIC_CLOUD_FUNCTIONS_BASE_URL ||
-      "https://europe-west1-assistant-ia-v4.cloudfunctions.net"
-  ) || "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+function getFunctionsBaseUrl(): string {
+  // Allow overriding by env
+  const fromEnv =
+    getEnv("NEXT_PUBLIC_FUNCTIONS_BASE_URL") ||
+    getEnv("NEXT_PUBLIC_FUNCTIONS_URL") ||
+    getEnv("NEXT_PUBLIC_FIREBASE_FUNCTIONS_URL");
 
-const URL_EXTRACT_PROFILE = `${CF_BASE}/extractProfile`;
-const URL_GENERATE_INTERVIEW_QA = `${CF_BASE}/generateInterviewQA`;
-const URL_GENERATE_CV_PDF = `${CF_BASE}/generateCvPdf`;
-const URL_GENERATE_CV_LM_ZIP = `${CF_BASE}/generateCvLmZip`;
-const URL_GENERATE_LETTER_AND_PITCH_CF = `${CF_BASE}/generateLetterAndPitch`;
-const URL_GENERATE_LETTER_PDF = `${CF_BASE}/generateLetterPdf`;
+  if (fromEnv) return fromEnv.replace(/\/+$/, "");
 
-// App Route (Next.js) — si tu utilises /api/letterAndPitch côté serveur
-const URL_LETTER_AND_PITCH_API = "/api/letterAndPitch";
+  // Default to your deployed project (matches your logs)
+  return "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+}
 
-/** ------ Fetch helpers ------ */
-type FetchJsonOptions = {
-  timeoutMs?: number;
-  headers?: Record<string, string>;
-};
+function buildHeaders(opts?: { idToken?: string; extra?: Record<string, string> }): HeadersInit {
+  const h: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(opts?.extra || {}),
+  };
+  if (opts?.idToken) h.Authorization = `Bearer ${opts.idToken}`;
+  return h;
+}
 
-async function readErrorBody(res: Response): Promise<string> {
-  const ct = res.headers.get("content-type") || "";
+async function parseError(resp: Response): Promise<{ message: string; data?: any }> {
+  const ct = resp.headers.get("content-type") || "";
   try {
     if (ct.includes("application/json")) {
-      const j = await res.json().catch(() => null);
-      if (j && typeof j === "object") {
-        const msg =
-          (j as any).error ||
-          (j as any).message ||
-          JSON.stringify(j).slice(0, 2000);
-        return msg;
-      }
+      const j = await resp.json();
+      const msg =
+        (j && (j.message || j.error || j?.details?.reason || j?.details?.error)) ||
+        JSON.stringify(j);
+      return { message: String(msg), data: j };
     }
-    const t = await res.text().catch(() => "");
-    return t || `HTTP ${res.status}`;
+    const t = await resp.text();
+    return { message: t || `${resp.status} ${resp.statusText}` };
   } catch {
-    return `HTTP ${res.status}`;
+    return { message: `${resp.status} ${resp.statusText}` };
   }
 }
 
-async function fetchJson<T>(
-  url: string,
-  body: unknown,
-  opts: FetchJsonOptions = {}
+async function postJson<T = JsonValue>(
+  path: string,
+  body: any,
+  opts?: { idToken?: string }
 ): Promise<T> {
-  const controller = opts.timeoutMs ? new AbortController() : undefined;
-  const timer =
-    controller && opts.timeoutMs
-      ? window.setTimeout(() => controller.abort(), opts.timeoutMs)
-      : undefined;
+  const url = `${getFunctionsBaseUrl()}/${path.replace(/^\/+/, "")}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: buildHeaders({ idToken: opts?.idToken }),
+    body: JSON.stringify(body ?? {}),
+  });
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(opts.headers || {}),
-      },
-      body: JSON.stringify(body),
-      signal: controller?.signal,
+  if (!resp.ok) {
+    const err = await parseError(resp);
+    throw Object.assign(new Error(err.message), {
+      status: resp.status,
+      data: err.data,
+      url,
     });
-
-    if (!res.ok) {
-      const msg = await readErrorBody(res);
-      throw new Error(`HTTP ${res.status}: ${msg}`);
-    }
-
-    return (await res.json()) as T;
-  } finally {
-    if (timer) window.clearTimeout(timer);
   }
+
+  return (await resp.json()) as T;
 }
 
-async function fetchBinary(
-  url: string,
-  body: unknown,
-  opts: FetchJsonOptions = {}
+async function postBinary(
+  path: string,
+  body: any,
+  opts?: { idToken?: string }
 ): Promise<Blob> {
-  const controller = opts.timeoutMs ? new AbortController() : undefined;
-  const timer =
-    controller && opts.timeoutMs
-      ? window.setTimeout(() => controller.abort(), opts.timeoutMs)
-      : undefined;
+  const url = `${getFunctionsBaseUrl()}/${path.replace(/^\/+/, "")}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: buildHeaders({ idToken: opts?.idToken }),
+    body: JSON.stringify(body ?? {}),
+  });
 
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(opts.headers || {}),
-      },
-      body: JSON.stringify(body),
-      signal: controller?.signal,
+  if (!resp.ok) {
+    const err = await parseError(resp);
+    throw Object.assign(new Error(err.message), {
+      status: resp.status,
+      data: err.data,
+      url,
     });
-
-    if (!res.ok) {
-      const msg = await readErrorBody(res);
-      throw new Error(`HTTP ${res.status}: ${msg}`);
-    }
-
-    return await res.blob();
-  } finally {
-    if (timer) window.clearTimeout(timer);
   }
+
+  const ab = await resp.arrayBuffer();
+  const ct = resp.headers.get("content-type") || "application/octet-stream";
+  return new Blob([ab], { type: ct });
 }
 
-/** ------ Domain helpers ------ */
-function getExperiencesArray(profile: ProfileData): any[] {
-  const a = (profile as any)?.experiences ?? (profile as any)?.experience ?? [];
-  return Array.isArray(a) ? a : [];
+// -----------------------------
+// reCAPTCHA (optional)
+// -----------------------------
+export async function callRecaptchaVerify(args: {
+  token: string;
+  action: string;
+}): Promise<RecaptchaVerifyResult> {
+  return await postJson<RecaptchaVerifyResult>("recaptchaVerify", {
+    token: args.token,
+    action: args.action,
+  });
 }
 
-function buildExperienceJobDescription(
-  profile: ProfileData,
-  experienceIndex: number
-): {
-  jobTitle: string;
-  companyName: string;
-  jobDescription: string;
-  experience: any;
-} {
-  const experiences = getExperiencesArray(profile);
-
-  if (
-    typeof experienceIndex !== "number" ||
-    Number.isNaN(experienceIndex) ||
-    experienceIndex < 0 ||
-    experienceIndex >= experiences.length
-  ) {
-    throw new Error("Indice d'expérience invalide.");
-  }
-
-  const exp = experiences[experienceIndex];
-
-  const jobTitle =
-    String(exp?.title || exp?.role || "").trim() ||
-    String(profile.title || "").trim() ||
-    "Poste (non renseigné)";
-
-  const companyName =
-    String(exp?.company || "").trim() || "Entreprise (non renseignée)";
-
-  const lines: string[] = [];
-  lines.push(`Expérience ciblée: ${jobTitle} chez ${companyName}`);
-
-  const location = exp?.location || exp?.city || profile.location || "";
-  if (location) lines.push(`Lieu: ${String(location)}`);
-
-  const period =
-    exp?.dates ||
-    ((exp?.startDate || exp?.endDate)
-      ? `${exp?.startDate || "?"} → ${exp?.endDate || "?"}`
-      : "");
-  if (period) lines.push(`Période: ${String(period)}`);
-
-  if (exp?.description) {
-    lines.push("");
-    lines.push(String(exp.description));
-  }
-
-  if (Array.isArray(exp?.bullets) && exp.bullets.length) {
-    lines.push("");
-    lines.push("Points clés:");
-    for (const b of exp.bullets) {
-      const t = String(b || "").trim();
-      if (t) lines.push(`- ${t}`);
-    }
-  }
-
-  if (profile.skills?.length) {
-    lines.push("");
-    lines.push(`Compétences (extrait): ${profile.skills.slice(0, 12).join(", ")}`);
-  }
-
-  if (profile.summary?.trim()) {
-    lines.push("");
-    lines.push(`Résumé candidat: ${profile.summary.trim()}`);
-  }
-
-  const jobDescription = lines.join("\n").trim() || "Description non disponible.";
-  return { jobTitle, companyName, jobDescription, experience: exp };
-}
-
-/** ------ Public API ------ */
-export async function callExtractProfile(profileText: string): Promise<ProfileData> {
-  const recaptchaToken = await getRecaptchaToken("extract_profile");
-  return await fetchJson<ProfileData>(
-    URL_EXTRACT_PROFILE,
-    { text: profileText, recaptchaToken },
-    { timeoutMs: 60_000 }
-  );
-}
-
-export async function callGenerateLetterAndPitch(
-  profile: ProfileData,
-  jobOffer: {
-    companyName: string;
-    jobTitle: string;
-    jobDescription: string;
-    location?: string;
-  }
-): Promise<LetterAndPitchResponse> {
-  return await fetchJson<LetterAndPitchResponse>(
-    URL_LETTER_AND_PITCH_API,
-    { profile, jobOffer },
-    { timeoutMs: 90_000 }
-  );
-}
-
-export async function callGenerateLetterAndPitchCF(
-  profile: ProfileData,
-  jobOffer: {
-    companyName: string;
-    jobTitle: string;
-    jobDescription: string;
-    location?: string;
-  },
-  lang: Language = "fr"
-): Promise<LetterAndPitchResponse> {
-  const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
-  return await fetchJson<LetterAndPitchResponse>(
-    URL_GENERATE_LETTER_AND_PITCH_CF,
-    { profile, jobOffer, lang, recaptchaToken },
-    { timeoutMs: 120_000 }
-  );
-}
-
-/** ✅ Q/R entretien sur une expérience (Cloud Function) */
-export async function callGenerateInterviewQA(params: {
-  profile: ProfileData;
-  experienceIndex: number;
-  lang?: Language;
-}): Promise<InterviewQAResponse> {
-  const { profile, experienceIndex, lang = "fr" } = params;
-
-  const { jobTitle, companyName, jobDescription, experience } =
-    buildExperienceJobDescription(profile, experienceIndex);
-
-  const recaptchaToken = await getRecaptchaToken("generate_interview_qa");
-
-  return await fetchJson<InterviewQAResponse>(
-    URL_GENERATE_INTERVIEW_QA,
+// -----------------------------
+// Gemini: extract profile from CV PDF base64
+// -----------------------------
+export async function callExtractProfile(args: {
+  base64Pdf: string;
+  recaptchaToken?: string;
+  idToken?: string; // optional (bypasses recaptcha server-side)
+}): Promise<ExtractProfileResult> {
+  return await postJson<ExtractProfileResult>(
+    "extractProfile",
     {
-      experienceIndex, // ✅ important
-      profile,
-      experience,
-      jobTitle,
-      companyName,
-      jobDescription,
-      lang,
-      recaptchaToken,
+      base64Pdf: args.base64Pdf,
+      recaptchaToken: args.recaptchaToken,
+      action: "extract_profile",
+      recaptchaAction: "extract_profile",
     },
-    { timeoutMs: 120_000 }
+    { idToken: args.idToken }
   );
 }
 
-export async function callGenerateCvPdf(cvJson: unknown): Promise<Blob> {
-  const recaptchaToken = await getRecaptchaToken("generate_cv_pdf");
-  return await fetchBinary(
-    URL_GENERATE_CV_PDF,
-    { cvJson, recaptchaToken },
-    { timeoutMs: 120_000 }
-  );
-}
-
-export async function callGenerateCvLmZip(cvJson: unknown): Promise<Blob> {
-  const recaptchaToken = await getRecaptchaToken("generate_cv_lm_zip");
-  return await fetchBinary(
-    URL_GENERATE_CV_LM_ZIP,
-    { cvJson, recaptchaToken },
-    { timeoutMs: 180_000 }
-  );
-}
-
-export async function callGenerateLetterPdf(params: {
-  letterText: string;
-  candidateName?: string;
+// -----------------------------
+// Gemini: generate letter + pitch (JSON strict)
+// -----------------------------
+export async function callGenerateLetterAndPitch(args: {
+  profile: Profile;
+  jobDescription?: string;
   jobTitle?: string;
   companyName?: string;
-  lang?: Language;
-}): Promise<Blob> {
-  const {
-    letterText,
-    candidateName = "",
-    jobTitle = "",
-    companyName = "",
-    lang = "fr",
-  } = params;
-
-  const recaptchaToken = await getRecaptchaToken("generate_letter_pdf");
-
-  return await fetchBinary(
-    URL_GENERATE_LETTER_PDF,
-    { letterText, candidateName, jobTitle, companyName, lang, recaptchaToken },
-    { timeoutMs: 120_000 }
+  lang?: Lang;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<GenerateLetterAndPitchResult> {
+  return await postJson<GenerateLetterAndPitchResult>(
+    "generateLetterAndPitch",
+    {
+      profile: args.profile,
+      jobDescription: args.jobDescription || "",
+      jobTitle: args.jobTitle || "",
+      companyName: args.companyName || "",
+      lang: args.lang || "fr",
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "generate_letter_pitch",
+      action: "generate_letter_pitch",
+    },
+    { idToken: args.idToken }
   );
 }
+
+// -----------------------------
+// Gemini: generate interview Q&A (3 questions/answers for one experience)
+// -----------------------------
+export async function callGenerateInterviewQA(args: {
+  profile: Profile;
+  experienceIndex: number;
+  lang?: Lang;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<GenerateInterviewQAResult> {
+  return await postJson<GenerateInterviewQAResult>(
+    "generateInterviewQA",
+    {
+      profile: args.profile,
+      experienceIndex: args.experienceIndex,
+      lang: args.lang || "fr",
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "generate_interview_qa",
+      action: "generate_interview_qa",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+// -----------------------------
+// Interview simulation (start / answer)
+// -----------------------------
+export async function callInterviewStart(args: {
+  userId: string;
+  jobTitle?: string;
+  jobDesc?: string;
+  interviewMode?: "complet" | "rapide" | "technique" | "comportemental";
+  difficulty?: "standard" | "difficile";
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<InterviewStartResult> {
+  return await postJson<InterviewStartResult>(
+    "interview",
+    {
+      action: "start",
+      userId: args.userId,
+      jobTitle: args.jobTitle || "",
+      jobDesc: args.jobDesc || "",
+      interviewMode: args.interviewMode || "complet",
+      difficulty: args.difficulty || "standard",
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "interview",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+export async function callInterviewAnswer(args: {
+  userId: string;
+  sessionId: string;
+  userMessage: string;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<InterviewAnswerResult> {
+  return await postJson<InterviewAnswerResult>(
+    "interview",
+    {
+      action: "answer",
+      userId: args.userId,
+      sessionId: args.sessionId,
+      userMessage: args.userMessage,
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "interview",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+// -----------------------------
+// PDF endpoints (return Blob)
+// -----------------------------
+export async function callGenerateCvPdf(args: {
+  profile: Profile;
+  targetJob?: string;
+  lang?: Lang;
+  contract?: string;
+  jobLink?: string;
+  jobDescription?: string;
+  companyName?: string;
+  recaptchaToken?: string;
+  idToken: string; // required (server debits credits)
+}): Promise<Blob> {
+  return await postBinary(
+    "generateCvPdf",
+    {
+      profile: args.profile,
+      targetJob: args.targetJob || "",
+      lang: args.lang || "fr",
+      contract: args.contract || "",
+      jobLink: args.jobLink || "",
+      jobDescription: args.jobDescription || "",
+      companyName: args.companyName || "",
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "generate_cv_pdf",
+      action: "generate_cv_pdf",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+export async function callGenerateCvLmZip(args: {
+  profile: Profile;
+  targetJob?: string;
+  lang?: Lang;
+  contract?: string;
+  jobLink?: string;
+  jobDescription?: string;
+  lm: {
+    jobTitle?: string;
+    companyName?: string;
+    jobDescription?: string;
+    lang?: Lang;
+  };
+  recaptchaToken?: string;
+  idToken: string; // required
+}): Promise<Blob> {
+  return await postBinary(
+    "generateCvLmZip",
+    {
+      profile: args.profile,
+      targetJob: args.targetJob || "",
+      lang: args.lang || "fr",
+      contract: args.contract || "",
+      jobLink: args.jobLink || "",
+      jobDescription: args.jobDescription || "",
+      lm: args.lm || {},
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "generate_cv_lm_zip",
+      action: "generate_cv_lm_zip",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+export async function callGenerateLetterPdf(args: {
+  coverLetter: string;
+  jobTitle?: string;
+  companyName?: string;
+  candidateName?: string;
+  lang?: Lang;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<Blob> {
+  return await postBinary(
+    "generateLetterPdf",
+    {
+      coverLetter: args.coverLetter,
+      jobTitle: args.jobTitle || "",
+      companyName: args.companyName || "",
+      candidateName: args.candidateName || "",
+      lang: args.lang || "fr",
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "generate_letter_pdf",
+      action: "generate_letter_pdf",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+// -----------------------------
+// Jobs search (Adzuna proxy)
+// -----------------------------
+export type JobItem = {
+  id: string;
+  title: string;
+  company: string;
+  location: string;
+  url: string;
+  description: string;
+  created: string;
+  salary: string | null;
+};
+
+export type JobsSearchResult = { jobs: JobItem[] };
+
+export async function callJobsSearch(args: {
+  query?: string;
+  location?: string;
+  page?: number;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<JobsSearchResult> {
+  return await postJson<JobsSearchResult>(
+    "jobs",
+    {
+      query: args.query || "",
+      location: args.location || "",
+      page: typeof args.page === "number" ? args.page : 1,
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "jobs_search",
+      action: "jobs_search",
+    },
+    { idToken: args.idToken }
+  );
+}
+
+// -----------------------------
+// Polar checkout
+// -----------------------------
+export type PolarCheckoutResult =
+  | { ok: true; url: string }
+  | { ok: false; error: string };
+
+export async function callPolarCheckout(args: {
+  packId: "20" | "50" | "100" | string;
+  userId: string;
+  email: string;
+  recaptchaToken?: string;
+  idToken?: string; // optional
+}): Promise<PolarCheckoutResult> {
+  return await postJson<PolarCheckoutResult>(
+    "polarCheckout",
+    {
+      packId: args.packId,
+      userId: args.userId,
+      email: args.email,
+      recaptchaToken: args.recaptchaToken,
+      recaptchaAction: "polar_checkout",
+      action: "polar_checkout",
+    },
+    { idToken: args.idToken }
+  );
+}
+````
+
+## File: next.config.mjs
+````javascript
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  reactStrictMode: true,
+
+  // 🔴 IMPORTANT : active le mode export statique
+  // => `next build` va générer un dossier `out/`
+  output: "export",
+
+  // 🔴 IMPORTANT pour un hébergement statique (Firebase Hosting)
+  // Pas d'image optimizer côté serveur
+  images: {
+    unoptimized: true,
+  },
+
+  // Tu l'avais déjà pour pdfjs
+  transpilePackages: ["pdfjs-dist"],
+
+  webpack: (config, { dev, isServer }) => {
+    // Workaround qui était déjà dans ton projet
+    if (dev && !isServer) {
+      config.devtool = "source-map"; // ou "cheap-module-source-map"
+    }
+    return config;
+  },
+
+  experimental: {},
+};
+
+export default nextConfig;
 ````
 
 ## File: package.json
@@ -26352,187 +26702,6 @@ export async function callGenerateLetterPdf(params: {
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.4",
     "typescript": "^5.5.0"
-  }
-}
-````
-
-## File: app/api/generateLetterAndPitch/route.ts
-````typescript
-// app/api/generateLetterAndPitch/route.ts
-import { NextResponse } from "next/server";
-
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-const CF_LETTER_AND_PITCH_URL =
-  process.env.FUNCTIONS_BASE_URL
-    ? `${process.env.FUNCTIONS_BASE_URL}/generateLetterAndPitch`
-    : "https://europe-west1-assistant-ia-v4.cloudfunctions.net/generateLetterAndPitch";
-
-// --------------------
-// Helpers (server)
-// --------------------
-function safeText(v: any) {
-  return String(v ?? "").trim();
-}
-
-function cleanGeneratedLetter(raw: string): string {
-  if (!raw) return "";
-  let txt = String(raw);
-
-  txt = txt.replace(/<\/?body[^>]*>/gi, "");
-  txt = txt.replace(/<\/?html[^>]*>/gi, "");
-  txt = txt.replace(/<\/?head[^>]*>[\s\S]*?<\/head>/gi, "");
-  txt = txt.replace(/<\/?[^>]+>/g, "");
-
-  return txt.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-function extractBodyFromLetterText(letterText: string, lang: "fr" | "en", fullName?: string) {
-  const raw = safeText(letterText);
-  if (!raw) return "";
-
-  const lines = raw
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  if (!lines.length) return raw;
-
-  const first = lines[0].toLowerCase();
-  const isGreeting =
-    (lang === "fr" && (first.startsWith("madame") || first.startsWith("bonjour"))) ||
-    (lang === "en" && (first.startsWith("dear") || first.startsWith("hello")));
-
-  if (isGreeting) lines.shift();
-
-  while (lines.length) {
-    const last = lines[lines.length - 1].toLowerCase();
-
-    if (
-      last.includes("cordialement") ||
-      last.includes("bien cordialement") ||
-      last.includes("salutations") ||
-      last.includes("sincerely") ||
-      last.includes("best regards") ||
-      last.includes("kind regards")
-    ) {
-      lines.pop();
-      continue;
-    }
-
-    if (fullName && last.includes(fullName.toLowerCase())) {
-      lines.pop();
-      continue;
-    }
-
-    break;
-  }
-
-  return lines.join("\n\n").trim() || raw;
-}
-
-// --------------------
-// Route
-// --------------------
-export async function POST(req: Request) {
-  // 1) Parse JSON
-  let body: any = null;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: "Corps JSON invalide." }, { status: 400 });
-  }
-
-  try {
-    // 2) Headers vers Cloud Function
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-
-    const authHeader = req.headers.get("authorization");
-    if (authHeader) headers["Authorization"] = authHeader;
-
-    // ✅ reCAPTCHA : body OU header (front envoie souvent dans le body)
-    const recaptchaFromHeader =
-      req.headers.get("x-recaptcha-token") || req.headers.get("X-Recaptcha-Token");
-
-    const recaptchaFromBody = typeof body?.recaptchaToken === "string" ? body.recaptchaToken.trim() : "";
-
-    const recaptchaToken = recaptchaFromBody || recaptchaFromHeader || "";
-    if (recaptchaToken) headers["X-Recaptcha-Token"] = recaptchaToken;
-
-    // optionnel mais propre : ne pas forward le token dans le body si la CF attend un header
-    if (body && "recaptchaToken" in body) delete body.recaptchaToken;
-
-    // 3) Timeout (évite req qui pend)
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 45_000);
-
-    const cfRes = await fetch(CF_LETTER_AND_PITCH_URL, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timeout));
-
-    const status = cfRes.status;
-    const contentType = cfRes.headers.get("content-type") || "";
-
-    // 4) Si pas JSON -> erreur explicite
-    if (!contentType.includes("application/json")) {
-      const text = await cfRes.text().catch(() => "");
-      return NextResponse.json(
-        {
-          error: "La Cloud Function generateLetterAndPitch ne renvoie pas de JSON.",
-          status,
-          rawBody: text.slice(0, 800),
-        },
-        { status: status || 500 }
-      );
-    }
-
-    const json = await cfRes.json().catch(() => null);
-
-    // 5) Propager erreur backend CF
-    if (!cfRes.ok) {
-      return NextResponse.json(json || { error: "Erreur backend generateLetterAndPitch" }, { status });
-    }
-
-    // 6) ✅ Normalisation : garantir letterBody côté front
-    // - si la CF renvoie déjà letterBody : on le clean
-    // - sinon fallback coverLetter -> on extrait un body propre
-    const lang = (body?.lang === "en" ? "en" : "fr") as "fr" | "en";
-    const fullName = safeText(body?.profile?.fullName);
-
-    const apiLetterBody = typeof json?.letterBody === "string" ? json.letterBody : "";
-    const apiCoverLetter = typeof json?.coverLetter === "string" ? json.coverLetter : "";
-
-    const cleanedPrimary = cleanGeneratedLetter(apiLetterBody || apiCoverLetter);
-    const bodyOnly = extractBodyFromLetterText(cleanedPrimary, lang, fullName);
-
-    const out = {
-      ...json,
-      // ✅ on force un champ stable
-      letterBody: bodyOnly || cleanedPrimary || "",
-      // (optionnel) on garde coverLetter intact si tu l’utilises ailleurs
-      coverLetter: typeof json?.coverLetter === "string" ? json.coverLetter : apiCoverLetter || "",
-    };
-
-    return NextResponse.json(out, { status });
-  } catch (e: any) {
-    const isAbort = e?.name === "AbortError";
-    console.error("Erreur proxy /api/generateLetterAndPitch :", e);
-
-    return NextResponse.json(
-      {
-        error: isAbort
-          ? "Timeout lors de l'appel à generateLetterAndPitch."
-          : "Erreur interne dans la route Next /api/generateLetterAndPitch (proxy).",
-        details: e?.message ?? String(e),
-      },
-      { status: isAbort ? 504 : 500 }
-    );
   }
 }
 ````

@@ -2,7 +2,6 @@
 import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
 const CF_LETTER_AND_PITCH_URL =
   process.env.FUNCTIONS_BASE_URL

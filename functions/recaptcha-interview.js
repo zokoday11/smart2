@@ -23,14 +23,12 @@ function setCors(req, res) {
 
   if (allowed.includes(origin)) {
     res.set("Access-Control-Allow-Origin", origin);
-  } else {
-    // (Option) tu peux mettre ton domaine custom ici si tu en as un
-    // res.set("Access-Control-Allow-Origin", "https://tondomaine.com");
   }
 
   res.set("Vary", "Origin");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  // ✅ ajoute X-Recaptcha-Token au cas où
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Recaptcha-Token");
 }
 
 /* ============================
@@ -61,8 +59,10 @@ function getClientIp(req) {
   );
 }
 
+// ✅ IMPORTANT : on ne lower-case plus ici.
+// On garde l’action telle qu’envoyée, et on compare en lowercase plus bas.
 function normalizeAction(action) {
-  return String(action || "").trim().toLowerCase();
+  return String(action || "").trim();
 }
 
 /**
@@ -90,7 +90,8 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
       event: {
         token,
         siteKey,
-        expectedAction: expectedAction || undefined,
+        // ✅ on n’envoie plus expectedAction à Google (évite mismatch sur casse iOS)
+        // expectedAction: expectedAction || undefined,
         userAgent: userAgent || undefined,
         userIpAddress: userIp || undefined,
       },
@@ -106,14 +107,14 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
     };
   }
 
-  // Action check (reCAPTCHA est case-sensitive)
-  if (expectedAction && tokenProps.action && String(tokenProps.action) !== String(expectedAction)) {
-    return {
-      ok: false,
-      reason: "action_mismatch",
-      expected: expectedAction,
-      got: tokenProps.action,
-    };
+  // ✅ Action check case-insensitive
+  // reCAPTCHA Enterprise est souvent case-sensitive côté token/action.
+  // On compare en lowercase pour éviter les refus "Login" vs "login".
+  const got = String(tokenProps.action || "").trim().toLowerCase();
+  const exp = String(expectedAction || "").trim().toLowerCase();
+
+  if (exp && got && got !== exp) {
+    return { ok: false, reason: "action_mismatch", expected: exp, got };
   }
 
   const score =
@@ -186,15 +187,13 @@ exports.interview = functions
     try {
       const body = req.body || {};
 
-      // ✅ on accepte plusieurs noms côté front
       const token =
         body.recaptchaToken ||
         body.token ||
         (body.recaptcha && body.recaptcha.token) ||
         null;
 
-      // ✅ action: on force une convention stable
-      // IMPORTANT : le front doit générer un token avec CETTE action
+      // ✅ On garde l’action telle qu’envoyée, et la vérif est case-insensitive dans verifyRecaptchaToken
       const expectedAction = normalizeAction(body.recaptchaAction || body.actionName || "interview");
 
       if (!token) {
@@ -215,10 +214,6 @@ exports.interview = functions
           extra: r,
         });
       }
-
-      // ✅ Ici, tu continues TON code interview (Gemini / sessions / credits etc.)
-      // Pour que ça compile direct, je renvoie juste un OK:
-      // Remplace cette partie par ton handler actuel (start/answer) si tu l’as déjà ici.
 
       return res.status(200).json({ ok: true, message: "interview OK", score: r.score ?? null });
     } catch (e) {

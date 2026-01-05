@@ -1,22 +1,30 @@
+// functions/index.js
 "use strict";
 
 /**
- * ✅ VERSION "FULL IA CONNECTÉE" (Smart2) — FIXED + PATCH COMPLET
+ * ✅ Smart2 — Firebase Functions (FULL FILE)
+ * - Gemini (CV extraction + lettres + pitch + interview + Q&A)
+ * - PDF (CV + Lettre)
+ * - ZIP (CV+LM)
+ * - reCAPTCHA Enterprise (avec bypass si user authentifié sur endpoints sensibles)
+ * - Admin (setAdminRole, adminUpdateCredits)
+ * - Jobs (Adzuna)
+ * - Paiements (Polar checkout + webhook)
  *
- * Fix inclus :
- * - ✅ LM/PITCH via IA en JSON strict (response_mime_type) + parsing robuste (AI_BAD_JSON)
- * - ✅ Plus de "<body>" dans la lettre (prompt + nettoyage)
- * - ✅ Lettre mieux ciblée (limite de mots + anti-copie + JD mieux nettoyée)
- * - ✅ Signatures en double/triple : normalisation + dédup renforcée
- * - ✅ En-têtes duplicats (Service Recrutement / Entreprise) : sanitization
- * - ✅ reCAPTCHA 403 : bypass si user authentifié + action mismatch non bloquant (configurable)
- * - ✅ PATCH: generateLetterAndPitch protégé par reCAPTCHA (action "generate_letter_pitch")
- * - ✅ PATCH: looksLikeFullLetter() FR corrigé (regex \b autour de virgule supprimé)
- * - ✅ PATCH: sanitizeLmBodyFromModel() améliore <br> + suppression HTML résiduel
+ * ⚠️ Pré-requis package.json functions:
+ * - engines.node: "18"
+ * - deps: firebase-admin, firebase-functions, pdf-lib, jszip, @polar-sh/sdk,
+ *         @google-cloud/recaptcha-enterprise
  *
- * IMPORTANT :
- * - Les PROMPTS IA demandent "corps uniquement" (sans salutation, sans signature).
- * - Le serveur peut recomposer une lettre complète "exemple" via composeFullCoverLetterDoc().
+ * ⚠️ Secrets:
+ * - GEMINI_API_KEY (runWith secrets)
+ *
+ * ⚠️ Env/config:
+ * - RECAPTCHA_PROJECT_ID / RECAPTCHA_SITE_KEY / RECAPTCHA_THRESHOLD / RECAPTCHA_BYPASS / RECAPTCHA_STRICT_ACTION
+ * - ADZUNA_APP_ID / ADZUNA_APP_KEY (ou functions.config().adzuna.*)
+ * - POLAR_ACCESS_TOKEN / POLAR_ENV / POLAR_PRODUCT_*_ID / POLAR_PRICE_*_ID
+ * - NEXT_PUBLIC_APP_URL ou functions.config().app.base_url
+ * - CORS_ALLOW_ORIGINS (csv) ou functions.config().app.cors_allow_origins (csv)
  */
 
 const functions = require("firebase-functions/v1");
@@ -29,9 +37,7 @@ const { RecaptchaEnterpriseServiceClient } = require("@google-cloud/recaptcha-en
 // =============================
 // Firebase Admin init
 // =============================
-if (!admin.apps.length) {
-  admin.initializeApp();
-}
+if (!admin.apps.length) admin.initializeApp();
 const db = admin.firestore();
 
 // =============================
@@ -113,10 +119,6 @@ JOB TITLE: {{jobTitle}}
 COMPANY: {{companyName}}
 `.trim();
 
-/**
- * ✅ CV tailoring (optionnel) : résume + compétences ciblées
- * -> ne change PAS les expériences, juste aide à "restructurer" le haut du CV.
- */
 const TEMPLATE_CV_TAILOR_FR = `
 Tu es un expert CV (recruteur senior).
 
@@ -246,7 +248,6 @@ function sanitizeJobDescription(raw) {
   t = t.replace(/[ \t]+/g, " ");
   t = t.replace(/\n{3,}/g, "\n\n").trim();
 
-  // Supprime titres trop "collés"
   t = t.replace(/^\s*(description du poste|job description)\s*:?/gim, "").trim();
 
   const cutPatterns = [
@@ -272,7 +273,6 @@ function sanitizeJobDescription(raw) {
   }
   if (cutAt !== -1) t = t.slice(0, cutAt).trim();
 
-  // limite (évite que l'IA recopie)
   if (t.length > 1600) t = t.slice(0, 1600).trim() + "…";
   return t;
 }
@@ -288,28 +288,22 @@ function stripMarkdownAndBullets(text) {
   let t = String(text || "").replace(/\r/g, "").trim();
   if (!t) return "";
 
-  // remove code fences
   if (t.startsWith("```")) {
     t = t.replace(/^```[a-zA-Z]*\s*/, "").replace(/```$/g, "").trim();
   }
 
-  // light markdown cleanup
   t = t.replace(/\*\*(.*?)\*\*/g, "$1").replace(/__(.*?)__/g, "$1").replace(/`([^`]+)`/g, "$1");
 
-  // bullets at start of lines
   t = t
     .split("\n")
     .map((line) => line.replace(/^\s*[-•]\s+/, "").trimEnd())
     .join("\n")
     .trim();
 
-  // shrink huge blank blocks
   t = t.replace(/\n{3,}/g, "\n\n").trim();
-
   return t;
 }
 
-// ✅ PATCH: looksLikeFullLetter() FR corrigé (pas de \b autour de la virgule)
 function looksLikeFullLetter(text, lang) {
   const t = String(text || "").trim();
   if (!t) return false;
@@ -332,9 +326,6 @@ function looksLikeFullLetter(text, lang) {
   );
 }
 
-/**
- * ✅ Dédup bloc signature à la fin (closing + name répétés)
- */
 function dedupeClosingBlockAtEnd(text, lang, candidateName) {
   const L = normalizeLang(lang);
   const name = String(candidateName || "").trim();
@@ -345,7 +336,6 @@ function dedupeClosingBlockAtEnd(text, lang, candidateName) {
 
   let t = String(text).replace(/\r/g, "").trim();
 
-  // supprime répétitions exactes de blocs de fin
   if (name) {
     const nameEsc = escapeRegExp(name);
     t = t.replace(
@@ -360,12 +350,6 @@ function dedupeClosingBlockAtEnd(text, lang, candidateName) {
   return t;
 }
 
-/**
- * Transforme un "body only" en lettre complète :
- * - Ajoute greeting
- * - Ajoute signature
- * - ✅ Déduplique si déjà présent
- */
 function ensureFullLetterFormat({ letter, lang, candidateName }) {
   let t = stripMarkdownAndBullets(letter || "");
   if (!t) return "";
@@ -373,23 +357,19 @@ function ensureFullLetterFormat({ letter, lang, candidateName }) {
   const L = normalizeLang(lang);
   const name = (candidateName || (L === "en" ? "The candidate" : "Le candidat")).trim();
 
-  // greeting
   if (!looksLikeFullLetter(t, L)) {
     const greeting = L === "en" ? "Dear Hiring Manager," : "Madame, Monsieur,";
     t = `${greeting}\n\n${t}`;
   }
 
-  // closing
   const closing = L === "en" ? "Sincerely," : "Cordialement,";
   const closingEsc = escapeRegExp(closing);
 
-  // ✅ FIX: no \b around comma
   const hasClosing = new RegExp(`(?:^|\\n)\\s*${closingEsc}\\s*(?:\\n|$)`, "i").test(t);
 
   if (!hasClosing) {
     t = `${t}\n\n${closing}\n${name}`;
   } else {
-    // If closing exists but no name right after, add it
     const lines = t.split("\n");
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].trim().toLowerCase() === closing.toLowerCase()) {
@@ -401,27 +381,19 @@ function ensureFullLetterFormat({ letter, lang, candidateName }) {
     t = lines.join("\n");
   }
 
-  // ✅ De-dup repeated closing+name at end
   t = dedupeClosingBlockAtEnd(t, L, name);
   return t;
 }
 
-// =============================
-// ✅ Nettoyage "body LM" (anti header/greeting/signature doublés)
-// =============================
 function sanitizeLmBodyOnly(raw, lang, candidateName) {
   const L = normalizeLang(lang);
   const name = String(candidateName || "").trim();
   let t = stripMarkdownAndBullets(raw || "");
   if (!t) return "";
 
-  // supprime tags body si jamais
   t = t.replace(/<\/?body>/gi, "").trim();
-
-  // Supprime lignes d'en-tête possibles (Objet / Subject)
   t = t.replace(/^\s*(objet|subject)\s*:\s*.*$/gim, "").trim();
 
-  // Supprime salutations si présentes
   if (L === "fr") {
     t = t.replace(/^\s*madame,\s+monsieur,?\s*/i, "").trim();
     t = t.replace(/^\s*(madame|monsieur)\s*,?\s*(monsieur|madame)?\s*,?\s*$/i, "").trim();
@@ -429,7 +401,6 @@ function sanitizeLmBodyOnly(raw, lang, candidateName) {
     t = t.replace(/^\s*dear\s+.*,\s*/i, "").trim();
   }
 
-  // Supprime closing + tout ce qui suit (souvent signature)
   const closings =
     L === "fr"
       ? ["cordialement,", "bien cordialement,", "salutations,", "respectueusement,"]
@@ -440,7 +411,6 @@ function sanitizeLmBodyOnly(raw, lang, candidateName) {
     t = t.replace(new RegExp(`\\n\\s*${cEsc}[\\s\\S]*$`, "i"), "").trim();
   }
 
-  // supprime une signature finale = nom seul sur 1 ligne
   if (name) {
     const nEsc = escapeRegExp(name);
     t = t.replace(new RegExp(`\\n\\s*${nEsc}\\s*$`, "i"), "").trim();
@@ -450,19 +420,18 @@ function sanitizeLmBodyOnly(raw, lang, candidateName) {
   return t;
 }
 
-// ✅ PATCH: Nettoyage "texte brut modèle" (anti HTML/parasites + <br> + tags résiduels)
 function sanitizeLmBodyFromModel(raw) {
   if (!raw) return "";
   return String(raw)
     .replace(/\r/g, "")
-    .replace(/<br\s*\/?>/gi, "\n") // ✅ important
+    .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/?p>/gi, "")
     .replace(/<\/?body>/gi, "")
     .replace(/^\s*<body>\s*$/gim, "")
     .replace(/^\s*<\/body>\s*$/gim, "")
     .replace(/^\s*body\s*$/gim, "")
-    .replace(/<\/?[^>]+>/g, "") // ✅ supprime HTML résiduel
-    .replace(/^\s*aperçu\b.*$/gim, "") // "Aperçu de la lettre..."
+    .replace(/<\/?[^>]+>/g, "")
+    .replace(/^\s*aperçu\b.*$/gim, "")
     .replace(/\[[^\]]*\]/g, "")
     .replace(/\*+/g, "")
     .replace(/^-{2,}.*$/gmi, "")
@@ -509,16 +478,11 @@ function formatLetterDateLine({ city, lang }) {
   return c ? `${c}, ${dateEn}` : `${dateEn}`;
 }
 
-// =============================
-// ✅ Sanitize company name header (évite doublons "Service Recrutement ...")
-// =============================
 function sanitizeCompanyNameForHeader(companyName) {
   let c = String(companyName || "").replace(/\r/g, "").trim();
   if (!c) return "";
-  // supprime phrases parasites possibles
   c = c.replace(/\s+/g, " ").trim();
   c = c.replace(/^(service recrutement|recruitment team)\s*[-:|]?\s*/i, "").trim();
-  // supprime si l'utilisateur a collé deux fois
   c = c.replace(/(.+?)\s+\1$/i, "$1").trim();
   return c;
 }
@@ -537,9 +501,6 @@ function uniqueLines(lines) {
   return out;
 }
 
-// =============================
-// ✅ Compose lettre "style exemple" (en-tête + objet + salutation + body + signature)
-// =============================
 function composeFullCoverLetterDoc({ profile, jobTitle, companyName, lang, bodyOnly }) {
   const L = normalizeLang(lang);
   const p = profile || {};
@@ -550,7 +511,8 @@ function composeFullCoverLetterDoc({ profile, jobTitle, companyName, lang, bodyO
   const linkedin = String(p.linkedin || "").trim();
   const city = String(p.city || "").trim();
 
-  const compRaw = String(companyName || "").trim() || (L === "en" ? "Your company" : "Votre entreprise");
+  const compRaw =
+    String(companyName || "").trim() || (L === "en" ? "Your company" : "Votre entreprise");
   const comp = sanitizeCompanyNameForHeader(compRaw) || compRaw;
 
   const role = String(jobTitle || "").trim() || (L === "en" ? "the position" : "le poste");
@@ -566,8 +528,8 @@ function composeFullCoverLetterDoc({ profile, jobTitle, companyName, lang, bodyO
   const headerRight = headerRightLines.join("\n");
 
   const dateLine = formatLetterDateLine({ city, lang: L });
-
-  const subjectLine = L === "en" ? `Subject: Application for ${role}` : `Objet : Candidature au poste de ${role}`;
+  const subjectLine =
+    L === "en" ? `Subject: Application for ${role}` : `Objet : Candidature au poste de ${role}`;
 
   const greeting = L === "en" ? "Dear Hiring Manager," : "Madame, Monsieur,";
   const closing = L === "en" ? "Sincerely," : "Cordialement,";
@@ -599,13 +561,9 @@ function composeFullCoverLetterDoc({ profile, jobTitle, companyName, lang, bodyO
   return doc;
 }
 
-// =============================
-// ✅ Détection lettre déjà complète format "exemple"
-// =============================
 function looksLikeFormattedLetterDoc(text) {
   const t = String(text || "").trim();
   if (!t) return false;
-
   const hasSubject = /(objet\s*:|subject\s*:)/i.test(t);
   const hasGreeting = /(madame,\s+monsieur,|dear\s+)/i.test(t);
   return hasSubject && hasGreeting;
@@ -627,7 +585,6 @@ function getRecaptchaConfig() {
   const bypassRaw = cfg.bypass || process.env.RECAPTCHA_BYPASS || "false";
   const bypass = String(bypassRaw).toLowerCase() === "true";
 
-  // ✅ action strict toggle (par défaut OFF pour éviter les 403)
   const strictActionRaw = cfg.strict_action || process.env.RECAPTCHA_STRICT_ACTION || "false";
   const strictAction = String(strictActionRaw).toLowerCase() === "true";
 
@@ -688,17 +645,20 @@ async function requireFirebaseUser(req) {
   try {
     const decoded = await admin.auth().verifyIdToken(token);
     return { uid: decoded.uid, email: decoded.email || "" };
-  } catch (e) {
+  } catch {
     const err = new Error("INVALID_AUTH");
     err.code = "INVALID_AUTH";
     throw err;
   }
 }
 
+/**
+ * ✅ PATCH reCAPTCHA : on remonte aussi hostname + action
+ */
 async function verifyRecaptchaToken({ token, expectedAction, req }) {
   const { projectId, siteKey, threshold, bypass, strictAction } = getRecaptchaConfig();
 
-  // ✅ bypass en dev/emulator
+  // bypass en dev/emulator
   if (bypass && (isEmulator() || process.env.NODE_ENV !== "production")) {
     return { ok: true, bypass: true, score: null, threshold };
   }
@@ -730,15 +690,18 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
     const [response] = await recaptchaClient.createAssessment(request);
 
     const tokenProps = response && response.tokenProperties;
+
     if (!tokenProps || tokenProps.valid !== true) {
       return {
         ok: false,
         reason: "invalid_token",
         invalidReason: tokenProps ? tokenProps.invalidReason : null,
+        hostname: tokenProps ? tokenProps.hostname : null,
+        action: tokenProps ? tokenProps.action : null,
       };
     }
 
-    // ✅ action mismatch : bloquant seulement si strictAction=true
+    // action mismatch : bloquant seulement si strictAction=true
     if (expectedAction && tokenProps.action && String(tokenProps.action) !== String(expectedAction)) {
       if (strictAction) {
         return {
@@ -746,6 +709,8 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
           reason: "action_mismatch",
           got: tokenProps.action,
           expected: expectedAction,
+          hostname: tokenProps.hostname || null,
+          action: tokenProps.action || null,
         };
       }
       console.warn("reCAPTCHA action mismatch (non bloquant):", {
@@ -760,10 +725,23 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
         : null;
 
     if (typeof score === "number" && score < threshold) {
-      return { ok: false, reason: "low_score", score, threshold };
+      return {
+        ok: false,
+        reason: "low_score",
+        score,
+        threshold,
+        hostname: tokenProps.hostname || null,
+        action: tokenProps.action || null,
+      };
     }
 
-    return { ok: true, score, threshold };
+    return {
+      ok: true,
+      score,
+      threshold,
+      hostname: tokenProps.hostname || null,
+      action: tokenProps.action || null,
+    };
   } catch (err) {
     console.error("Erreur reCAPTCHA Enterprise:", err);
     return { ok: false, reason: "recaptcha_error" };
@@ -771,11 +749,9 @@ async function verifyRecaptchaToken({ token, expectedAction, req }) {
 }
 
 async function enforceRecaptchaOrReturn(req, res, expectedAction) {
-  // ✅ Bypass si l'utilisateur est authentifié (réduit les 403 en prod)
+  // ✅ Bypass si l'utilisateur est authentifié
   const authed = await tryFirebaseUser(req);
-  if (authed && authed.uid) {
-    return null;
-  }
+  if (authed && authed.uid) return null;
 
   const token =
     (req.body && (req.body.recaptchaToken || req.body.token)) ||
@@ -783,7 +759,8 @@ async function enforceRecaptchaOrReturn(req, res, expectedAction) {
     req.headers["x-recaptchatoken"] ||
     "";
 
-  const actionFromBody = (req.body && (req.body.recaptchaAction || req.body.actionRecaptcha || req.body.action)) || "";
+  const actionFromBody =
+    (req.body && (req.body.recaptchaAction || req.body.actionRecaptcha || req.body.action)) || "";
 
   const action = expectedAction || actionFromBody || "";
 
@@ -908,7 +885,6 @@ exports.adminUpdateCredits = functions
     }
 
     const userRef = db.collection("users").doc(userId);
-
     await userRef.set({ credits, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 
     return { success: true, userId, credits };
@@ -953,7 +929,7 @@ function extractFirstJsonBlock(s) {
 
 function repairJsonString(s) {
   let t = normalizeSmartQuotes(s);
-  t = t.replace(/,\s*([}\]])/g, "$1"); // trailing commas
+  t = t.replace(/,\s*([}\]])/g, "$1");
   return t.trim();
 }
 
@@ -1214,45 +1190,6 @@ RÈGLES IMPORTANTES :
 }
 
 // =============================
-// extractProfile (reCAPTCHA ou auth bypass)
-// =============================
-exports.extractProfile = functions
-  .runWith({ secrets: ["GEMINI_API_KEY"] })
-  .region("europe-west1")
-  .https.onRequest(async (req, res) => {
-    setCors(req, res);
-
-    if (req.method === "OPTIONS") return res.status(204).send("");
-    if (req.method !== "POST") return res.status(405).json({ error: "Méthode non autorisée" });
-    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
-
-    const deny = await enforceRecaptchaOrReturn(req, res, "extract_profile");
-    if (deny) return;
-
-    try {
-      const base64Pdf = req.body?.base64Pdf;
-      if (!base64Pdf) return res.status(400).json({ error: "Champ 'base64Pdf' manquant." });
-
-      const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-      if (!GEMINI_API_KEY) {
-        return res.status(500).json({
-          error: "Clé Gemini manquante côté serveur. Configure le secret GEMINI_API_KEY.",
-        });
-      }
-
-      const profile = await callGeminiWithCv(base64Pdf, GEMINI_API_KEY);
-      return res.status(200).json(profile);
-    } catch (err) {
-      console.error("Erreur analyse CV :", err);
-      const msg = String(err?.message || "");
-      return res.status(500).json({
-        error: msg.startsWith("Erreur Gemini:") ? msg : "Erreur pendant l'analyse du CV.",
-      });
-    }
-  });
-
-// =============================
 // Build profile context for IA
 // =============================
 function buildProfileContextForIA(profile) {
@@ -1455,19 +1392,17 @@ async function createSimpleCvPdf(profile, options) {
     }
   }
 
-  // Header
   drawLine(p.fullName || "", 16, true);
-  const jobLine = targetJob || contract || p.contractType || (lang === "en" ? "Target position" : "Poste recherché");
+  const jobLine =
+    targetJob || contract || p.contractType || (lang === "en" ? "Target position" : "Poste recherché");
   drawLine(jobLine, 11, false);
 
   const contactParts = [p.email || "", p.phone || "", p.city || "", p.linkedin || ""].filter(Boolean);
   if (contactParts.length) drawLine(contactParts.join(" · "), 9, false);
-
   if (jobLink) drawLine((lang === "en" ? "Job link: " : "Lien de l'offre : ") + jobLink, 8, false);
 
   y -= 6;
 
-  // Tailored summary first (if any), else profile summary
   const summaryToUse = tailoredSummary || p.profileSummary;
   if (summaryToUse) {
     drawSectionTitle(lang === "en" ? "Profile" : "Profil");
@@ -1534,7 +1469,6 @@ async function createSimpleCvPdf(profile, options) {
 async function createLetterPdf(coverLetterFull, meta) {
   const { jobTitle = "", companyName = "", candidateName = "", lang = "fr" } = meta || {};
 
-  // ✅ dédup final avant rendu
   let letterText = String(coverLetterFull || "").trim();
   letterText = dedupeClosingBlockAtEnd(letterText, lang, candidateName);
 
@@ -1723,6 +1657,44 @@ function buildFallbackLetterAndPitchBody(profile, jobTitle, companyName, jobDesc
 }
 
 // =============================
+// extractProfile (PDF base64) ✅
+// =============================
+exports.extractProfile = functions
+  .runWith({ secrets: ["GEMINI_API_KEY"] })
+  .region("europe-west1")
+  .https.onRequest(async (req, res) => {
+    setCors(req, res);
+
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Méthode non autorisée" });
+    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
+
+    const deny = await enforceRecaptchaOrReturn(req, res, "extract_profile");
+    if (deny) return;
+
+    try {
+      const base64Pdf = req.body?.base64Pdf;
+      if (!base64Pdf) return res.status(400).json({ error: "Champ 'base64Pdf' manquant." });
+
+      const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+      if (!GEMINI_API_KEY) {
+        return res.status(500).json({
+          error: "Clé Gemini manquante côté serveur. Configure le secret GEMINI_API_KEY.",
+        });
+      }
+
+      const profile = await callGeminiWithCv(base64Pdf, GEMINI_API_KEY);
+      return res.status(200).json(profile);
+    } catch (err) {
+      console.error("Erreur analyse CV :", err);
+      const msg = String(err?.message || "");
+      return res.status(500).json({
+        error: msg.startsWith("Erreur Gemini:") ? msg : "Erreur pendant l'analyse du CV.",
+      });
+    }
+  });
+
+// =============================
 // generateLetterAndPitch ✅ (IA JSON strict + bodyOnly + lettre format exemple)
 // =============================
 exports.generateLetterAndPitch = functions
@@ -1736,7 +1708,6 @@ exports.generateLetterAndPitch = functions
     if (!req.is("application/json"))
       return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
-    // ✅ PATCH: reCAPTCHA sur cet endpoint aussi (bypass auto si user authentifié)
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_letter_pitch");
     if (deny) return;
 
@@ -1779,21 +1750,18 @@ exports.generateLetterAndPitch = functions
 
       try {
         const parsed = await callGeminiJson(prompt, GEMINI_API_KEY, 0.55, 1800);
-
         coverLetterBody = typeof parsed?.coverLetterBody === "string" ? parsed.coverLetterBody.trim() : "";
         pitch = typeof parsed?.pitch === "string" ? parsed.pitch.trim() : "";
       } catch (e) {
         console.error("Gemini JSON letter/pitch failed:", e?.message || e);
       }
 
-      // fallback si IA KO
       if (!coverLetterBody || !pitch) {
         const fb = buildFallbackLetterAndPitchBody(profile, jobTitle, companyName, jobDescription, lang);
         if (!coverLetterBody) coverLetterBody = fb.body;
         if (!pitch) pitch = fb.pitch;
       }
 
-      // Nettoyage robuste
       const cleanedFromModel = sanitizeLmBodyFromModel(coverLetterBody);
       const bodyOnly = sanitizeLmBodyOnly(cleanedFromModel, lang, profile?.fullName || "");
 
@@ -1801,7 +1769,6 @@ exports.generateLetterAndPitch = functions
         return res.status(502).json({ error: "AI_EMPTY", message: "Lettre vide après nettoyage." });
       }
 
-      // ✅ Lettre complète format exemple (identique attendu côté PDF)
       const coverLetter = composeFullCoverLetterDoc({
         profile,
         jobTitle,
@@ -1812,9 +1779,7 @@ exports.generateLetterAndPitch = functions
 
       return res.status(200).json({
         lang,
-        // ✅ renvoie le body SEUL pour édition front (recommandé)
         letterBody: bodyOnly,
-        // ✅ renvoie aussi la lettre complète pour compat
         coverLetter,
         pitch,
       });
@@ -1824,20 +1789,6 @@ exports.generateLetterAndPitch = functions
     }
   });
 
-/* =============================
-   ✅ LE RESTE DE TON FICHIER EST IDENTIQUE À TA VERSION
-   (interview, generateInterviewQA, credits/logs, recaptchaVerify, generateCvPdf,
-    generateCvLmZip, generateLetterPdf, jobs, polarCheckout, polarWebhook)
-   ============================= */
-
-/**
- * NOTE:
- * Tu peux conserver EXACTEMENT la suite de ton index.js comme tu l'avais.
- * Si tu veux que je te recolle aussi TOUTE la fin (Polar/Webhook/etc.) dans ce même bloc,
- * dis juste "COLLE LA SUITE" et je te la poste d’un coup (sans rien changer).
- *
- * Ici je m’arrête volontairement pour éviter une réponse tronquée par la limite de chat.
- */
 // =============================
 // Interview (simulation) ✅ IA
 // =============================
@@ -1950,9 +1901,7 @@ exports.interview = functions
       const action = body.action;
 
       if (!action)
-        return res
-          .status(400)
-          .json({ error: "Champ 'action' manquant ('start' ou 'answer')." });
+        return res.status(400).json({ error: "Champ 'action' manquant ('start' ou 'answer')." });
 
       const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
@@ -1965,8 +1914,7 @@ exports.interview = functions
 
         if (!userId) return res.status(400).json({ error: "Champ 'userId' manquant." });
 
-        const totalQuestions =
-          INTERVIEW_QUESTION_PLAN[interviewMode] || INTERVIEW_QUESTION_PLAN.complet;
+        const totalQuestions = INTERVIEW_QUESTION_PLAN[interviewMode] || INTERVIEW_QUESTION_PLAN.complet;
         const sessionId = createInterviewSessionId();
         const nowIso = new Date().toISOString();
 
@@ -1996,19 +1944,12 @@ exports.interview = functions
           if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY manquante");
 
           const prompt = buildInterviewPrompt(session, null);
-          const raw = await callGeminiText(
-            prompt,
-            GEMINI_API_KEY,
-            0.6,
-            1200,
-            "application/json"
-          );
+          const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.6, 1200, "application/json");
 
           const parsed = extractInterviewJson(raw) || {};
           if (typeof parsed.next_question === "string" && parsed.next_question.trim())
             nextQuestion = parsed.next_question.trim();
-          if (typeof parsed.short_analysis === "string")
-            shortAnalysis = parsed.short_analysis.trim();
+          if (typeof parsed.short_analysis === "string") shortAnalysis = parsed.short_analysis.trim();
           if (typeof parsed.final_summary === "string" && parsed.final_summary.trim())
             finalSummary = parsed.final_summary.trim();
           if (typeof parsed.final_score === "number" || typeof parsed.final_score === "string") {
@@ -2024,8 +1965,7 @@ exports.interview = functions
             ? `Bonjour ! Pour commencer, pouvez-vous vous présenter et m'expliquer pourquoi vous ciblez le poste de ${jobTitle} ?`
             : "Bonjour ! Pour commencer, pouvez-vous vous présenter en quelques phrases ?";
           if (!shortAnalysis)
-            shortAnalysis =
-              "Mode dégradé sans analyse IA détaillée (erreur ou quota Gemini).";
+            shortAnalysis = "Mode dégradé sans analyse IA détaillée (erreur ou quota Gemini).";
         }
 
         session.history.push({ role: "interviewer", text: nextQuestion, createdAt: nowIso });
@@ -2059,8 +1999,7 @@ exports.interview = functions
         const session = interviewSessions.get(sessionId);
         if (!session) {
           return res.status(404).json({
-            error:
-              "Session d'entretien introuvable ou expirée (instance de fonction différente).",
+            error: "Session d'entretien introuvable ou expirée (instance de fonction différente).",
           });
         }
 
@@ -2089,19 +2028,12 @@ exports.interview = functions
           if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY manquante");
 
           const prompt = buildInterviewPrompt(session, userMessage);
-          const raw = await callGeminiText(
-            prompt,
-            GEMINI_API_KEY,
-            0.6,
-            1200,
-            "application/json"
-          );
+          const raw = await callGeminiText(prompt, GEMINI_API_KEY, 0.6, 1200, "application/json");
 
           const parsed = extractInterviewJson(raw) || {};
           if (typeof parsed.next_question === "string" && parsed.next_question.trim())
             nextQuestion = parsed.next_question.trim();
-          if (typeof parsed.short_analysis === "string")
-            shortAnalysis = parsed.short_analysis.trim();
+          if (typeof parsed.short_analysis === "string") shortAnalysis = parsed.short_analysis.trim();
           if (typeof parsed.final_summary === "string" && parsed.final_summary.trim())
             finalSummary = parsed.final_summary.trim();
           if (typeof parsed.final_score === "number" || typeof parsed.final_score === "string") {
@@ -2112,8 +2044,7 @@ exports.interview = functions
           console.error("Erreur Gemini (interview/answer):", err);
         }
 
-        const isLastStep =
-          session.currentStep >= (session.totalQuestions || INTERVIEW_QUESTION_PLAN.complet);
+        const isLastStep = session.currentStep >= (session.totalQuestions || INTERVIEW_QUESTION_PLAN.complet);
 
         if (!nextQuestion && !finalSummary) {
           if (isLastStep) {
@@ -2123,8 +2054,7 @@ exports.interview = functions
           } else {
             nextQuestion =
               "Merci pour ta réponse. Peux-tu me donner un exemple encore plus concret en lien avec ce poste ?";
-            shortAnalysis =
-              shortAnalysis || "Mode dégradé sans analyse IA détaillée (erreur ou quota Gemini).";
+            shortAnalysis = shortAnalysis || "Mode dégradé sans analyse IA détaillée (erreur ou quota Gemini).";
           }
         }
 
@@ -2160,12 +2090,10 @@ exports.interview = functions
   });
 
 // =============================
-// generateInterviewQA ✅ IA (inchangé)
+// generateInterviewQA ✅ IA
 // =============================
 function buildFallbackQuestions(lang, role, company, city, dates, bullets) {
-  const missions = (Array.isArray(bullets) ? bullets : [])
-    .filter((b) => typeof b === "string")
-    .slice(0, 3);
+  const missions = (Array.isArray(bullets) ? bullets : []).filter((b) => typeof b === "string").slice(0, 3);
 
   if (lang === "en") {
     return [
@@ -2177,15 +2105,11 @@ function buildFallbackQuestions(lang, role, company, city, dates, bullets) {
       },
       {
         question: `Tell me about a concrete achievement in this role.`,
-        answer: missions[1]
-          ? `One strong achievement was: ${missions[1]}`
-          : `One of my main achievements was delivering key tasks with measurable impact.`,
+        answer: missions[1] ? `One strong achievement was: ${missions[1]}` : `One of my main achievements was delivering key tasks with measurable impact.`,
       },
       {
         question: `Which tools or technologies did you use most often?`,
-        answer: missions[2]
-          ? `I regularly used tools/technologies such as: ${missions[2]}.`
-          : `I used the main tools and workflows of the role on a daily basis.`,
+        answer: missions[2] ? `I regularly used tools/technologies such as: ${missions[2]}.` : `I used the main tools and workflows of the role on a daily basis.`,
       },
     ];
   }
@@ -2193,23 +2117,17 @@ function buildFallbackQuestions(lang, role, company, city, dates, bullets) {
   return [
     {
       question: `Pouvez-vous me décrire votre rôle de ${role} chez ${company} ?`,
-      answer: `Dans ce poste de ${role} chez ${company}${city ? " à " + city : ""}${
-        dates ? " (" + dates + ")" : ""
-      }, j'étais principalement en charge de ${
+      answer: `Dans ce poste de ${role} chez ${company}${city ? " à " + city : ""}${dates ? " (" + dates + ")" : ""}, j'étais principalement en charge de ${
         missions[0] || "missions clés en lien avec le poste (projets, coordination, suivi, etc.)"
       }.`,
     },
     {
       question: `Parlez-moi d'une réalisation concrète dont vous êtes fier(e).`,
-      answer: missions[1]
-        ? `Une réalisation marquante : ${missions[1]}`
-        : `Une de mes réalisations majeures a eu un impact positif mesurable sur l'équipe et/ou l'entreprise.`,
+      answer: missions[1] ? `Une réalisation marquante : ${missions[1]}` : `Une de mes réalisations majeures a eu un impact positif mesurable sur l'équipe et/ou l'entreprise.`,
     },
     {
       question: `Quels outils ou technologies utilisiez-vous le plus souvent ?`,
-      answer: missions[2]
-        ? `J'utilisais notamment ${missions[2]} au quotidien.`
-        : `J'utilisais au quotidien les principaux outils liés à ce poste.`,
+      answer: missions[2] ? `J'utilisais notamment ${missions[2]} au quotidien.` : `J'utilisais au quotidien les principaux outils liés à ce poste.`,
     },
   ];
 }
@@ -2325,7 +2243,7 @@ ${cvText}`;
   });
 
 // =============================
-// Credits / Logs (inchangé)
+// Credits / Logs
 // =============================
 function getReqPath(req) {
   try {
@@ -2335,18 +2253,7 @@ function getReqPath(req) {
   }
 }
 
-async function debitCreditsAndLog({
-  uid,
-  email,
-  cost,
-  tool,
-  docType,
-  docsGenerated,
-  cvGenerated,
-  lmGenerated,
-  req,
-  meta,
-}) {
+async function debitCreditsAndLog({ uid, email, cost, tool, docType, docsGenerated, cvGenerated, lmGenerated, req, meta }) {
   const userRef = db.collection("users").doc(uid);
   const usageRef = db.collection("usageLogs").doc();
   const now = Date.now();
@@ -2371,15 +2278,9 @@ async function debitCreditsAndLog({
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    if (docsGenerated && docsGenerated > 0) {
-      updates.totalDocumentsGenerated = admin.firestore.FieldValue.increment(docsGenerated);
-    }
-    if (cvGenerated && cvGenerated > 0) {
-      updates.totalCvGenerated = admin.firestore.FieldValue.increment(cvGenerated);
-    }
-    if (lmGenerated && lmGenerated > 0) {
-      updates.totalLmGenerated = admin.firestore.FieldValue.increment(lmGenerated);
-    }
+    if (docsGenerated && docsGenerated > 0) updates.totalDocumentsGenerated = admin.firestore.FieldValue.increment(docsGenerated);
+    if (cvGenerated && cvGenerated > 0) updates.totalCvGenerated = admin.firestore.FieldValue.increment(cvGenerated);
+    if (lmGenerated && lmGenerated > 0) updates.totalLmGenerated = admin.firestore.FieldValue.increment(lmGenerated);
 
     tx.set(userRef, updates, { merge: true });
 
@@ -2406,7 +2307,7 @@ async function debitCreditsAndLog({
 }
 
 // =============================
-// recaptchaVerify endpoint (inchangé)
+// recaptchaVerify endpoint (pour login etc.)
 // =============================
 exports.recaptchaVerify = functions
   .region("europe-west1")
@@ -2430,12 +2331,19 @@ exports.recaptchaVerify = functions
         ok: false,
         reason: result.reason || "recaptcha_failed",
         score: typeof result.score === "number" ? result.score : undefined,
+        threshold: typeof result.threshold === "number" ? result.threshold : undefined,
+        invalidReason: result.invalidReason || null,
+        hostname: result.hostname || null,
+        action: result.action || null,
+        got: result.got || undefined,
+        expected: result.expected || undefined,
       });
     }
 
     return res.status(200).json({
       ok: true,
       score: typeof result.score === "number" ? result.score : undefined,
+      threshold: typeof result.threshold === "number" ? result.threshold : undefined,
     });
   });
 
@@ -2450,8 +2358,7 @@ exports.generateCvPdf = functions
 
     if (req.method === "OPTIONS") return res.status(204).send("");
     if (req.method !== "POST") return res.status(405).json({ error: "Méthode non autorisée" });
-    if (!req.is("application/json"))
-      return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
+    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_cv_pdf");
     if (deny) return;
@@ -2535,7 +2442,7 @@ exports.generateCvPdf = functions
   });
 
 // =============================
-// generateCvLmZip ✅ (auth + credits + recaptcha) — LM via generateLetterAndPitch JSON
+// generateCvLmZip ✅ (auth + credits + recaptcha)
 // =============================
 exports.generateCvLmZip = functions
   .runWith({ secrets: ["GEMINI_API_KEY"] })
@@ -2544,8 +2451,7 @@ exports.generateCvLmZip = functions
     setCors(req, res);
 
     if (req.method === "OPTIONS") return res.status(204).send("");
-    if (!req.is("application/json"))
-      return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
+    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_cv_lm_zip");
     if (deny) return;
@@ -2593,7 +2499,6 @@ exports.generateCvLmZip = functions
 
       const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-      // CV tailor
       let tailoredSummary = "";
       let tailoredKeySkills = [];
       if (GEMINI_API_KEY && (targetJob || jobDescription)) {
@@ -2630,7 +2535,6 @@ exports.generateCvLmZip = functions
       const lmJobDescription = sanitizeJobDescription(lm.jobDescription || jobDescription || "");
       const lmLang = normalizeLang(lm.lang || lang);
 
-      // ✅ Génère body+pitch via JSON strict
       const cvText = buildProfileContextForIA(profile);
       const prompt = buildLetterAndPitchPrompt({
         lang: lmLang,
@@ -2648,11 +2552,7 @@ exports.generateCvLmZip = functions
       }
 
       let coverBody = parsed && typeof parsed.coverLetterBody === "string" ? parsed.coverLetterBody : "";
-      coverBody = sanitizeLmBodyOnly(
-        sanitizeLmBodyFromModel(coverBody),
-        lmLang,
-        profile.fullName || ""
-      );
+      coverBody = sanitizeLmBodyOnly(sanitizeLmBodyFromModel(coverBody), lmLang, profile.fullName || "");
       if (!coverBody) {
         const fb = buildFallbackLetterAndPitchBody(profile, jobTitle, companyName, lmJobDescription, lmLang);
         coverBody = fb.body;
@@ -2689,7 +2589,7 @@ exports.generateCvLmZip = functions
   });
 
 // =============================
-// generateLetterPdf ✅ (recaptcha) — respect format exemple + dedupe
+// generateLetterPdf ✅ (recaptcha)
 // =============================
 exports.generateLetterPdf = functions
   .region("europe-west1")
@@ -2697,8 +2597,7 @@ exports.generateLetterPdf = functions
     setCors(req, res);
 
     if (req.method === "OPTIONS") return res.status(204).send("");
-    if (!req.is("application/json"))
-      return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
+    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
     const deny = await enforceRecaptchaOrReturn(req, res, "generate_letter_pdf");
     if (deny) return;
@@ -2711,16 +2610,11 @@ exports.generateLetterPdf = functions
       const candidateName = (body.candidateName || "").toString().trim();
       const lang = normalizeLang(body.lang || "fr");
 
-      if (!coverLetterRaw)
-        return res.status(400).json({ error: "Champ 'coverLetter' manquant ou vide." });
+      if (!coverLetterRaw) return res.status(400).json({ error: "Champ 'coverLetter' manquant ou vide." });
 
       const coverLetterFull = looksLikeFormattedLetterDoc(coverLetterRaw)
         ? coverLetterRaw
-        : ensureFullLetterFormat({
-            letter: coverLetterRaw,
-            lang,
-            candidateName,
-          });
+        : ensureFullLetterFormat({ letter: coverLetterRaw, lang, candidateName });
 
       const pdfBuffer = await createLetterPdf(coverLetterFull, {
         jobTitle,
@@ -2729,15 +2623,9 @@ exports.generateLetterPdf = functions
         lang,
       });
 
-      const safeJob = jobTitle
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "");
-
+      const safeJob = jobTitle.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
       const filename =
-        (lang === "en" ? "cover-letter" : "lettre-motivation") +
-        (safeJob ? `-${safeJob}` : "") +
-        ".pdf";
+        (lang === "en" ? "cover-letter" : "lettre-motivation") + (safeJob ? `-${safeJob}` : "") + ".pdf";
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
@@ -2749,7 +2637,7 @@ exports.generateLetterPdf = functions
   });
 
 // =============================
-// jobs (Adzuna) — inchangé
+// jobs (Adzuna)
 // =============================
 exports.jobs = functions
   .region("europe-west1")
@@ -2757,8 +2645,7 @@ exports.jobs = functions
     setCors(req, res);
 
     if (req.method === "OPTIONS") return res.status(204).send("");
-    if (!req.is("application/json"))
-      return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
+    if (!req.is("application/json")) return res.status(400).json({ error: "Content-Type invalide. Envoie du JSON." });
 
     const deny = await enforceRecaptchaOrReturn(req, res, "jobs_search");
     if (deny) return;
@@ -2775,13 +2662,10 @@ exports.jobs = functions
         return res.status(400).json({ error: "Ajoute au moins un mot-clé (query) ou un lieu (location)." });
       }
 
-      const ADZUNA_APP_ID =
-        (functions.config().adzuna && functions.config().adzuna.app_id) || process.env.ADZUNA_APP_ID;
-      const ADZUNA_APP_KEY =
-        (functions.config().adzuna && functions.config().adzuna.app_key) || process.env.ADZUNA_APP_KEY;
+      const ADZUNA_APP_ID = (functions.config().adzuna && functions.config().adzuna.app_id) || process.env.ADZUNA_APP_ID;
+      const ADZUNA_APP_KEY = (functions.config().adzuna && functions.config().adzuna.app_key) || process.env.ADZUNA_APP_KEY;
 
-      if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY)
-        return res.status(500).json({ error: "Clés Adzuna manquantes côté serveur." });
+      if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY) return res.status(500).json({ error: "Clés Adzuna manquantes côté serveur." });
 
       const page =
         typeof pageRaw === "number" && pageRaw > 0
@@ -2818,16 +2702,12 @@ exports.jobs = functions
         return {
           id: job.id || `job-${index}`,
           title: job.title || "Offre sans titre",
-          company:
-            job.company && job.company.display_name ? job.company.display_name : "Entreprise non renseignée",
-          location:
-            job.location && job.location.display_name ? job.location.display_name : "Lieu non précisé",
+          company: job.company && job.company.display_name ? job.company.display_name : "Entreprise non renseignée",
+          location: job.location && job.location.display_name ? job.location.display_name : "Lieu non précisé",
           url: job.redirect_url || "",
           description: job.description || "",
           created: job.created || "",
-          salary: hasSalary
-            ? `${salaryMin.toLocaleString("fr-FR")} – ${salaryMax.toLocaleString("fr-FR")} €`
-            : null,
+          salary: hasSalary ? `${salaryMin.toLocaleString("fr-FR")} – ${salaryMax.toLocaleString("fr-FR")} €` : null,
         };
       });
 
@@ -2839,7 +2719,7 @@ exports.jobs = functions
   });
 
 // =============================
-// Polar checkout + webhook — inchangé (collé tel quel)
+// Polar checkout + webhook
 // =============================
 const POLAR_ACCESS_TOKEN_BOOT =
   process.env.POLAR_ACCESS_TOKEN || (functions.config().polar && functions.config().polar.access_token);
@@ -2875,8 +2755,7 @@ exports.polarCheckout = functions
       const polarAccessToken =
         process.env.POLAR_ACCESS_TOKEN || (functions.config().polar && functions.config().polar.access_token);
 
-      const polarEnv =
-        process.env.POLAR_ENV || (functions.config().polar && functions.config().polar.env) || "sandbox";
+      const polarEnv = process.env.POLAR_ENV || (functions.config().polar && functions.config().polar.env) || "sandbox";
 
       const product20 =
         process.env.POLAR_PRODUCT_20_ID || (functions.config().polar && functions.config().polar.product_20_id);
@@ -2885,8 +2764,7 @@ exports.polarCheckout = functions
       const product100 =
         process.env.POLAR_PRODUCT_100_ID || (functions.config().polar && functions.config().polar.product_100_id);
 
-      if (!polarAccessToken)
-        return res.status(500).json({ ok: false, error: "Configuration Polar manquante côté serveur." });
+      if (!polarAccessToken) return res.status(500).json({ ok: false, error: "Configuration Polar manquante côté serveur." });
 
       const server = polarEnv === "production" ? "production" : "sandbox";
       const polar = new Polar({ accessToken: polarAccessToken, server });
@@ -2924,8 +2802,7 @@ exports.polarCheckout = functions
 
       const checkout = await polar.checkouts.create(payload);
 
-      if (!checkout || !checkout.url)
-        return res.status(500).json({ ok: false, error: "Checkout Polar créé mais URL manquante." });
+      if (!checkout || !checkout.url) return res.status(500).json({ ok: false, error: "Checkout Polar créé mais URL manquante." });
 
       try {
         const checkoutId = checkout.id ? String(checkout.id) : null;
@@ -3026,8 +2903,7 @@ exports.polarWebhook = functions
       const event = req.body || {};
       console.log("Webhook Polar reçu :", JSON.stringify(event, null, 2));
 
-      if (!event || !event.type)
-        return res.status(400).json({ ok: false, error: "Event Polar invalide (type manquant)." });
+      if (!event || !event.type) return res.status(400).json({ ok: false, error: "Event Polar invalide (type manquant)." });
       if (event.type !== "order.paid") return res.status(200).json({ ok: true, ignored: true });
 
       const product20 =
@@ -3132,8 +3008,7 @@ exports.polarWebhook = functions
         }
       }
 
-      if (!userId)
-        return res.status(200).json({ ok: true, ignored: true, reason: "userId introuvable" });
+      if (!userId) return res.status(200).json({ ok: true, ignored: true, reason: "userId introuvable" });
 
       const orderId = (data && (data.id || data.order_id || data.orderId)) || event.id || null;
       const ledgerRef = orderId ? db.collection("polar_orders").doc(String(orderId)) : null;
@@ -3151,11 +3026,7 @@ exports.polarWebhook = functions
 
         const newCredits = currentCredits + creditsToAdd;
 
-        tx.set(
-          userRef,
-          { credits: newCredits, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-          { merge: true }
-        );
+        tx.set(userRef, { credits: newCredits, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 
         if (ledgerRef) {
           tx.set(ledgerRef, {

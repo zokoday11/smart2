@@ -11,7 +11,14 @@ export type CvTemplateId =
   | "creative"
   | "elegant"
   | "tech"
-  | "pro_max";
+  | "pro_max"
+  // ✅ nouveaux
+  | "executive"
+  | "startup"
+  | "two_column"
+  | "elegant_color"
+  | "academic"
+  | "sales";
 
 export type PdfColorsLike = Record<string, string | undefined> & {
   brand?: string;
@@ -27,7 +34,7 @@ export type CvTemplateMeta = {
   id: CvTemplateId;
   label: string;
   description: string;
-  previewSrc: string; // ex: "/cv-templates/cv-template-modern.png"
+  previewSrc: string;
   badge?: string;
 };
 
@@ -86,6 +93,46 @@ export const CV_TEMPLATES: CvTemplateMeta[] = [
     previewSrc: "/cv-templates/cv-template-pro-max.png",
     badge: "Nouveau",
   },
+
+  // ✅ NOUVEAUX TEMPLATES
+  {
+    id: "executive",
+    label: "Executive",
+    description: "Sobriété premium, sidebar douce, parfait corporate / direction.",
+    previewSrc: "/cv-templates/cv-template-executive.png",
+    badge: "Nouveau",
+  },
+  {
+    id: "startup",
+    label: "Startup",
+    description: "Header impactant, sections dynamiques, look moderne startup.",
+    previewSrc: "/cv-templates/cv-template-startup.png",
+    badge: "Nouveau",
+  },
+  {
+    id: "two_column",
+    label: "Two-Column",
+    description: "Équilibré en 2 colonnes, très lisible, polyvalent.",
+    previewSrc: "/cv-templates/cv-template-two-column.png",
+  },
+  {
+    id: "elegant_color",
+    label: "Elegant Color",
+    description: "Version élégante avec touches de couleur plus visibles.",
+    previewSrc: "/cv-templates/cv-template-elegant-color.png",
+  },
+  {
+    id: "academic",
+    label: "Academic",
+    description: "Recherche/enseignement : publications, projets, sections académiques.",
+    previewSrc: "/cv-templates/cv-template-academic.png",
+  },
+  {
+    id: "sales",
+    label: "Sales (KPIs)",
+    description: "Orienté business : KPIs / résultats mis en avant.",
+    previewSrc: "/cv-templates/cv-template-sales.png",
+  },
 ];
 
 // utilisé par l’UI
@@ -137,14 +184,14 @@ function joinDot(list: string[] | undefined, maxChars = 80): string {
   return out.join(" • ");
 }
 
-function hr(scale: number, color: string) {
+function hr(scale: number, color: string, w = 515) {
   return {
     canvas: [
       {
         type: "line",
         x1: 0,
         y1: 0,
-        x2: 515,
+        x2: w,
         y2: 0,
         lineWidth: 0.6,
         lineColor: color,
@@ -162,6 +209,29 @@ function sectionTitle(label: string, scale: number, color: string) {
     color,
     margin: [0, 4 * scale, 0, 3 * scale],
   };
+}
+
+function sectionTitleAccent(label: string, scale: number, brand: string) {
+  return {
+    text: label,
+    fontSize: 10.5 * scale,
+    bold: true,
+    color: brand,
+    margin: [0, 6 * scale, 0, 3 * scale],
+  };
+}
+
+function normalizeLines(v: unknown, max = 6): string[] {
+  if (Array.isArray(v)) {
+    return (v as unknown as string[]).map(safeText).filter(Boolean).slice(0, max);
+  }
+  const one = safeText(v);
+  if (!one) return [];
+  return one
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(0, max);
 }
 
 function collectSkills(model: CvDocModel): string[] {
@@ -187,13 +257,7 @@ function renderXp(model: CvDocModel, scale: number, ink: string, muted: string) 
   const xpArr: CvDocModel["xp"] = Array.isArray(xpRaw) ? (xpRaw as CvDocModel["xp"]) : [];
 
   if (!xpArr.length) {
-    return [
-      {
-        text: "—",
-        fontSize: 9 * scale,
-        color: muted,
-      },
-    ];
+    return [{ text: "—", fontSize: 9 * scale, color: muted }];
   }
 
   return xpArr.map((x: CvDocModel["xp"][number]) => {
@@ -261,16 +325,10 @@ function renderEducation(model: CvDocModel, scale: number, ink: string, muted: s
   }
 
   if (!eduArr.length) {
-    return [
-      {
-        text: "—",
-        fontSize: 9 * scale,
-        color: muted,
-      },
-    ];
+    return [{ text: "—", fontSize: 9 * scale, color: muted }];
   }
 
-  return eduArr.slice(0, 4).map((line: string) => ({
+  return eduArr.slice(0, 5).map((line: string) => ({
     text: line,
     fontSize: 9 * scale,
     color: ink,
@@ -312,23 +370,16 @@ function baseDocDefinition(
 }
 
 // ----------------------------------------------------
-// Templates
+// Templates existants
 // ----------------------------------------------------
 
 function buildClassic(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
   const L = normLang(lang);
-  const brand = pick(colors, "brand", "#ef4444");
   const ink = pick(colors, "ink", "#111827");
   const muted = pick(colors, "muted", "#6b7280");
   const line = pick(colors, "line", "#e5e7eb");
 
-  const doc = baseDocDefinition(model, colors, scale, [
-    34 * scale,
-    30 * scale,
-    34 * scale,
-    26 * scale,
-  ]);
-
+  const doc = baseDocDefinition(model, colors, scale, [34 * scale, 30 * scale, 34 * scale, 26 * scale]);
   const leftWidth = 170 * scale;
 
   const skills = collectSkills(model);
@@ -338,15 +389,8 @@ function buildClassic(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scal
       {
         width: leftWidth,
         stack: [
-          {
-            text: safeText(model.name),
-            style: "name",
-          },
-          {
-            text: safeText((model as any).title),
-            style: "title",
-            margin: [0, 2 * scale, 0, 0],
-          },
+          { text: safeText(model.name), style: "name" },
+          { text: safeText((model as any).title), style: "title", margin: [0, 2 * scale, 0, 0] },
           {
             text: safeText((model as any).contactLine ?? (model as any).contact),
             style: "contact",
@@ -355,28 +399,13 @@ function buildClassic(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scal
           hr(scale, line),
 
           sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
-          {
-            text: joinDot(skills, 120),
-            fontSize: 9 * scale,
-            color: muted,
-            margin: [0, 2 * scale, 0, 6 * scale],
-          },
+          { text: joinDot(skills, 120), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 6 * scale] },
 
           sectionTitle(L === "en" ? "Languages" : "Langues", scale, ink),
-          {
-            text: safeText((model as any).langLine),
-            fontSize: 9 * scale,
-            color: muted,
-            margin: [0, 2 * scale, 0, 6 * scale],
-          },
+          { text: safeText((model as any).langLine), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 6 * scale] },
 
           sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
-          {
-            text: joinDot((model as any).hobbies as string[] | undefined, 120),
-            fontSize: 9 * scale,
-            color: muted,
-            margin: [0, 2 * scale, 0, 0],
-          },
+          { text: joinDot((model as any).hobbies as string[] | undefined, 120), fontSize: 9 * scale, color: muted },
         ],
       },
       {
@@ -394,24 +423,15 @@ function buildClassic(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scal
           hr(scale, line),
 
           sectionTitle(L === "en" ? "Experience" : "Expérience professionnelle", scale, ink),
-          {
-            stack: renderXp(model, scale, ink, muted),
-          },
+          { stack: renderXp(model, scale, ink, muted) },
 
           hr(scale, line),
 
           sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
-          {
-            stack: renderEducation(model, scale, ink, muted),
-          },
+          { stack: renderEducation(model, scale, ink, muted) },
 
           sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
-          {
-            text: safeText((model as any).certs),
-            fontSize: 9 * scale,
-            color: ink,
-            margin: [0, 2 * scale, 0, 0],
-          },
+          { text: safeText((model as any).certs), fontSize: 9 * scale, color: ink, margin: [0, 2 * scale, 0, 0] },
         ],
       },
     ],
@@ -426,57 +446,27 @@ function buildModern(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale
   const brand = pick(colors, "brand", "#2563eb");
   const ink = pick(colors, "ink", "#0f172a");
   const muted = pick(colors, "muted", "#6b7280");
-  const line = pick(colors, "line", "#e5e7eb");
   const bgSoft = pick(colors, "bgSoft", "#eff6ff");
 
-  const doc = baseDocDefinition(model, colors, scale, [
-    30 * scale,
-    28 * scale,
-    30 * scale,
-    28 * scale,
-  ]);
-
+  const doc = baseDocDefinition(model, colors, scale, [30 * scale, 28 * scale, 30 * scale, 28 * scale]);
   const skills = collectSkills(model);
 
   (doc.content as any[]).push(
     {
-      // Header bande colorée
       table: {
         widths: ["*", "*"],
         body: [
           [
             {
               stack: [
-                {
-                  text: safeText(model.name),
-                  fontSize: 20 * scale,
-                  bold: true,
-                  color: ink,
-                },
-                {
-                  text: safeText((model as any).title),
-                  fontSize: 11 * scale,
-                  bold: true,
-                  color: brand,
-                  margin: [0, 2 * scale, 0, 0],
-                },
+                { text: safeText(model.name), fontSize: 20 * scale, bold: true, color: ink },
+                { text: safeText((model as any).title), fontSize: 11 * scale, bold: true, color: brand, margin: [0, 2 * scale, 0, 0] },
               ],
             },
             {
               stack: [
-                {
-                  text: safeText((model as any).contactLine ?? (model as any).contact),
-                  fontSize: 9 * scale,
-                  color: muted,
-                  alignment: "right",
-                },
-                {
-                  text: safeText((model as any).langLine),
-                  fontSize: 9 * scale,
-                  color: muted,
-                  alignment: "right",
-                  margin: [0, 2 * scale, 0, 0],
-                },
+                { text: safeText((model as any).contactLine ?? (model as any).contact), fontSize: 9 * scale, color: muted, alignment: "right" },
+                { text: safeText((model as any).langLine), fontSize: 9 * scale, color: muted, alignment: "right", margin: [0, 2 * scale, 0, 0] },
               ],
             },
           ],
@@ -486,25 +476,16 @@ function buildModern(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale
       fillColor: bgSoft,
       margin: [-6 * scale, -6 * scale, -6 * scale, 10 * scale],
     },
-
     {
       columns: [
         {
           width: "*",
           stack: [
             sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
-            {
-              text: safeText((model as any).profile),
-              fontSize: 9.5 * scale,
-              color: ink,
-              margin: [0, 2 * scale, 0, 6 * scale],
-              alignment: "justify",
-            },
+            { text: safeText((model as any).profile), fontSize: 9.5 * scale, color: ink, margin: [0, 2 * scale, 0, 6 * scale], alignment: "justify" },
 
             sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
-            {
-              stack: renderXp(model, scale, ink, muted),
-            },
+            { stack: renderXp(model, scale, ink, muted) },
           ],
         },
         {
@@ -512,32 +493,16 @@ function buildModern(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale
           margin: [16 * scale, 0, 0, 0],
           stack: [
             sectionTitle(L === "en" ? "Key Skills" : "Compétences clés", scale, ink),
-            {
-              text: joinDot(skills, 140),
-              fontSize: 9 * scale,
-              color: muted,
-              margin: [0, 2 * scale, 0, 6 * scale],
-            },
+            { text: joinDot(skills, 140), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 6 * scale] },
 
             sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
-            {
-              stack: renderEducation(model, scale, ink, muted),
-            },
+            { stack: renderEducation(model, scale, ink, muted) },
 
             sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
-            {
-              text: safeText((model as any).certs),
-              fontSize: 9 * scale,
-              color: muted,
-              margin: [0, 2 * scale, 0, 6 * scale],
-            },
+            { text: safeText((model as any).certs), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 6 * scale] },
 
             sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
-            {
-              text: joinDot((model as any).hobbies as string[] | undefined, 140),
-              fontSize: 9 * scale,
-              color: muted,
-            },
+            { text: joinDot((model as any).hobbies as string[] | undefined, 140), fontSize: 9 * scale, color: muted },
           ],
         },
       ],
@@ -554,91 +519,44 @@ function buildMinimalist(model: CvDocModel, lang: Lang, colors: PdfColorsLike, s
   const muted = pick(colors, "muted", "#6b7280");
   const line = pick(colors, "line", "#e5e7eb");
 
-  const doc = baseDocDefinition(model, colors, scale, [
-    40 * scale,
-    32 * scale,
-    40 * scale,
-    32 * scale,
-  ]);
-
+  const doc = baseDocDefinition(model, colors, scale, [40 * scale, 32 * scale, 40 * scale, 32 * scale]);
   const skills = collectSkills(model);
 
   (doc.content as any[]).push(
-    {
-      text: safeText(model.name),
-      fontSize: 20 * scale,
-      bold: true,
-      color: ink,
-      margin: [0, 0, 0, 2 * scale],
-    },
-    {
-      text: safeText((model as any).title),
-      fontSize: 11 * scale,
-      color: muted,
-      margin: [0, 0, 0, 4 * scale],
-    },
-    {
-      text: safeText((model as any).contactLine ?? (model as any).contact),
-      fontSize: 9 * scale,
-      color: muted,
-      margin: [0, 0, 0, 8 * scale],
-    },
+    { text: safeText(model.name), fontSize: 20 * scale, bold: true, color: ink, margin: [0, 0, 0, 2 * scale] },
+    { text: safeText((model as any).title), fontSize: 11 * scale, color: muted, margin: [0, 0, 0, 4 * scale] },
+    { text: safeText((model as any).contactLine ?? (model as any).contact), fontSize: 9 * scale, color: muted, margin: [0, 0, 0, 8 * scale] },
     hr(scale, line),
     sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
-    {
-      text: safeText((model as any).profile),
-      fontSize: 9.5 * scale,
-      color: ink,
-      margin: [0, 2 * scale, 0, 6 * scale],
-      alignment: "justify",
-    },
+    { text: safeText((model as any).profile), fontSize: 9.5 * scale, color: ink, margin: [0, 2 * scale, 0, 6 * scale], alignment: "justify" },
+
     sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
-    {
-      stack: renderXp(model, scale, ink, muted),
-      margin: [0, 0, 0, 4 * scale],
-    },
+    { stack: renderXp(model, scale, ink, muted), margin: [0, 0, 0, 4 * scale] },
+
     sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
-    {
-      stack: renderEducation(model, scale, ink, muted),
-    },
+    { stack: renderEducation(model, scale, ink, muted) },
+
     sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
-    {
-      text: joinDot(skills, 160),
-      fontSize: 9 * scale,
-      color: muted,
-      margin: [0, 2 * scale, 0, 4 * scale],
-    },
+    { text: joinDot(skills, 160), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 4 * scale] },
+
     sectionTitle(L === "en" ? "Languages" : "Langues", scale, ink),
-    {
-      text: safeText((model as any).langLine),
-      fontSize: 9 * scale,
-      color: muted,
-      margin: [0, 2 * scale, 0, 4 * scale],
-    },
+    { text: safeText((model as any).langLine), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 4 * scale] },
+
     sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
-    {
-      text: joinDot((model as any).hobbies as string[] | undefined, 160),
-      fontSize: 9 * scale,
-      color: muted,
-    }
+    { text: joinDot((model as any).hobbies as string[] | undefined, 160), fontSize: 9 * scale, color: muted }
   );
 
   return doc;
 }
 
-// pour l’instant, on réutilise les layouts existants
+// les anciens "creative/elegant" réutilisent encore des bases
 function buildCreative(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  // Style plus "design" : on réutilise Modern (tu pourras raffiner plus tard)
   return buildModern(model, lang, colors, scale);
 }
-
 function buildElegant(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  // Style premium mais sobre : on part du Classic
   return buildClassic(model, lang, colors, scale);
 }
-
 function buildTech(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  // Palette plus sombre pour un look "tech"
   const overridden: PdfColorsLike = {
     ...colors,
     brand: colors.brand || "#22c55e",
@@ -649,15 +567,469 @@ function buildTech(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: 
   };
   return buildModern(model, lang, overridden, scale);
 }
-
 function buildProMax(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
-  // Version "premium" basée sur Modern, avec léger zoom
-  const overridden: PdfColorsLike = {
-    ...colors,
-    brand: colors.brand || "#0ea5e9",
-  };
+  const overridden: PdfColorsLike = { ...colors, brand: colors.brand || "#0ea5e9" };
   const boostedScale = clamp(scale * 1.02, 0.75, 1.6);
   return buildModern(model, lang, overridden, boostedScale);
+}
+
+// ----------------------------------------------------
+// ✅ NOUVEAUX TEMPLATES (6)
+// ----------------------------------------------------
+
+function buildExecutive(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  const L = normLang(lang);
+  const brand = pick(colors, "brand", "#111827"); // sobre
+  const ink = pick(colors, "ink", "#0f172a");
+  const muted = pick(colors, "muted", "#64748b");
+  const line = pick(colors, "line", "#e5e7eb");
+  const bgSoft = pick(colors, "bgSoft", "#f3f4f6");
+
+  const doc = baseDocDefinition(model, colors, scale, [30 * scale, 28 * scale, 30 * scale, 26 * scale]);
+  const skills = collectSkills(model);
+
+  const leftW = 175 * scale;
+
+  (doc.content as any[]).push(
+    {
+      text: safeText(model.name),
+      fontSize: 22 * scale,
+      bold: true,
+      color: ink,
+      margin: [0, 0, 0, 2 * scale],
+    },
+    {
+      text: safeText((model as any).title),
+      fontSize: 11.5 * scale,
+      bold: true,
+      color: brand,
+      margin: [0, 0, 0, 8 * scale],
+    },
+    {
+      table: {
+        widths: [leftW, "*"],
+        body: [
+          [
+            {
+              fillColor: bgSoft,
+              margin: [12 * scale, 12 * scale, 12 * scale, 12 * scale],
+              stack: [
+                sectionTitle(L === "en" ? "Contact" : "Contact", scale, ink),
+                { text: safeText((model as any).contactLine ?? (model as any).contact), fontSize: 9 * scale, color: muted, margin: [0, 0, 0, 6 * scale] },
+
+                hr(scale, line, leftW - 24 * scale),
+
+                sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
+                { text: joinDot(skills, 140), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 6 * scale] },
+
+                sectionTitle(L === "en" ? "Languages" : "Langues", scale, ink),
+                { text: safeText((model as any).langLine), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 6 * scale] },
+
+                sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
+                { text: joinDot((model as any).hobbies as string[] | undefined, 160), fontSize: 9 * scale, color: muted },
+              ],
+            },
+            {
+              margin: [14 * scale, 0, 0, 0],
+              stack: [
+                sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
+                { text: safeText((model as any).profile), fontSize: 9.5 * scale, color: ink, margin: [0, 2 * scale, 0, 8 * scale], alignment: "justify" },
+
+                hr(scale, line),
+
+                sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
+                { stack: renderXp(model, scale, ink, muted) },
+
+                hr(scale, line),
+
+                sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
+                { stack: renderEducation(model, scale, ink, muted) },
+
+                sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
+                { text: safeText((model as any).certs), fontSize: 9 * scale, color: ink },
+              ],
+            },
+          ],
+        ],
+      },
+      layout: "noBorders",
+    }
+  );
+
+  return doc;
+}
+
+function buildStartup(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  const L = normLang(lang);
+  const brand = pick(colors, "brand", "#f97316"); // orange
+  const ink = pick(colors, "ink", "#0f172a");
+  const muted = pick(colors, "muted", "#64748b");
+  const line = pick(colors, "line", "#e5e7eb");
+
+  const doc = baseDocDefinition(model, colors, scale, [28 * scale, 26 * scale, 28 * scale, 24 * scale]);
+  const skills = collectSkills(model);
+
+  (doc.content as any[]).push(
+    {
+      table: {
+        widths: ["*", "*"],
+        body: [
+          [
+            {
+              fillColor: brand,
+              margin: [14 * scale, 12 * scale, 14 * scale, 12 * scale],
+              stack: [
+                { text: safeText(model.name), fontSize: 20 * scale, bold: true, color: "#ffffff" },
+                { text: safeText((model as any).title), fontSize: 11 * scale, bold: true, color: "#ffffff", margin: [0, 2 * scale, 0, 0] },
+              ],
+            },
+            {
+              fillColor: brand,
+              margin: [14 * scale, 12 * scale, 14 * scale, 12 * scale],
+              stack: [
+                { text: safeText((model as any).contactLine ?? (model as any).contact), fontSize: 9 * scale, color: "#ffffff", alignment: "right" },
+                { text: safeText((model as any).langLine), fontSize: 9 * scale, color: "#ffffff", alignment: "right", margin: [0, 2 * scale, 0, 0] },
+              ],
+            },
+          ],
+        ],
+      },
+      layout: "noBorders",
+      margin: [-6 * scale, -6 * scale, -6 * scale, 10 * scale],
+    },
+    {
+      columns: [
+        {
+          width: "*",
+          stack: [
+            sectionTitleAccent(L === "en" ? "Profile" : "Profil", scale, brand),
+            { text: safeText((model as any).profile), fontSize: 9.5 * scale, color: ink, margin: [0, 2 * scale, 0, 8 * scale], alignment: "justify" },
+
+            sectionTitleAccent(L === "en" ? "Experience" : "Expérience", scale, brand),
+            { stack: renderXp(model, scale, ink, muted) },
+          ],
+        },
+        {
+          width: 190 * scale,
+          margin: [16 * scale, 0, 0, 0],
+          stack: [
+            sectionTitleAccent(L === "en" ? "Skills" : "Compétences", scale, brand),
+            { text: joinDot(skills, 150), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 10 * scale] },
+
+            sectionTitleAccent(L === "en" ? "Education" : "Formation", scale, brand),
+            { stack: renderEducation(model, scale, ink, muted) },
+
+            sectionTitleAccent(L === "en" ? "Certifications" : "Certifications", scale, brand),
+            { text: safeText((model as any).certs), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 0] },
+          ],
+        },
+      ],
+    }
+  );
+
+  return doc;
+}
+
+function buildTwoColumn(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  const L = normLang(lang);
+  const brand = pick(colors, "brand", "#2563eb");
+  const ink = pick(colors, "ink", "#0f172a");
+  const muted = pick(colors, "muted", "#64748b");
+  const line = pick(colors, "line", "#e5e7eb");
+  const bgSoft = pick(colors, "bgSoft", "#eff6ff");
+
+  const doc = baseDocDefinition(model, colors, scale, [28 * scale, 26 * scale, 28 * scale, 24 * scale]);
+  const skills = collectSkills(model);
+
+  (doc.content as any[]).push(
+    {
+      table: {
+        widths: ["*", "*"],
+        body: [
+          [
+            {
+              stack: [
+                { text: safeText(model.name), fontSize: 20 * scale, bold: true, color: ink },
+                { text: safeText((model as any).title), fontSize: 11 * scale, bold: true, color: brand, margin: [0, 2 * scale, 0, 0] },
+              ],
+            },
+            {
+              stack: [
+                { text: safeText((model as any).contactLine ?? (model as any).contact), fontSize: 9 * scale, color: muted, alignment: "right" },
+                { text: safeText((model as any).langLine), fontSize: 9 * scale, color: muted, alignment: "right", margin: [0, 2 * scale, 0, 0] },
+              ],
+            },
+          ],
+        ],
+      },
+      layout: "noBorders",
+      fillColor: bgSoft,
+      margin: [-6 * scale, -6 * scale, -6 * scale, 10 * scale],
+    },
+    {
+      columns: [
+        {
+          width: 210 * scale,
+          stack: [
+            sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
+            { text: safeText((model as any).profile), fontSize: 9.5 * scale, color: ink, margin: [0, 2 * scale, 0, 8 * scale], alignment: "justify" },
+            hr(scale, line, 210 * scale),
+
+            sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
+            { text: joinDot(skills, 160), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 8 * scale] },
+
+            sectionTitle(L === "en" ? "Interests" : "Centres d’intérêt", scale, ink),
+            { text: joinDot((model as any).hobbies as string[] | undefined, 160), fontSize: 9 * scale, color: muted },
+          ],
+        },
+        {
+          width: "*",
+          margin: [16 * scale, 0, 0, 0],
+          stack: [
+            sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
+            { stack: renderXp(model, scale, ink, muted) },
+
+            hr(scale, line),
+
+            sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
+            { stack: renderEducation(model, scale, ink, muted) },
+
+            sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
+            { text: safeText((model as any).certs), fontSize: 9 * scale, color: ink },
+          ],
+        },
+      ],
+    }
+  );
+
+  return doc;
+}
+
+function buildElegantColor(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  const L = normLang(lang);
+  const brand = pick(colors, "brand", "#10b981"); // emerald accent
+  const ink = pick(colors, "ink", "#0f172a");
+  const muted = pick(colors, "muted", "#64748b");
+  const line = pick(colors, "line", "#e5e7eb");
+
+  const doc = baseDocDefinition(model, colors, scale, [32 * scale, 28 * scale, 32 * scale, 26 * scale]);
+  const skills = collectSkills(model);
+
+  (doc.content as any[]).push(
+    {
+      columns: [
+        {
+          width: "*",
+          stack: [
+            { text: safeText(model.name), fontSize: 22 * scale, bold: true, color: ink },
+            { text: safeText((model as any).title), fontSize: 11.5 * scale, bold: true, color: brand, margin: [0, 2 * scale, 0, 4 * scale] },
+            { text: safeText((model as any).contactLine ?? (model as any).contact), fontSize: 9 * scale, color: muted },
+          ],
+        },
+        {
+          width: 140 * scale,
+          stack: [
+            { canvas: [{ type: "rect", x: 0, y: 0, w: 140 * scale, h: 6 * scale, color: brand }] },
+            { canvas: [{ type: "rect", x: 0, y: 0, w: 90 * scale, h: 6 * scale, color: brand }], margin: [0, 8 * scale, 0, 0] },
+          ],
+        },
+      ],
+      margin: [0, 0, 0, 8 * scale],
+    },
+    hr(scale, line),
+    sectionTitleAccent(L === "en" ? "Profile" : "Profil", scale, brand),
+    { text: safeText((model as any).profile), fontSize: 9.5 * scale, color: ink, margin: [0, 2 * scale, 0, 8 * scale], alignment: "justify" },
+
+    sectionTitleAccent(L === "en" ? "Experience" : "Expérience", scale, brand),
+    { stack: renderXp(model, scale, ink, muted) },
+
+    hr(scale, line),
+
+    {
+      columns: [
+        {
+          width: "*",
+          stack: [
+            sectionTitleAccent(L === "en" ? "Education" : "Formation", scale, brand),
+            { stack: renderEducation(model, scale, ink, muted) },
+          ],
+        },
+        {
+          width: 200 * scale,
+          margin: [16 * scale, 0, 0, 0],
+          stack: [
+            sectionTitleAccent(L === "en" ? "Skills" : "Compétences", scale, brand),
+            { text: joinDot(skills, 160), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 8 * scale] },
+
+            sectionTitleAccent(L === "en" ? "Certifications" : "Certifications", scale, brand),
+            { text: safeText((model as any).certs), fontSize: 9 * scale, color: muted },
+          ],
+        },
+      ],
+    }
+  );
+
+  return doc;
+}
+
+function buildAcademic(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  const L = normLang(lang);
+  const brand = pick(colors, "brand", "#0f172a");
+  const ink = pick(colors, "ink", "#0f172a");
+  const muted = pick(colors, "muted", "#64748b");
+  const line = pick(colors, "line", "#e5e7eb");
+
+  const doc = baseDocDefinition(model, colors, scale, [34 * scale, 30 * scale, 34 * scale, 28 * scale]);
+
+  const publications = normalizeLines((model as any).publications ?? (model as any).pubs, 8);
+  const projects = normalizeLines((model as any).projects, 6);
+  const teaching = normalizeLines((model as any).teaching, 6);
+
+  (doc.content as any[]).push(
+    { text: safeText(model.name), fontSize: 22 * scale, bold: true, color: ink, margin: [0, 0, 0, 2 * scale] },
+    { text: safeText((model as any).title), fontSize: 11.5 * scale, bold: true, color: brand, margin: [0, 0, 0, 4 * scale] },
+    { text: safeText((model as any).contactLine ?? (model as any).contact), fontSize: 9 * scale, color: muted, margin: [0, 0, 0, 8 * scale] },
+    hr(scale, line),
+
+    sectionTitle(L === "en" ? "Research Summary" : "Résumé de recherche", scale, ink),
+    { text: safeText((model as any).profile), fontSize: 9.5 * scale, color: ink, margin: [0, 2 * scale, 0, 8 * scale], alignment: "justify" },
+
+    sectionTitle(L === "en" ? "Academic Experience" : "Expérience", scale, ink),
+    { stack: renderXp(model, scale, ink, muted) },
+
+    sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
+    { stack: renderEducation(model, scale, ink, muted) },
+
+    sectionTitle(L === "en" ? "Projects" : "Projets", scale, ink),
+    publications.length || projects.length
+      ? { ul: projects.length ? projects : ["—"], fontSize: 9 * scale, color: ink, margin: [0, 0, 0, 6 * scale] }
+      : { text: "—", fontSize: 9 * scale, color: muted, margin: [0, 0, 0, 6 * scale] },
+
+    sectionTitle(L === "en" ? "Teaching" : "Enseignement", scale, ink),
+    teaching.length
+      ? { ul: teaching, fontSize: 9 * scale, color: ink, margin: [0, 0, 0, 6 * scale] }
+      : { text: "—", fontSize: 9 * scale, color: muted, margin: [0, 0, 0, 6 * scale] },
+
+    sectionTitle(L === "en" ? "Publications" : "Publications", scale, ink),
+    publications.length
+      ? { ol: publications, fontSize: 9 * scale, color: ink }
+      : { text: "—", fontSize: 9 * scale, color: muted }
+  );
+
+  return doc;
+}
+
+function buildSales(model: CvDocModel, lang: Lang, colors: PdfColorsLike, scale: number) {
+  const L = normLang(lang);
+  const brand = pick(colors, "brand", "#1e3a8a"); // blue
+  const ink = pick(colors, "ink", "#0f172a");
+  const muted = pick(colors, "muted", "#64748b");
+  const line = pick(colors, "line", "#e5e7eb");
+  const bgSoft = pick(colors, "bgSoft", "#eff6ff");
+
+  const doc = baseDocDefinition(model, colors, scale, [28 * scale, 26 * scale, 28 * scale, 24 * scale]);
+  const skills = collectSkills(model);
+
+  const kpisRaw = (model as any).kpis ?? (model as any).salesKpis ?? [];
+  const kpis: Array<{ label: string; value: string }> = Array.isArray(kpisRaw)
+    ? kpisRaw
+        .map((x: any) => ({ label: safeText(x?.label), value: safeText(x?.value) }))
+        .filter((x) => x.label || x.value)
+        .slice(0, 6)
+    : [];
+
+  (doc.content as any[]).push(
+    {
+      table: {
+        widths: ["*", "*"],
+        body: [
+          [
+            {
+              fillColor: brand,
+              margin: [14 * scale, 12 * scale, 14 * scale, 12 * scale],
+              stack: [
+                { text: safeText(model.name), fontSize: 20 * scale, bold: true, color: "#ffffff" },
+                { text: safeText((model as any).title), fontSize: 11 * scale, bold: true, color: "#ffffff", margin: [0, 2 * scale, 0, 0] },
+              ],
+            },
+            {
+              fillColor: brand,
+              margin: [14 * scale, 12 * scale, 14 * scale, 12 * scale],
+              stack: [
+                { text: safeText((model as any).contactLine ?? (model as any).contact), fontSize: 9 * scale, color: "#ffffff", alignment: "right" },
+                { text: safeText((model as any).langLine), fontSize: 9 * scale, color: "#ffffff", alignment: "right", margin: [0, 2 * scale, 0, 0] },
+              ],
+            },
+          ],
+        ],
+      },
+      layout: "noBorders",
+      margin: [-6 * scale, -6 * scale, -6 * scale, 10 * scale],
+    },
+    {
+      columns: [
+        {
+          width: 210 * scale,
+          stack: [
+            {
+              table: {
+                widths: ["*"],
+                body: [
+                  [
+                    {
+                      fillColor: bgSoft,
+                      margin: [10 * scale, 10 * scale, 10 * scale, 10 * scale],
+                      stack: [
+                        sectionTitle(L === "en" ? "Top KPIs" : "KPIs", scale, ink),
+                        ...(kpis.length
+                          ? kpis.map((k) => ({
+                              columns: [
+                                { width: "*", text: k.label || "—", fontSize: 9 * scale, color: muted },
+                                { width: 70 * scale, text: k.value || "—", fontSize: 9.2 * scale, bold: true, color: ink, alignment: "right" },
+                              ],
+                              columnGap: 8 * scale,
+                              margin: [0, 1 * scale, 0, 3 * scale],
+                            }))
+                          : [{ text: "—", fontSize: 9 * scale, color: muted }]),
+                      ],
+                    },
+                  ],
+                ],
+              },
+              layout: "noBorders",
+              margin: [0, 0, 0, 10 * scale],
+            },
+
+            sectionTitle(L === "en" ? "Skills" : "Compétences", scale, ink),
+            { text: joinDot(skills, 160), fontSize: 9 * scale, color: muted, margin: [0, 2 * scale, 0, 10 * scale] },
+
+            sectionTitle(L === "en" ? "Certifications" : "Certifications", scale, ink),
+            { text: safeText((model as any).certs), fontSize: 9 * scale, color: muted },
+          ],
+        },
+        {
+          width: "*",
+          margin: [16 * scale, 0, 0, 0],
+          stack: [
+            sectionTitle(L === "en" ? "Profile" : "Profil", scale, ink),
+            { text: safeText((model as any).profile), fontSize: 9.5 * scale, color: ink, margin: [0, 2 * scale, 0, 8 * scale], alignment: "justify" },
+
+            hr(scale, line),
+
+            sectionTitle(L === "en" ? "Experience" : "Expérience", scale, ink),
+            { stack: renderXp(model, scale, ink, muted) },
+
+            hr(scale, line),
+
+            sectionTitle(L === "en" ? "Education" : "Formation", scale, ink),
+            { stack: renderEducation(model, scale, ink, muted) },
+          ],
+        },
+      ],
+    }
+  );
+
+  return doc;
 }
 
 // ----------------------------------------------------
@@ -674,16 +1046,13 @@ export function buildCvPdf(
 ) {
   const L = normLang(lang);
 
-  // mapping layout -> styleMode attendu par buildCvAtsPdf
   const styleMode: "auto" | "compact" | "expanded" =
     layout === "tight" ? "compact" : layout === "spacious" ? "expanded" : "auto";
 
-  // ATS = ton template existant
   if (templateId === "ats") {
     return buildCvAtsPdf(model, L, colors as any, styleMode, scale);
   }
 
-  // ajustement global de l’échelle selon layout
   const mul = layout === "tight" ? 0.92 : layout === "spacious" ? 1.08 : 1.0;
   const s = clamp(scale * mul, 0.75, 1.6);
 
@@ -702,8 +1071,22 @@ export function buildCvPdf(
       return buildTech(model, L, colors, s);
     case "pro_max":
       return buildProMax(model, L, colors, s);
+
+    // ✅ nouveaux
+    case "executive":
+      return buildExecutive(model, L, colors, s);
+    case "startup":
+      return buildStartup(model, L, colors, s);
+    case "two_column":
+      return buildTwoColumn(model, L, colors, s);
+    case "elegant_color":
+      return buildElegantColor(model, L, colors, s);
+    case "academic":
+      return buildAcademic(model, L, colors, s);
+    case "sales":
+      return buildSales(model, L, colors, s);
+
     default:
-      // fallback safe
       return buildClassic(model, L, colors, s);
   }
 }

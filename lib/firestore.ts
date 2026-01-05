@@ -1,26 +1,24 @@
-import { db } from "./firebase";
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  updateDoc,
-  addDoc,
-  query,
-  where
-} from "firebase/firestore";
+// src/lib/firebase.ts
+import { initializeApp, getApps, getApp } from "firebase/app";
+import { getAuth } from "firebase/auth";
+import { initializeFirestore } from "firebase/firestore";
 
-// Placeholders pour tes futures fonctions Firestore (users, candidatures, etc.)
-export {
-  db,
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  updateDoc,
-  addDoc,
-  query,
-  where
+const firebaseConfig = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY!,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN!,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID!,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET!,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID!,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID!,
 };
+
+export const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
+
+export const auth = getAuth(app);
+
+// ✅ IMPORTANT iOS/mobile: force long-polling (corrige Listen/channel sur Safari / réseaux stricts)
+export const db = initializeFirestore(app, {
+  experimentalForceLongPolling: true,
+  // si tu as encore des soucis sur certains mobiles, tu peux aussi activer ça :
+  // useFetchStreams: false,
+});

@@ -3,10 +3,15 @@
 
 /**
  * ✅ Single source of truth reCAPTCHA (v3 standard ou Enterprise)
- * - Loader robuste (si script pas encore chargé)
+ * - Loader robuste (script injecté si absent + attente réelle de grecaptcha)
  * - tryGetRecaptchaToken(): non bloquant => retourne null si adblock/timeout…
  * - getRecaptchaToken(): strict => throw si impossible
- * - verifyRecaptcha(): optionnel via ton endpoint CF /recaptchaVerify (Enterprise)
+ * - verifyRecaptcha(): optionnel via endpoint CF /recaptchaVerify (Enterprise côté serveur)
+ *
+ * Notes :
+ * - Côté Cloud Functions, tes endpoints acceptent le token via body.recaptchaToken|token
+ *   OU via header "x-recaptcha-token".
+ * - L’action est normalisée côté client, et envoyée au /recaptchaVerify (optionnel).
  */
 
 declare global {
@@ -28,12 +33,12 @@ export type VerifyResult =
   | { ok: true; score?: number }
   | { ok: false; reason: string; score?: number };
 
-const DEFAULT_API_BASE =
-  "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+const DEFAULT_API_BASE = "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
 
-export const API_BASE = (
-  process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE
-).replace(/\/+$/, "");
+export const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE).replace(
+  /\/+$/,
+  ""
+);
 
 const SITE_KEY =
   process.env.NEXT_PUBLIC_RECAPTCHA_SITE_KEY ||
@@ -41,26 +46,43 @@ const SITE_KEY =
   "";
 
 const USE_ENTERPRISE =
-  (process.env.NEXT_PUBLIC_RECAPTCHA_ENTERPRISE || "")
-    .toLowerCase()
-    .trim() === "true";
+  (process.env.NEXT_PUBLIC_RECAPTCHA_ENTERPRISE || "").toLowerCase().trim() === "true";
+
+/**
+ * Optionnel : certains environnements bloquent google.com mais autorisent recaptcha.net
+ * (même si, souvent, les deux sont filtrés). Tu peux forcer via env si besoin.
+ */
+const USE_RECAPTCHA_NET =
+  (process.env.NEXT_PUBLIC_RECAPTCHA_USE_NET || "").toLowerCase().trim() === "true";
 
 let recaptchaLoadPromise: Promise<void> | null = null;
 
-function isBrowser() {
+function isBrowser(): boolean {
   return typeof window !== "undefined" && typeof document !== "undefined";
 }
 
-function normalizeAction(action: string) {
+function normalizeAction(action: string): string {
   return (action || "").trim().toLowerCase();
 }
 
-function describeRecaptchaLoadFailure() {
+function describeRecaptchaLoadFailure(): string {
   return [
     "Sécurité: impossible de valider reCAPTCHA.",
     "Le script reCAPTCHA n’a pas pu être chargé ou est bloqué.",
     "Causes fréquentes: bloqueur de pubs, DNS filtrant, proxy/corporate, CSP trop stricte, ou réseau qui bloque google.com.",
   ].join(" ");
+}
+
+function getScriptSelector(): string {
+  return USE_ENTERPRISE ? 'script[data-recaptcha="enterprise"]' : 'script[data-recaptcha="v3"]';
+}
+
+function getScriptSrc(): string {
+  const host = USE_RECAPTCHA_NET ? "https://www.recaptcha.net" : "https://www.google.com";
+  const base = USE_ENTERPRISE
+    ? `${host}/recaptcha/enterprise.js`
+    : `${host}/recaptcha/api.js`;
+  return `${base}?render=${encodeURIComponent(SITE_KEY)}`;
 }
 
 function hasUsableRecaptcha(): boolean {
@@ -88,8 +110,9 @@ function pickRecaptchaClient(): GrecaptchaClient | null {
 }
 
 /**
- * ✅ Loader robuste:
- * - attend que grecaptcha soit réellement dispo (poll)
+ * ✅ Loader robuste :
+ * - injecte le script si absent
+ * - attend que grecaptcha soit réellement dispo
  * - retentable (reset promise en cas d’échec)
  */
 async function ensureRecaptchaLoaded(): Promise<void> {
@@ -103,25 +126,26 @@ async function ensureRecaptchaLoaded(): Promise<void> {
   if (recaptchaLoadPromise) return recaptchaLoadPromise;
 
   recaptchaLoadPromise = new Promise<void>((resolve, reject) => {
-    const selector = USE_ENTERPRISE
-      ? 'script[data-recaptcha="enterprise"]'
-      : 'script[data-recaptcha="v3"]';
-
+    const selector = getScriptSelector();
     const existing = document.querySelector<HTMLScriptElement>(selector);
 
-    const pollUntilReady = (ms: number) => {
+    const waitUntil = (timeoutMs: number) => {
       const t0 = Date.now();
+
       const tick = () => {
         if (hasUsableRecaptcha()) return resolve();
-        if (Date.now() - t0 > ms) return reject(new Error(describeRecaptchaLoadFailure()));
-        requestAnimationFrame(tick);
+        if (Date.now() - t0 > timeoutMs) return reject(new Error(describeRecaptchaLoadFailure()));
+
+        // requestAnimationFrame peut être throttlé en onglet inactif, on mixe avec setTimeout.
+        window.setTimeout(tick, 50);
       };
+
       tick();
     };
 
     // Script déjà présent => on attend juste l'exposition de grecaptcha
     if (existing) {
-      pollUntilReady(10_000);
+      waitUntil(12_000);
       return;
     }
 
@@ -129,20 +153,15 @@ async function ensureRecaptchaLoaded(): Promise<void> {
     script.async = true;
     script.defer = true;
     script.setAttribute("data-recaptcha", USE_ENTERPRISE ? "enterprise" : "v3");
-
-    const base = USE_ENTERPRISE
-      ? "https://www.google.com/recaptcha/enterprise.js"
-      : "https://www.google.com/recaptcha/api.js";
-
-    script.src = `${base}?render=${encodeURIComponent(SITE_KEY)}`;
+    script.src = getScriptSrc();
 
     const timeout = window.setTimeout(() => {
       reject(new Error(describeRecaptchaLoadFailure()));
-    }, 12_000);
+    }, 15_000);
 
     script.onload = () => {
       window.clearTimeout(timeout);
-      pollUntilReady(8_000);
+      waitUntil(10_000);
     };
 
     script.onerror = () => {
@@ -173,6 +192,7 @@ export async function tryGetRecaptchaToken(action: string): Promise<string | nul
 
   try {
     await ensureRecaptchaLoaded();
+
     const client = pickRecaptchaClient();
     if (!client) return null;
 
@@ -192,7 +212,7 @@ export async function tryGetRecaptchaToken(action: string): Promise<string | nul
       }
     });
 
-    return typeof token === "string" && token ? token : null;
+    return typeof token === "string" && token.trim() ? token : null;
   } catch {
     return null;
   }
@@ -201,17 +221,29 @@ export async function tryGetRecaptchaToken(action: string): Promise<string | nul
 /** Version stricte */
 export async function getRecaptchaToken(action: string): Promise<string> {
   const token = await tryGetRecaptchaToken(action);
-  if (!token) {
-    throw new Error(describeRecaptchaLoadFailure());
-  }
+  if (!token) throw new Error(describeRecaptchaLoadFailure());
   return token;
 }
 
+/** Précharge le script (utile au mount) */
 export async function warmupRecaptcha(): Promise<void> {
   await ensureRecaptchaLoaded();
 }
 
-/** Vérif optionnelle via endpoint /recaptchaVerify */
+/**
+ * Helper pratique pour tes appels Cloud Functions:
+ * - met le token en header (tes CF le lisent via x-recaptcha-token)
+ * - ou tu peux aussi le mettre dans le body (recaptchaToken)
+ */
+export function buildRecaptchaHeaders(token: string | null): HeadersInit {
+  if (!token) return {};
+  return {
+    "X-Recaptcha-Token": token,
+    "x-recaptcha-token": token,
+  };
+}
+
+/** Vérif optionnelle via endpoint /recaptchaVerify (serveur) */
 export async function verifyRecaptcha(token: string, action: string): Promise<VerifyResult> {
   const normalizedAction = normalizeAction(action);
 
@@ -229,14 +261,17 @@ export async function verifyRecaptcha(token: string, action: string): Promise<Ve
     const data: any = await res.json().catch(() => ({}));
 
     if (!res.ok || !data?.ok) {
-      return {
-        ok: false,
-        reason: String(data?.reason || data?.details?.reason || "recaptcha_failed"),
-        score: typeof data?.score === "number"
+      const score =
+        typeof data?.score === "number"
           ? data.score
           : typeof data?.details?.score === "number"
             ? data.details.score
-            : undefined,
+            : undefined;
+
+      return {
+        ok: false,
+        reason: String(data?.reason || data?.details?.reason || "recaptcha_failed"),
+        score,
       };
     }
 
