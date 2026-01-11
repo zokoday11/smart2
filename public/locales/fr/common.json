@@ -1,0 +1,75 @@
+{
+  "header": {
+    "title": "Assistant Candidatures IA",
+    "space": "Espace candidat",
+    "connected": "Connecté·e :",
+    "logout": "Se déconnecter"
+  },
+  "nav": {
+    "profile": "Profil CV IA",
+    "coverLetter": "Assistant candidature",
+    "tracker": "Suivi candidatures",
+    "interview": "Préparer entretien",
+    "apply": "Postuler",
+    "history": "Historique IA",
+    "credits": "Crédits",
+    "settings": "Paramètres"
+  },
+  "landing": {
+    "badge": "IA appliquée aux candidatures",
+    "title": "Ton bureau de candidature, piloté par l’IA.",
+    "subtitle": "Importe ton CV, génère des lettres ciblées, prépare ton pitch et suis tes candidatures depuis un seul espace.",
+    "ctaPrimary": "Essayer gratuitement",
+    "ctaSecondary": "J’ai déjà un compte"
+  },
+  "dashboard": {
+    "title": "Tableau de bord",
+    "welcome": "Bienvenue",
+    "creditsLabel": "crédits",
+    "creditsLoading": "Chargement…"
+  },
+  "auth": {
+    "loginTitle": "Se connecter",
+    "signupTitle": "Créer un compte",
+    "email": "Email",
+    "password": "Mot de passe",
+    "confirmPassword": "Confirmer le mot de passe",
+    "forgotPassword": "Mot de passe oublié ?",
+    "noAccount": "Pas encore de compte ?",
+    "haveAccount": "Déjà un compte ?",
+    "createAccount": "Créer un compte",
+    "signIn": "Se connecter",
+    "signOut": "Se déconnecter",
+    "continue": "Continuer",
+    "back": "Retour",
+    "verifyEmailTitle": "Vérifie ton email",
+    "verifyEmailDesc": "Un email de vérification t’a été envoyé. Clique sur le lien pour activer ton compte.",
+    "resend": "Renvoyer l’email",
+    "resendDone": "Email renvoyé.",
+    "blockedTitle": "Compte bloqué",
+    "blockedDesc": "Ton compte a été bloqué. Contacte le support si besoin."
+  },
+  "common": {
+    "loading": "Chargement…",
+    "menu": "Menu",
+    "navigation": "Navigation",
+    "save": "Enregistrer",
+    "cancel": "Annuler",
+    "close": "Fermer",
+    "delete": "Supprimer",
+    "edit": "Modifier",
+    "confirm": "Confirmer",
+    "yes": "Oui",
+    "no": "Non",
+    "search": "Rechercher",
+    "copy": "Copier",
+    "copied": "Copié !",
+    "error": "Une erreur est survenue.",
+    "retry": "Réessayer"
+  },
+  "errors": {
+    "blocked": "Ton compte a été bloqué. Contacte le support si besoin.",
+    "unauthorized": "Accès refusé.",
+    "notFound": "Page introuvable."
+  }
+}

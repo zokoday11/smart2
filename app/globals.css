@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 /* =========================
-   Thème global
+   Thème global (Dark default)
    ========================= */
 :root {
   --bg: #020617;              /* fond général */
@@ -13,31 +13,69 @@
   --muted: #9ca3af;           /* texte secondaire */
   --brand: #60a5fa;           /* bleu principal */
   --brandDark: #1d4ed8;       /* bleu plus foncé */
-  --border: #1f2933;          /* gris pour les bordures */
+  --border: #1f2933;          /* bordures */
 }
 
+/* =========================
+   Thème clair (override)
+   Ajoute la classe "theme-light" sur <html>
+   ========================= */
+.theme-light {
+  --bg: #f8fafc;
+  --bg-soft: rgba(255, 255, 255, 0.85);
+  --card-elevated: rgba(255, 255, 255, 0.75);
+  --ink: #0f172a;
+  --muted: rgba(51, 65, 85, 0.85);
+  --border: rgba(15, 23, 42, 0.14);
+
+  --brand: #2563eb;
+  --brandDark: #1d4ed8;
+}
+
+/* =========================
+   Base HTML/BODY
+   ========================= */
 html,
 body {
   padding: 0;
   margin: 0;
+  height: 100%;
+  min-height: 100%;
+  overflow-x: hidden;
+}
+
+body {
+  background: radial-gradient(circle at top, #020617 0, #020617 40%, #000 100%);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
+  overscroll-behavior-y: contain;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Fond en mode clair */
+.theme-light body {
+  background: radial-gradient(circle at top, #eef2ff 0, #f8fafc 45%, #e5e7eb 100%);
+}
+
+/* Pages router fallback (si présent) */
+#__next {
   min-height: 100%;
 }
 
-body {
-  background:
-    radial-gradient(circle at top, #020617 0, #020617 40%, #000 100%);
-  color: var(--ink);
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Inter",
-    sans-serif;
-}
-
-/* Pour que les sections soient bien fluides sur mobile */
-body {
-  overscroll-behavior-y: none;
+/* =========================
+   ⭐ Canvas étoiles (Starfield overlay)
+   ========================= */
+.starry-background {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 50;          /* au-dessus du fond et des sections */
+  pointer-events: none; /* ne bloque pas les clics */
 }
 
 /* =========================
-   Scrollbar globale (droite)
+   Scrollbar globale
    ========================= */
 
 /* Firefox */
@@ -50,18 +88,31 @@ body {
 *::-webkit-scrollbar {
   width: 8px;
 }
-
 *::-webkit-scrollbar-track {
   background: transparent;
 }
-
 *::-webkit-scrollbar-thumb {
-  background-image: linear-gradient(
-    to bottom,
-    var(--brand),
-    var(--brandDark)
-  );
+  background-image: linear-gradient(to bottom, var(--brand), var(--brandDark));
   border-radius: 9999px;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Scrollbar verticale sur main (si main scroll) */
+main::-webkit-scrollbar {
+  width: 6px;
+}
+main::-webkit-scrollbar-track {
+  background: transparent;
+}
+main::-webkit-scrollbar-thumb {
+  background: var(--brand);
+  border-radius: 999px;
+}
+main {
+  scrollbar-width: thin;
+  scrollbar-color: var(--brand) transparent;
 }
 
 /* Barre de progression en haut */
@@ -74,8 +125,23 @@ body {
    ========================= */
 
 .glass {
-  background: radial-gradient(circle at top left, rgba(148, 163, 184, 0.16), transparent 55%),
+  background: radial-gradient(
+      circle at top left,
+      rgba(148, 163, 184, 0.16),
+      transparent 55%
+    ),
     rgba(15, 23, 42, 0.92);
+  backdrop-filter: blur(18px);
+}
+
+/* Variante glass en mode clair */
+.theme-light .glass {
+  background: radial-gradient(
+      circle at top left,
+      rgba(37, 99, 235, 0.10),
+      transparent 55%
+    ),
+    rgba(255, 255, 255, 0.78);
   backdrop-filter: blur(18px);
 }
 
@@ -88,13 +154,11 @@ body {
   transition: transform 0.12s ease-out, box-shadow 0.12s ease-out,
     filter 0.12s ease-out;
 }
-
 .btn-primary:hover {
   transform: translateY(-1px);
   box-shadow: 0 14px 32px rgba(37, 99, 235, 0.6);
   filter: brightness(1.05);
 }
-
 .btn-primary:active {
   transform: translateY(0);
   box-shadow: 0 8px 20px rgba(37, 99, 235, 0.4);
@@ -109,16 +173,27 @@ body {
   transition: background-color 0.12s ease-out, border-color 0.12s ease-out,
     color 0.12s ease-out;
 }
-
 .btn-secondary:hover {
   border-color: var(--brand);
   color: white;
 }
 
-/* Petites helpers pour cartes etc. */
+/* Mode clair : bouton secondaire plus lisible */
+.theme-light .btn-secondary {
+  background: rgba(255, 255, 255, 0.75);
+  border-color: rgba(15, 23, 42, 0.18);
+}
+.theme-light .btn-secondary:hover {
+  color: var(--ink);
+}
+
+/* Petites helpers pour cartes */
 .card-border {
   border: 1px solid rgba(148, 163, 184, 0.35);
   border-radius: 0.75rem;
+}
+.theme-light .card-border {
+  border-color: rgba(15, 23, 42, 0.14);
 }
 
 /* Lien hover subtil */
@@ -126,40 +201,14 @@ body {
   color: var(--muted);
   transition: color 0.12s ease-out;
 }
-
 .link-soft:hover {
   color: var(--ink);
 }
 
-/* Pour éviter un flash de scroll bar trop claire au load */
-::-webkit-scrollbar-corner {
-  background: transparent;
-}
-
-/* Scrollbar verticale (container principal) */
-main::-webkit-scrollbar {
-  width: 6px;
-}
-
-main::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-main::-webkit-scrollbar-thumb {
-  background: var(--brand);
-  border-radius: 999px;
-}
-
-main {
-  scrollbar-width: thin;               /* Firefox */
-  scrollbar-color: var(--brand) transparent;
-}
-
 /* =========================
-   FORM CONTROLS (inputs / selects / textareas)
+   FORM CONTROLS
    ========================= */
 
-/* Champs de base */
 .input,
 textarea.input,
 textarea.textarea,
@@ -176,7 +225,6 @@ select.select-brand {
     background-color 0.15s ease, color 0.15s ease;
 }
 
-/* Placeholders visibles */
 .input::placeholder,
 textarea.input::placeholder,
 textarea.textarea::placeholder {
@@ -184,26 +232,23 @@ textarea.textarea::placeholder {
   opacity: 1;
 }
 
-/* Focus state */
 .input:focus,
 textarea.input:focus,
 textarea.textarea:focus,
 select.select-brand:focus {
   border-color: var(--brand);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--brand) 60%, transparent);
-  background-color: #020617;
 }
 
-/* Textarea : redimension verticale seulement */
+/* Textarea */
 textarea.input,
 textarea.textarea {
   resize: vertical;
   min-height: 3rem;
 }
 
-/* Select sur fond un peu différent */
+/* Select */
 select.select-brand {
-  background-color: rgba(15, 23, 42, 0.9);
   padding-right: 2rem;
   appearance: none;
 }
@@ -224,24 +269,32 @@ select.select-brand {
   border: 1px solid rgba(148, 163, 184, 0.5);
   color: var(--muted);
 }
+.theme-light .badge-muted {
+  background-color: rgba(255, 255, 255, 0.75);
+  border-color: rgba(15, 23, 42, 0.14);
+  color: rgba(51, 65, 85, 0.85);
+}
 
-/* Carte soft (used for LM / Pitch preview) */
+/* Carte soft */
 .card-soft {
   background: rgba(15, 23, 42, 0.92);
 }
+.theme-light .card-soft {
+  background: rgba(255, 255, 255, 0.78);
+}
 
-/* Simple toggle checkbox (si tu ne l’as pas déjà) */
+/* Toggle checkbox */
 .toggle-checkbox {
   width: 1rem;
   height: 1rem;
   border-radius: 0.3rem;
   border: 1px solid var(--border);
-  background-color: #020617;
+  background-color: transparent;
   accent-color: var(--brand);
 }
 
 /* =========================
-   LOADER SPINNER
+   LOADER
    ========================= */
 
 .loader {
@@ -260,42 +313,16 @@ select.select-brand {
 }
 
 /* =========================
-   BANDEAU "L’IA prépare tes documents…"
-   (optionnel, mais utile si tu utilises une classe dédiée)
+   BANDEAU chargement (optionnel)
    ========================= */
-
 .assistant-loading-bar {
   border-radius: 9999px;
   backdrop-filter: blur(10px);
 }
-/* app/globals.css */
 
-/* Assure toi que html / body remplissent bien la hauteur */
-html,
-body {
-  height: 100%;
-}
-
-body {
-  min-height: 100%;
-  /* évite les comportements bizarres de scroll sur mobile */
-  overscroll-behavior-y: contain;
-  -webkit-tap-highlight-color: transparent;
-}
-
-/* Empêche tout débordement horizontal global */
-html,
-body {
-  overflow-x: hidden;
-}
-
-/* Si tu utilises #__next (pages router) : garde ça, sinon tu peux l'ignorer */
-#__next {
-  min-height: 100%;
-}
-
-/* Tu peux garder ici toutes tes classes custom :
-   .glass, .btn-primary, .badge-muted, etc. */
+/* =========================
+   reCAPTCHA badge
+   ========================= */
 .grecaptcha-badge {
-  visibility: hidden; /* ou display:none; mais visibility est plus “soft” */
+  visibility: hidden;
 }

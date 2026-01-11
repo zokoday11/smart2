@@ -2,8 +2,13 @@
 import "./globals.css";
 import type { Metadata, Viewport } from "next";
 import Script from "next/script";
+
 import { AuthProvider } from "@/context/AuthContext";
 import ActivityTracker from "@/components/ActivityTracker";
+
+import { ThemeProvider } from "@/context/ThemeContext";
+import I18nClientProvider from "@/components/I18nClientProvider";
+import { Starfield } from "@/components/ui/Starfield";
 
 export const metadata: Metadata = {
   title: "Assistant Candidatures IA",
@@ -51,16 +56,8 @@ export default function RootLayout({
         />
       </head>
 
-      <body
-        className="
-          min-h-screen
-          bg-[var(--bg)]
-          text-[var(--text)]
-          overflow-x-hidden
-          antialiased
-        "
-      >
-        {/* ✅ Charge reCAPTCHA v3 (standard ou enterprise selon env) */}
+      <body className="min-h-screen bg-[var(--bg)] text-[var(--ink)] overflow-x-hidden antialiased">
+        {/* reCAPTCHA v3 / enterprise */}
         {siteKey ? (
           <Script
             src={recaptchaSrc}
@@ -69,10 +66,20 @@ export default function RootLayout({
           />
         ) : null}
 
-        <AuthProvider>
-          <ActivityTracker />
-          <div className="min-h-screen flex flex-col">{children}</div>
-        </AuthProvider>
+        <ThemeProvider>
+          {/* ✅ i18next provider (détection navigateur + cache) */}
+          <I18nClientProvider>
+            {/* Fond étoilé derrière tout */}
+            <Starfield />
+
+            <AuthProvider>
+              <ActivityTracker />
+              <div className="app-shell min-h-screen flex flex-col">
+                {children}
+              </div>
+            </AuthProvider>
+          </I18nClientProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

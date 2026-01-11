@@ -1,0 +1,75 @@
+{
+  "header": {
+    "title": "AI Applications Assistant",
+    "space": "Candidate area",
+    "connected": "Signed in:",
+    "logout": "Log out"
+  },
+  "nav": {
+    "profile": "AI CV Profile",
+    "coverLetter": "Application assistant",
+    "tracker": "Application tracker",
+    "interview": "Interview prep",
+    "apply": "Apply",
+    "history": "AI history",
+    "credits": "Credits",
+    "settings": "Settings"
+  },
+  "landing": {
+    "badge": "AI for job applications",
+    "title": "Your AI-powered job application workspace.",
+    "subtitle": "Upload your CV, generate targeted cover letters, prepare your pitch and track your applications in one place.",
+    "ctaPrimary": "Start for free",
+    "ctaSecondary": "I already have an account"
+  },
+  "dashboard": {
+    "title": "Dashboard",
+    "welcome": "Welcome",
+    "creditsLabel": "credits",
+    "creditsLoading": "Loading…"
+  },
+  "auth": {
+    "loginTitle": "Log in",
+    "signupTitle": "Create an account",
+    "email": "Email",
+    "password": "Password",
+    "confirmPassword": "Confirm password",
+    "forgotPassword": "Forgot password?",
+    "noAccount": "Don't have an account yet?",
+    "haveAccount": "Already have an account?",
+    "createAccount": "Create account",
+    "signIn": "Log in",
+    "signOut": "Log out",
+    "continue": "Continue",
+    "back": "Back",
+    "verifyEmailTitle": "Verify your email",
+    "verifyEmailDesc": "We sent you a verification email. Click the link to activate your account.",
+    "resend": "Resend email",
+    "resendDone": "Email resent.",
+    "blockedTitle": "Account blocked",
+    "blockedDesc": "Your account has been blocked. Contact support if needed."
+  },
+  "common": {
+    "loading": "Loading…",
+    "menu": "Menu",
+    "navigation": "Navigation",
+    "save": "Save",
+    "cancel": "Cancel",
+    "close": "Close",
+    "delete": "Delete",
+    "edit": "Edit",
+    "confirm": "Confirm",
+    "yes": "Yes",
+    "no": "No",
+    "search": "Search",
+    "copy": "Copy",
+    "copied": "Copied!",
+    "error": "Something went wrong.",
+    "retry": "Retry"
+  },
+  "errors": {
+    "blocked": "Your account has been blocked. Contact support if needed.",
+    "unauthorized": "Access denied.",
+    "notFound": "Page not found."
+  }
+}

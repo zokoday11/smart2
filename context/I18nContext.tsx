@@ -72,22 +72,21 @@ export const I18nProvider = ({ children }: { children: ReactNode }) => {
 
   useEffect(() => {
     const stored = localStorage.getItem(LANG_KEY) as LangCode | null;
-    const initial =
-      stored && translations[stored] ? stored : ("fr" as LangCode);
-
-    setLangState(initial);
-    document.documentElement.dir = initial === "ar" ? "rtl" : "ltr";
-    document.documentElement.lang = initial;
+    if (stored && translations[stored]) {
+      setLangState(stored);
+      document.documentElement.dir = stored === "ar" ? "rtl" : "ltr";
+    }
   }, []);
 
   const setLang = (next: LangCode) => {
     setLangState(next);
     localStorage.setItem(LANG_KEY, next);
     document.documentElement.dir = next === "ar" ? "rtl" : "ltr";
-    document.documentElement.lang = next;
   };
 
-  const t = (key: string) => translations[lang]?.[key] ?? key;
+  const t = (key: string) => {
+    return translations[lang]?.[key] ?? key;
+  };
 
   return (
     <I18nContext.Provider value={{ lang, setLang, t }}>
@@ -98,6 +97,8 @@ export const I18nProvider = ({ children }: { children: ReactNode }) => {
 
 export const useI18n = () => {
   const ctx = useContext(I18nContext);
-  if (!ctx) throw new Error("useI18n must be used inside I18nProvider");
+  if (!ctx) {
+    throw new Error("useI18n must be used inside I18nProvider");
+  }
   return ctx;
 };

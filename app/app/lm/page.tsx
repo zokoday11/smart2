@@ -10,6 +10,7 @@ import { onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, collection, addDoc, serverTimestamp } from "firebase/firestore";
 
 import { getRecaptchaToken } from "@/lib/recaptcha";
+import { callGenerateCvPdf, callGenerateLetterAndPitch } from "@/lib/gemini";
 
 import { makePdfColors } from "@/lib/pdf/colors";
 import { fitOnePage } from "@/lib/pdf/fitOnePage";
@@ -18,11 +19,7 @@ import { downloadBlob } from "@/lib/pdf/pdfmakeClient";
 
 import type { CvDocModel } from "@/lib/pdf/templates/cvAts";
 import { buildCvPdf, getCvTemplates, type CvTemplateId } from "@/lib/pdf/templates/cvTemplates";
-
 import { buildLmStyledPdf, type LmModel } from "@/lib/pdf/templates/letter";
-
-// 🔗 ENDPOINT LOCAL (Proxy Next.js)
-const LETTER_AND_PITCH_URL = "/api/generateLetterAndPitch";
 
 // --- TYPES ---
 type CvSkillsSection = { title: string; items: string[] };
@@ -416,11 +413,9 @@ function buildLmModel(profile: CvProfile, lang: Lang, companyNameInput: string, 
   const name = safeText(profile.fullName) || "Candidat";
 
   const contactLines: string[] = [];
-  if (profile.phone)
-    contactLines.push(lang === "fr" ? `Téléphone : ${safeText(profile.phone)}` : `Phone: ${safeText(profile.phone)}`);
+  if (profile.phone) contactLines.push(lang === "fr" ? `Téléphone : ${safeText(profile.phone)}` : `Phone: ${safeText(profile.phone)}`);
   if (profile.email) contactLines.push(lang === "fr" ? `Email : ${safeText(profile.email)}` : `Email: ${safeText(profile.email)}`);
-  if (profile.linkedin)
-    contactLines.push(lang === "fr" ? `LinkedIn : ${safeText(profile.linkedin)}` : `LinkedIn: ${safeText(profile.linkedin)}`);
+  if (profile.linkedin) contactLines.push(lang === "fr" ? `LinkedIn : ${safeText(profile.linkedin)}` : `LinkedIn: ${safeText(profile.linkedin)}`);
 
   const city = safeText(profile.city) || "Paris";
   const dateStr = lang === "fr" ? new Date().toLocaleDateString("fr-FR") : new Date().toLocaleDateString("en-GB");
@@ -575,14 +570,8 @@ async function ensurePdfJs() {
       throw new Error("PDF.js doit être chargé côté client.");
     }
 
-    // Version PDF.js utilisée via CDN
     const PDFJS_VERSION = "4.0.379";
-
-    const pdfjs: any = await import(
-      /* webpackIgnore: true */ `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.mjs`
-    );
-
-    // Worker PDF.js également via CDN
+    const pdfjs: any = await import(/* webpackIgnore: true */ `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.mjs`);
     pdfjs.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
 
     __pdfjs = pdfjs;
@@ -593,13 +582,7 @@ async function ensurePdfJs() {
   return __pdfjsLoading;
 }
 
-function PdfCanvasViewer({
-  fileUrl,
-  className,
-}: {
-  fileUrl: string | null;
-  className?: string;
-}) {
+function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; className?: string }) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -610,7 +593,6 @@ function PdfCanvasViewer({
   const [rendering, setRendering] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // load doc
   useEffect(() => {
     let cancelled = false;
 
@@ -624,8 +606,6 @@ function PdfCanvasViewer({
 
       try {
         const pdfjs = await ensurePdfJs();
-
-        // On passe un objet { url } (plus robuste)
         const task = (pdfjs as any).getDocument({ url: fileUrl });
         const doc = await task.promise;
         if (cancelled) return;
@@ -643,7 +623,6 @@ function PdfCanvasViewer({
     };
   }, [fileUrl]);
 
-  // render page
   useEffect(() => {
     let cancelled = false;
 
@@ -693,7 +672,7 @@ function PdfCanvasViewer({
     try {
       const p = await pdf.getPage(page);
       const viewport1 = p.getViewport({ scale: 1 });
-      const pad = 24; // marge intérieure
+      const pad = 24;
       const w = Math.max(320, wrapRef.current.clientWidth - pad);
       const next = w / viewport1.width;
       setScale(Math.max(0.4, Math.min(2.2, next)));
@@ -729,38 +708,20 @@ function PdfCanvasViewer({
         </div>
 
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            className="btn-secondary !py-1.5 !px-3 text-[11px]"
-            onClick={() => canPrev && setPage((p) => p - 1)}
-            disabled={!canPrev}
-          >
+          <button type="button" className="btn-secondary !py-1.5 !px-3 text-[11px]" onClick={() => canPrev && setPage((p) => p - 1)} disabled={!canPrev}>
             ←
           </button>
-          <button
-            type="button"
-            className="btn-secondary !py-1.5 !px-3 text-[11px]"
-            onClick={() => canNext && setPage((p) => p + 1)}
-            disabled={!canNext}
-          >
+          <button type="button" className="btn-secondary !py-1.5 !px-3 text-[11px]" onClick={() => canNext && setPage((p) => p + 1)} disabled={!canNext}>
             →
           </button>
 
           <span className="w-[1px] h-5 bg-[var(--border)] mx-1" />
 
-          <button
-            type="button"
-            className="btn-secondary !py-1.5 !px-3 text-[11px]"
-            onClick={() => setScale((s) => Math.max(0.4, Number((s - 0.1).toFixed(2))))}
-          >
+          <button type="button" className="btn-secondary !py-1.5 !px-3 text-[11px]" onClick={() => setScale((s) => Math.max(0.4, Number((s - 0.1).toFixed(2))))}>
             -
           </button>
           <span className="text-[11px] text-[var(--muted)] w-[54px] text-center">{Math.round(scale * 100)}%</span>
-          <button
-            type="button"
-            className="btn-secondary !py-1.5 !px-3 text-[11px]"
-            onClick={() => setScale((s) => Math.min(2.2, Number((s + 0.1).toFixed(2))))}
-          >
+          <button type="button" className="btn-secondary !py-1.5 !px-3 text-[11px]" onClick={() => setScale((s) => Math.min(2.2, Number((s + 0.1).toFixed(2))))}>
             +
           </button>
 
@@ -873,6 +834,10 @@ export default function AssistanceCandidaturePage() {
   // ✅ Couleur PDF (CV + LM)
   const [pdfBrand, setPdfBrand] = useState("#ef4444");
 
+  // ✅ Description de l’offre + switch IA CV
+  const [cvOfferDescription, setCvOfferDescription] = useState("");
+  const [cvUseAiOptimizeOnDownload, setCvUseAiOptimizeOnDownload] = useState(true);
+
   // Templates
   const [templatesModalOpen, setTemplatesModalOpen] = useState(false);
   const [templateSearch, setTemplateSearch] = useState("");
@@ -892,6 +857,9 @@ export default function AssistanceCandidaturePage() {
   // Fullscreen modals
   const [cvEditorOpen, setCvEditorOpen] = useState(false);
   const [cvLmViewerOpen, setCvLmViewerOpen] = useState(false);
+
+  // ✅ Mobile CV editor view (edit / preview)
+  const [cvMobileView, setCvMobileView] = useState<"edit" | "preview">("edit");
 
   // --- LM ---
   const [lmLang, setLmLang] = useState<Lang>("fr");
@@ -947,14 +915,12 @@ export default function AssistanceCandidaturePage() {
     return profileToCvDocModel(profile, { targetJob: cvTargetJob, contract: cvContract });
   }, [profile, cvTargetJob, cvContract]);
 
-  // sync draft tant que pas dirty
   useEffect(() => {
     if (!baseCvModel) return;
     if (!cvDraft || !cvDraftDirty) setCvDraft(baseCvModel);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [baseCvModel]);
 
-  // cleanup URLs
   useEffect(() => {
     return () => {
       if (cvPreviewUrl) URL.revokeObjectURL(cvPreviewUrl);
@@ -963,7 +929,6 @@ export default function AssistanceCandidaturePage() {
     };
   }, [cvPreviewUrl, lmPreviewUrl, cvLmPreviewUrl]);
 
-  // top3 + modal
   const top3Templates = useMemo(() => {
     const all = cvTemplates || [];
     const first = all.slice(0, 3);
@@ -1016,7 +981,6 @@ export default function AssistanceCandidaturePage() {
     localStorage.removeItem(cvStorageKey);
   };
 
-  // auto load if exists and not dirty
   useEffect(() => {
     if (!cvStorageKey) return;
     if (!profile) return;
@@ -1102,9 +1066,7 @@ export default function AssistanceCandidaturePage() {
 
     try {
       const cvModel = buildFinalCvModel();
-      const { blob, bestScale } = await fitOnePage((scale) =>
-        buildCvPdf(cvTemplate, cvModel, cvLang, colors, "auto", scale)
-      );
+      const { blob, bestScale } = await fitOnePage((scale) => buildCvPdf(cvTemplate, cvModel, cvLang, colors, "auto", scale));
 
       setCvLastBlob(blob);
 
@@ -1126,8 +1088,56 @@ export default function AssistanceCandidaturePage() {
     }
   };
 
-  // ✅ Download CV (USER CLICK ONLY)
+  // ✅ Download CV (USER CLICK ONLY) + IA option (Cloud Function)
   const downloadCv = async () => {
+    if (!profile || !baseCvModel) {
+      setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA.");
+      return;
+    }
+
+    // ✅ si IA activée + offre fournie → Cloud Function (CV adapté)
+    if (cvUseAiOptimizeOnDownload && cvOfferDescription.trim()) {
+      try {
+        const user = auth.currentUser;
+        if (!user) throw new Error("Connecte-toi pour télécharger un CV adapté.");
+
+        setCvError(null);
+        setGlobalLoadingMessage("Adaptation du CV à l’offre (IA)…");
+        const idToken = await user.getIdToken();
+        const recaptchaToken = await getRecaptchaToken("generate_cv_pdf");
+
+        const blob = await callGenerateCvPdf({
+          profile: profile as any,
+          targetJob: cvTargetJob,
+          lang: cvLang,
+          contract: cvContract,
+          jobLink,
+          jobDescription: cvOfferDescription,
+          companyName,
+          recaptchaToken,
+          idToken,
+        });
+
+        downloadBlob(blob, "cv-ia-adapte.pdf");
+        await autoCreateApplication("cv");
+
+        await logUsage({
+          user,
+          action: "download_pdf",
+          docType: "cv",
+          eventType: "cv_download",
+          tool: "cloudFunctionGenerateCvPdf",
+        });
+
+        return;
+      } catch (e: any) {
+        setCvError(e?.message || "Impossible d’adapter le CV via IA.");
+      } finally {
+        setGlobalLoadingMessage(null);
+      }
+    }
+
+    // ✅ sinon : téléchargement du PDF local (preview)
     const blob = cvLastBlob ?? (await prepareCvPreview());
     if (!blob) return;
 
@@ -1146,7 +1156,7 @@ export default function AssistanceCandidaturePage() {
   };
 
   // =============================
-  // ✅ Generate letter text (AI)
+  // ✅ Generate letter text (AI) (Cloud Functions)
   // =============================
   const generateCoverLetterText = async (lang: Lang): Promise<string> => {
     if (!profile) throw new Error("Profil manquant.");
@@ -1157,7 +1167,7 @@ export default function AssistanceCandidaturePage() {
     const user = auth.currentUser;
     if (!user) throw new Error("Vous devez être connecté pour générer une lettre.");
 
-    const token = await user.getIdToken();
+    const idToken = await user.getIdToken();
     const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
 
     const profileContext = buildProfileContext(profile);
@@ -1170,36 +1180,22 @@ export default function AssistanceCandidaturePage() {
       jobLink,
     });
 
-    const resp = await fetch(LETTER_AND_PITCH_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({
-        profile,
-        jobTitle,
-        companyName,
-        jobDescription: strictPrompt,
-        lang,
-        recaptchaToken,
-      }),
+    const res = await callGenerateLetterAndPitch({
+      profile: profile as any,
+      jobTitle,
+      companyName,
+      jobDescription: strictPrompt,
+      lang,
+      recaptchaToken,
+      idToken,
     });
 
-    const json = await resp.json().catch(() => null);
-    if (!resp.ok) {
-      const msg = (json && json.error) || "Erreur pendant la génération de la lettre de motivation.";
-      throw new Error(msg);
-    }
-
-    const apiLetterBody = typeof json?.letterBody === "string" ? json.letterBody.trim() : "";
-    const apiCoverLetter = typeof json?.coverLetter === "string" ? json.coverLetter.trim() : "";
-
-    const out = apiLetterBody || apiCoverLetter;
+    const out = (res.letterBody || res.coverLetter || "").trim();
     const cleaned = sanitizeLM(out);
-
     if (!cleaned) throw new Error("Lettre vide renvoyée par l'API.");
 
     const name = safeText(profile.fullName);
-    const bodyOnly = extractBodyOnly(cleaned, lang, name);
-    return bodyOnly || cleaned;
+    return extractBodyOnly(cleaned, lang, name) || cleaned;
   };
 
   // =============================
@@ -1409,7 +1405,7 @@ export default function AssistanceCandidaturePage() {
     try {
       const coverLetterBody = await generateCoverLetterText(lmLang);
       setLetterBody(coverLetterBody);
-      setLmEditorOpen(true); // ✅ ouvre l’éditeur plein écran
+      setLmEditorOpen(true);
       await prepareLmPreview({ ensureText: false });
     } catch (err: any) {
       console.error("Erreur generateLetter:", err);
@@ -1421,7 +1417,7 @@ export default function AssistanceCandidaturePage() {
   };
 
   // =============================
-  // ✅ Pitch
+  // ✅ Pitch (Cloud Functions)
   // =============================
   const handleGeneratePitch = async () => {
     if (!profile) {
@@ -1443,37 +1439,29 @@ export default function AssistanceCandidaturePage() {
       const token = await user.getIdToken();
       const recaptchaToken = await getRecaptchaToken("generate_letter_pitch");
 
-      const resp = await fetch(LETTER_AND_PITCH_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({
-          profile,
-          jobTitle: effectiveJobTitle,
-          companyName,
-          jobDescription: effectiveDesc,
-          lang: pitchLang,
-          recaptchaToken,
-        }),
+      const res = await callGenerateLetterAndPitch({
+        profile: profile as any,
+        jobTitle: effectiveJobTitle,
+        companyName,
+        jobDescription: effectiveDesc,
+        lang: pitchLang,
+        recaptchaToken,
+        idToken: token,
       });
 
-      const json = await resp.json().catch(() => null);
-      if (!resp.ok) throw new Error((json && json.error) || "Erreur pendant la génération du pitch.");
-
-      const pitch = typeof json.pitch === "string" ? json.pitch.trim() : "";
+      const pitch = (res.pitch || "").trim();
       if (!pitch) throw new Error("Pitch vide renvoyé par l'API.");
 
       setPitchText(pitch);
       await autoCreateApplication("pitch");
 
-      if (auth.currentUser) {
-        await logUsage({
-          user: auth.currentUser,
-          action: "generate_pitch",
-          docType: "other",
-          eventType: "generate",
-          tool: "generateLetterAndPitch",
-        });
-      }
+      await logUsage({
+        user,
+        action: "generate_pitch",
+        docType: "other",
+        eventType: "generate",
+        tool: "generateLetterAndPitch",
+      });
     } catch (err: any) {
       console.error("Erreur generatePitch:", err);
       setPitchError(err?.message || "Impossible de générer le pitch.");
@@ -1645,6 +1633,29 @@ ${name || "—"}
             />
           </div>
 
+          {/* ✅ Offre + switch IA CV */}
+          <div>
+            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Description de l’offre (pour adapter le CV au poste)</label>
+            <textarea
+              rows={4}
+              className="input textarea w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
+              placeholder="Colle ici 5–20 lignes: missions, outils, contexte…"
+              value={cvOfferDescription}
+              onChange={(e) => setCvOfferDescription(e.target.value)}
+            />
+            <label className="mt-2 flex items-center gap-2 cursor-pointer text-[12px]">
+              <input
+                type="checkbox"
+                className="toggle-checkbox"
+                checked={cvUseAiOptimizeOnDownload}
+                onChange={(e) => setCvUseAiOptimizeOnDownload(e.target.checked)}
+              />
+              <span className="text-[var(--muted)]">
+                Adapter le CV via IA <strong>au téléchargement</strong> (consomme des crédits).
+              </span>
+            </label>
+          </div>
+
           {/* Templates top3 + modal */}
           <div className="space-y-2">
             <div className="flex items-end justify-between gap-2">
@@ -1668,8 +1679,9 @@ ${name || "—"}
                     key={t.id}
                     type="button"
                     onClick={() => setCvTemplate(t.id)}
-                    className={`text-left rounded-2xl border p-2 bg-[var(--bg-soft)] transition
-                      ${active ? "border-[var(--brand)] ring-2 ring-[var(--brand)]/20" : "border-[var(--border)] hover:border-[var(--brand)]/50"}`}
+                    className={`text-left rounded-2xl border p-2 bg-[var(--bg-soft)] transition ${
+                      active ? "border-[var(--brand)] ring-2 ring-[var(--brand)]/20" : "border-[var(--border)] hover:border-[var(--brand)]/50"
+                    }`}
                   >
                     <img
                       src={t.previewSrc}
@@ -1767,6 +1779,7 @@ ${name || "—"}
             type="button"
             onClick={async () => {
               await prepareCvPreview();
+              setCvMobileView("edit");
               setCvEditorOpen(true);
             }}
             disabled={cvLoading || !profile}
@@ -1788,25 +1801,19 @@ ${name || "—"}
           </button>
         </div>
 
-        {/* Status + preview inline (SANS iframe) */}
         <div className="mt-2 p-2.5 rounded-md border border-dashed border-[var(--border)]/70 text-[11px] text-[var(--muted)]">
-          {cvStatus ? (
-            <p className="text-center text-emerald-400 text-[12px]">{cvStatus}</p>
-          ) : (
-            <p className="text-center">Prépare un aperçu, vérifie dans l’éditeur, puis télécharge.</p>
-          )}
+          {cvStatus ? <p className="text-center text-emerald-400 text-[12px]">{cvStatus}</p> : <p className="text-center">Prépare un aperçu, vérifie dans l’éditeur, puis télécharge.</p>}
           {cvError && <p className="mt-1 text-center text-red-400 text-[12px]">{cvError}</p>}
 
-          {/* CV preview actions */}
           {cvPreviewUrl && (
             <div className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--bg)] overflow-hidden">
               <div className="flex flex-wrap items-center justify-between gap-2 p-2 border-b border-[var(--border)] bg-[var(--bg-soft)]">
                 <p className="text-[11px] text-[var(--muted)]">Aperçu CV prêt (sans toolbar Chrome)</p>
                 <div className="flex gap-2">
-                  <button type="button" className="btn-secondary !py-1 !px-3 text-[11px]" onClick={() => setCvEditorOpen(true)}>
+                  <button type="button" className="btn-secondary !py-1 !px-3 text-[11px]" onClick={() => (setCvMobileView("edit"), setCvEditorOpen(true))}>
                     Ouvrir l’éditeur
                   </button>
-                  <button type="button" className="btn-primary !py-1 !px-3 text-[11px]" onClick={downloadCv} disabled={!cvLastBlob}>
+                  <button type="button" className="btn-primary !py-1 !px-3 text-[11px]" onClick={downloadCv}>
                     Télécharger
                   </button>
                 </div>
@@ -1815,7 +1822,6 @@ ${name || "—"}
             </div>
           )}
 
-          {/* CV+LM preview actions */}
           {cvLmPreviewUrl && (
             <div className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--bg)] overflow-hidden">
               <div className="flex flex-wrap items-center justify-between gap-2 p-2 border-b border-[var(--border)] bg-[var(--bg-soft)]">
@@ -1824,7 +1830,7 @@ ${name || "—"}
                   <button type="button" className="btn-secondary !py-1 !px-3 text-[11px]" onClick={() => setCvLmViewerOpen(true)}>
                     Ouvrir l’aperçu
                   </button>
-                  <button type="button" className="btn-primary !py-1 !px-3 text-[11px]" onClick={downloadCvLm} disabled={!cvLmLastBlob}>
+                  <button type="button" className="btn-primary !py-1 !px-3 text-[11px]" onClick={downloadCvLm}>
                     Télécharger
                   </button>
                 </div>
@@ -1961,11 +1967,7 @@ ${name || "—"}
               <p className="text-[11px] text-[var(--muted)]">Résumé percutant de 2–4 phrases.</p>
             </div>
           </div>
-          <select
-            className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
-            value={pitchLang}
-            onChange={(e) => setPitchLang(e.target.value as Lang)}
-          >
+          <select className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]" value={pitchLang} onChange={(e) => setPitchLang(e.target.value as Lang)}>
             <option value="fr">FR</option>
             <option value="en">EN</option>
           </select>
@@ -2040,14 +2042,12 @@ ${name || "—"}
           </div>
           <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
             <h4 className="font-semibold text-sm mb-2">Corps du mail</h4>
-            <div className="text-xs text-[var(--muted)] whitespace-pre-line max-h-64 overflow-auto">
-              {emailPreview || "Le texte du mail apparaîtra ici après génération."}
-            </div>
+            <div className="text-xs text-[var(--muted)] whitespace-pre-line max-h-64 overflow-auto">{emailPreview || "Le texte du mail apparaîtra ici après génération."}</div>
           </div>
         </div>
       </section>
 
-      {/* =============== MODAL CV FULLSCREEN =============== */}
+      {/* =============== MODAL CV FULLSCREEN (RESPONSIVE) =============== */}
       <FullScreenModal
         open={cvEditorOpen}
         title="Éditeur CV — plein écran"
@@ -2066,373 +2066,417 @@ ${name || "—"}
             <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={prepareCvPreview} disabled={cvLoading}>
               Régénérer aperçu
             </button>
-            <button type="button" className="btn-primary !py-2 !px-3 text-[12px]" onClick={downloadCv} disabled={!cvLastBlob}>
+            <button type="button" className="btn-primary !py-2 !px-3 text-[12px]" onClick={downloadCv}>
               Télécharger
             </button>
           </>
         }
       >
-        <div className="h-full grid grid-cols-1 lg:grid-cols-2 min-h-0">
-          {/* LEFT: editor */}
-          <div className="min-h-0 overflow-auto p-3 sm:p-4 border-b lg:border-b-0 lg:border-r border-[var(--border)]">
-            {!cvDraft ? (
-              <p className="text-[11px] text-[var(--muted)]">Charge ton profil CV IA pour éditer.</p>
-            ) : (
-              <div className="space-y-3">
-                {/* Sections */}
-                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-soft)] p-3">
-                  <p className="text-[11px] font-medium text-[var(--muted)] mb-2">Sections à afficher</p>
-                  <div className="grid grid-cols-2 gap-2 text-[11px] text-[var(--muted)]">
-                    {(
-                      [
-                        ["profile", "Profil"],
-                        ["xp", "Expérience"],
-                        ["education", "Formation"],
-                        ["skills", "Compétences"],
-                        ["certs", "Certifications"],
-                        ["languages", "Langues"],
-                        ["hobbies", "Hobbies"],
-                      ] as Array<[CvSectionKey, string]>
-                    ).map(([k, label]) => (
-                      <label key={k} className="flex items-center gap-2 cursor-pointer">
-                        <input type="checkbox" checked={cvSections[k]} onChange={(e) => setCvSections((prev) => ({ ...prev, [k]: e.target.checked }))} />
-                        <span>{label}</span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Quick fields */}
-                <div className="grid sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom</label>
-                    <input
-                      className="input w-full"
-                      value={(cvDraft as any).name || ""}
-                      onChange={(e) => {
-                        setCvDraftDirty(true);
-                        setCvDraft((prev) => (prev ? ({ ...prev, name: e.target.value } as any) : prev));
-                      }}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Titre</label>
-                    <input
-                      className="input w-full"
-                      value={(cvDraft as any).title || ""}
-                      onChange={(e) => {
-                        setCvDraftDirty(true);
-                        setCvDraft((prev) => (prev ? ({ ...prev, title: e.target.value } as any) : prev));
-                      }}
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Contact line</label>
-                  <input
-                    className="input w-full"
-                    value={(cvDraft as any).contactLine || ""}
-                    onChange={(e) => {
-                      setCvDraftDirty(true);
-                      setCvDraft((prev) => (prev ? ({ ...prev, contactLine: e.target.value } as any) : prev));
-                    }}
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Profil</label>
-                  <textarea
-                    rows={4}
-                    className="input textarea w-full"
-                    value={(cvDraft as any).profile || ""}
-                    onChange={(e) => {
-                      setCvDraftDirty(true);
-                      setCvDraft((prev) => (prev ? ({ ...prev, profile: e.target.value } as any) : prev));
-                    }}
-                  />
-                </div>
-
-                <div className="grid sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Certifications</label>
-                    <textarea
-                      rows={3}
-                      className="input textarea w-full"
-                      value={(cvDraft as any).certs || ""}
-                      onChange={(e) => {
-                        setCvDraftDirty(true);
-                        setCvDraft((prev) => (prev ? ({ ...prev, certs: e.target.value } as any) : prev));
-                      }}
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Langues</label>
-                    <textarea
-                      rows={3}
-                      className="input textarea w-full"
-                      value={(cvDraft as any).langLine || ""}
-                      onChange={(e) => {
-                        setCvDraftDirty(true);
-                        setCvDraft((prev) => (prev ? ({ ...prev, langLine: e.target.value } as any) : prev));
-                      }}
-                    />
-                  </div>
-                </div>
-
-                {/* Skills */}
-                <div className="grid sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Compétences – tools (virgules)</label>
-                    <textarea
-                      rows={3}
-                      className="input textarea w-full"
-                      value={joinList(((cvDraft as any).skills?.tools || []) as string[])}
-                      onChange={(e) => {
-                        const tools = splitList(e.target.value);
-                        setCvDraftDirty(true);
-                        setCvDraft((prev) => {
-                          if (!prev) return prev;
-                          const skills = { ...(prev as any).skills, tools };
-                          return { ...(prev as any), skills };
-                        });
-                      }}
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Compétences – cloud</label>
-                    <textarea
-                      rows={3}
-                      className="input textarea w-full"
-                      value={joinList(((cvDraft as any).skills?.cloud || []) as string[])}
-                      onChange={(e) => {
-                        const cloud = splitList(e.target.value);
-                        setCvDraftDirty(true);
-                        setCvDraft((prev) => {
-                          if (!prev) return prev;
-                          const skills = { ...(prev as any).skills, cloud };
-                          return { ...(prev as any), skills };
-                        });
-                      }}
-                    />
-                  </div>
-                </div>
-
-                {/* Education */}
-                <div>
-                  <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Formation (1 ligne = 1 entrée)</label>
-                  <textarea
-                    rows={4}
-                    className="input textarea w-full"
-                    value={linesToText(((cvDraft as any).education || []) as string[])}
-                    onChange={(e) => {
-                      setCvDraftDirty(true);
-                      const education = textToLines(e.target.value);
-                      setCvDraft((prev) => (prev ? ({ ...prev, education } as any) : prev));
-                    }}
-                  />
-                </div>
-
-                {/* Experiences */}
-                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-soft)] p-3">
-                  <div className="flex items-center justify-between gap-2 mb-2">
-                    <p className="text-[11px] font-medium text-[var(--muted)]">Expériences</p>
-                    <button
-                      type="button"
-                      className="btn-secondary !py-1 !px-3 text-[11px]"
-                      onClick={() => {
-                        setCvDraftDirty(true);
-                        setCvDraft((prev) => {
-                          if (!prev) return prev;
-                          const xp = Array.isArray((prev as any).xp) ? ([...(prev as any).xp] as any[]) : [];
-                          xp.unshift({ company: "", role: "", dates: "", city: "", bullets: [] });
-                          return { ...(prev as any), xp };
-                        });
-                      }}
-                    >
-                      + Ajouter
-                    </button>
-                  </div>
-
-                  <div className="space-y-2">
-                    {(((cvDraft as any).xp || []) as any[]).map((x, idx) => (
-                      <details key={idx} className="rounded-xl border border-[var(--border)] bg-[var(--bg)] p-2">
-                        <summary className="cursor-pointer text-[12px] font-semibold text-[var(--ink)]">
-                          {(x.role || "Rôle")} — {(x.company || "Entreprise")}{" "}
-                          <span className="text-[10px] text-[var(--muted)]">#{idx + 1}</span>
-                        </summary>
-
-                        <div className="mt-2 space-y-2">
-                          <div className="grid sm:grid-cols-2 gap-2">
-                            <input
-                              className="input w-full"
-                              placeholder="Rôle"
-                              value={x.role || ""}
-                              onChange={(e) => {
-                                setCvDraftDirty(true);
-                                setCvDraft((prev) => {
-                                  if (!prev) return prev;
-                                  const xp = [...((prev as any).xp || [])];
-                                  xp[idx] = { ...xp[idx], role: e.target.value };
-                                  return { ...(prev as any), xp };
-                                });
-                              }}
-                            />
-                            <input
-                              className="input w-full"
-                              placeholder="Entreprise"
-                              value={x.company || ""}
-                              onChange={(e) => {
-                                setCvDraftDirty(true);
-                                setCvDraft((prev) => {
-                                  if (!prev) return prev;
-                                  const xp = [...((prev as any).xp || [])];
-                                  xp[idx] = { ...xp[idx], company: e.target.value };
-                                  return { ...(prev as any), xp };
-                                });
-                              }}
-                            />
-                          </div>
-
-                          <div className="grid sm:grid-cols-2 gap-2">
-                            <input
-                              className="input w-full"
-                              placeholder="Dates (ex: 2022–2024)"
-                              value={x.dates || ""}
-                              onChange={(e) => {
-                                setCvDraftDirty(true);
-                                setCvDraft((prev) => {
-                                  if (!prev) return prev;
-                                  const xp = [...((prev as any).xp || [])];
-                                  xp[idx] = { ...xp[idx], dates: e.target.value };
-                                  return { ...(prev as any), xp };
-                                });
-                              }}
-                            />
-                            <input
-                              className="input w-full"
-                              placeholder="Ville / Lieu"
-                              value={x.city || ""}
-                              onChange={(e) => {
-                                setCvDraftDirty(true);
-                                setCvDraft((prev) => {
-                                  if (!prev) return prev;
-                                  const xp = [...((prev as any).xp || [])];
-                                  xp[idx] = { ...xp[idx], city: e.target.value };
-                                  return { ...(prev as any), xp };
-                                });
-                              }}
-                            />
-                          </div>
-
-                          <textarea
-                            rows={4}
-                            className="input textarea w-full"
-                            placeholder={"Bullets (1 ligne = 1 bullet)\n- Exemple: Mise en place MFA\n- Exemple: Durcissement AD"}
-                            value={bulletsToText(x.bullets || [])}
-                            onChange={(e) => {
-                              const bullets = textToBullets(e.target.value);
-                              setCvDraftDirty(true);
-                              setCvDraft((prev) => {
-                                if (!prev) return prev;
-                                const xp = [...((prev as any).xp || [])];
-                                xp[idx] = { ...xp[idx], bullets };
-                                return { ...(prev as any), xp };
-                              });
-                            }}
-                          />
-
-                          <div className="flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              className="btn-secondary !py-1 !px-3 text-[11px]"
-                              onClick={() => {
-                                setCvDraftDirty(true);
-                                setCvDraft((prev) => {
-                                  if (!prev) return prev;
-                                  const xp = [...((prev as any).xp || [])];
-                                  if (idx > 0) [xp[idx - 1], xp[idx]] = [xp[idx], xp[idx - 1]];
-                                  return { ...(prev as any), xp };
-                                });
-                              }}
-                            >
-                              ↑ Monter
-                            </button>
-
-                            <button
-                              type="button"
-                              className="btn-secondary !py-1 !px-3 text-[11px]"
-                              onClick={() => {
-                                setCvDraftDirty(true);
-                                setCvDraft((prev) => {
-                                  if (!prev) return prev;
-                                  const xp = [...((prev as any).xp || [])];
-                                  if (idx < xp.length - 1) [xp[idx + 1], xp[idx]] = [xp[idx], xp[idx + 1]];
-                                  return { ...(prev as any), xp };
-                                });
-                              }}
-                            >
-                              ↓ Descendre
-                            </button>
-
-                            <button
-                              type="button"
-                              className="btn-secondary !py-1 !px-3 text-[11px] border-red-500/40 text-red-300 hover:border-red-500"
-                              onClick={() => {
-                                setCvDraftDirty(true);
-                                setCvDraft((prev) => {
-                                  if (!prev) return prev;
-                                  const xp = [...((prev as any).xp || [])];
-                                  xp.splice(idx, 1);
-                                  return { ...(prev as any), xp };
-                                });
-                              }}
-                            >
-                              Supprimer
-                            </button>
-                          </div>
-                        </div>
-                      </details>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Hobbies */}
-                <div>
-                  <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Hobbies (virgules)</label>
-                  <input
-                    className="input w-full"
-                    value={joinList(((cvDraft as any).hobbies || []) as string[])}
-                    onChange={(e) => {
-                      const hobbies = splitList(e.target.value);
-                      setCvDraftDirty(true);
-                      setCvDraft((prev) => (prev ? ({ ...prev, hobbies } as any) : prev));
-                    }}
-                  />
-                </div>
-
-                {/* Reset */}
-                <button
-                  type="button"
-                  className="btn-secondary w-full"
-                  onClick={() => {
-                    if (!baseCvModel) return;
-                    setCvDraft(baseCvModel);
-                    setCvDraftDirty(false);
-                    setCvSections(DEFAULT_CV_SECTIONS);
-                  }}
-                >
-                  Réinitialiser au profil IA
-                </button>
-              </div>
-            )}
+        <div className="h-full min-h-0">
+          {/* ✅ Mobile switch (edit / preview) */}
+          <div className="lg:hidden p-2 border-b border-[var(--border)] bg-[var(--bg-soft)] flex gap-2">
+            <button
+              type="button"
+              className={`btn-secondary flex-1 !py-2 ${cvMobileView === "edit" ? "!border-[var(--brand)]" : ""}`}
+              onClick={() => setCvMobileView("edit")}
+            >
+              Éditer
+            </button>
+            <button
+              type="button"
+              className={`btn-secondary flex-1 !py-2 ${cvMobileView === "preview" ? "!border-[var(--brand)]" : ""}`}
+              onClick={() => setCvMobileView("preview")}
+            >
+              Aperçu
+            </button>
           </div>
 
-          {/* RIGHT: preview (PDF.js canvas) */}
-          <div className="min-h-0 bg-white border-t lg:border-t-0 lg:border-l border-[var(--border)]">
-            <PdfCanvasViewer fileUrl={cvPreviewUrl} />
+          {/* Desktop split / Mobile one view */}
+          <div className="h-[calc(100%-48px)] lg:h-full grid grid-cols-1 lg:grid-cols-2 min-h-0">
+            {/* LEFT: editor */}
+            <div className={`${cvMobileView === "preview" ? "hidden" : ""} lg:block min-h-0 overflow-auto p-3 sm:p-4 border-b lg:border-b-0 lg:border-r border-[var(--border)]`}>
+              {/* ✅ Mobile actions bar (requested) */}
+              <div className="lg:hidden sticky top-0 z-10 -mx-3 sm:-mx-4 px-3 sm:px-4 py-2 border-b border-[var(--border)] bg-[var(--bg-soft)]">
+                <div className="grid grid-cols-2 gap-2">
+                  <button type="button" className="btn-secondary !py-2 text-[12px]" onClick={loadCvDraft} disabled={!userId}>
+                    Charger
+                  </button>
+                  <button type="button" className="btn-secondary !py-2 text-[12px]" onClick={saveCvDraft} disabled={!userId || !cvDraft}>
+                    Enregistrer
+                  </button>
+                  <button type="button" className="btn-secondary !py-2 text-[12px]" onClick={clearCvDraft} disabled={!userId}>
+                    Oublier
+                  </button>
+                  <button type="button" className="btn-secondary !py-2 text-[12px]" onClick={prepareCvPreview} disabled={cvLoading}>
+                    Régénérer aperçu
+                  </button>
+                  <button type="button" className="btn-primary !py-2 text-[12px]" onClick={downloadCv}>
+                    Télécharger
+                  </button>
+                  <button type="button" className="btn-secondary !py-2 text-[12px]" onClick={() => setCvEditorOpen(false)}>
+                    Fermer
+                  </button>
+                </div>
+              </div>
+
+              {!cvDraft ? (
+                <p className="text-[11px] text-[var(--muted)]">Charge ton profil CV IA pour éditer.</p>
+              ) : (
+                <div className="space-y-3">
+                  {/* Sections */}
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-soft)] p-3">
+                    <p className="text-[11px] font-medium text-[var(--muted)] mb-2">Sections à afficher</p>
+                    <div className="grid grid-cols-2 gap-2 text-[11px] text-[var(--muted)]">
+                      {(
+                        [
+                          ["profile", "Profil"],
+                          ["xp", "Expérience"],
+                          ["education", "Formation"],
+                          ["skills", "Compétences"],
+                          ["certs", "Certifications"],
+                          ["languages", "Langues"],
+                          ["hobbies", "Hobbies"],
+                        ] as Array<[CvSectionKey, string]>
+                      ).map(([k, label]) => (
+                        <label key={k} className="flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" checked={cvSections[k]} onChange={(e) => setCvSections((prev) => ({ ...prev, [k]: e.target.checked }))} />
+                          <span>{label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Quick fields */}
+                  <div className="grid sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom</label>
+                      <input
+                        className="input w-full"
+                        value={(cvDraft as any).name || ""}
+                        onChange={(e) => {
+                          setCvDraftDirty(true);
+                          setCvDraft((prev) => (prev ? ({ ...prev, name: e.target.value } as any) : prev));
+                        }}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Titre</label>
+                      <input
+                        className="input w-full"
+                        value={(cvDraft as any).title || ""}
+                        onChange={(e) => {
+                          setCvDraftDirty(true);
+                          setCvDraft((prev) => (prev ? ({ ...prev, title: e.target.value } as any) : prev));
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Contact line</label>
+                    <input
+                      className="input w-full"
+                      value={(cvDraft as any).contactLine || ""}
+                      onChange={(e) => {
+                        setCvDraftDirty(true);
+                        setCvDraft((prev) => (prev ? ({ ...prev, contactLine: e.target.value } as any) : prev));
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Profil</label>
+                    <textarea
+                      rows={4}
+                      className="input textarea w-full"
+                      value={(cvDraft as any).profile || ""}
+                      onChange={(e) => {
+                        setCvDraftDirty(true);
+                        setCvDraft((prev) => (prev ? ({ ...prev, profile: e.target.value } as any) : prev));
+                      }}
+                    />
+                  </div>
+
+                  <div className="grid sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Certifications</label>
+                      <textarea
+                        rows={3}
+                        className="input textarea w-full"
+                        value={(cvDraft as any).certs || ""}
+                        onChange={(e) => {
+                          setCvDraftDirty(true);
+                          setCvDraft((prev) => (prev ? ({ ...prev, certs: e.target.value } as any) : prev));
+                        }}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Langues</label>
+                      <textarea
+                        rows={3}
+                        className="input textarea w-full"
+                        value={(cvDraft as any).langLine || ""}
+                        onChange={(e) => {
+                          setCvDraftDirty(true);
+                          setCvDraft((prev) => (prev ? ({ ...prev, langLine: e.target.value } as any) : prev));
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Skills */}
+                  <div className="grid sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Compétences – tools (virgules)</label>
+                      <textarea
+                        rows={3}
+                        className="input textarea w-full"
+                        value={joinList(((cvDraft as any).skills?.tools || []) as string[])}
+                        onChange={(e) => {
+                          const tools = splitList(e.target.value);
+                          setCvDraftDirty(true);
+                          setCvDraft((prev) => {
+                            if (!prev) return prev;
+                            const skills = { ...(prev as any).skills, tools };
+                            return { ...(prev as any), skills };
+                          });
+                        }}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Compétences – cloud</label>
+                      <textarea
+                        rows={3}
+                        className="input textarea w-full"
+                        value={joinList(((cvDraft as any).skills?.cloud || []) as string[])}
+                        onChange={(e) => {
+                          const cloud = splitList(e.target.value);
+                          setCvDraftDirty(true);
+                          setCvDraft((prev) => {
+                            if (!prev) return prev;
+                            const skills = { ...(prev as any).skills, cloud };
+                            return { ...(prev as any), skills };
+                          });
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Education */}
+                  <div>
+                    <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Formation (1 ligne = 1 entrée)</label>
+                    <textarea
+                      rows={4}
+                      className="input textarea w-full"
+                      value={linesToText(((cvDraft as any).education || []) as string[])}
+                      onChange={(e) => {
+                        setCvDraftDirty(true);
+                        const education = textToLines(e.target.value);
+                        setCvDraft((prev) => (prev ? ({ ...prev, education } as any) : prev));
+                      }}
+                    />
+                  </div>
+
+                  {/* Experiences */}
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-soft)] p-3">
+                    <div className="flex items-center justify-between gap-2 mb-2">
+                      <p className="text-[11px] font-medium text-[var(--muted)]">Expériences</p>
+                      <button
+                        type="button"
+                        className="btn-secondary !py-1 !px-3 text-[11px]"
+                        onClick={() => {
+                          setCvDraftDirty(true);
+                          setCvDraft((prev) => {
+                            if (!prev) return prev;
+                            const xp = Array.isArray((prev as any).xp) ? ([...(prev as any).xp] as any[]) : [];
+                            xp.unshift({ company: "", role: "", dates: "", city: "", bullets: [] });
+                            return { ...(prev as any), xp };
+                          });
+                        }}
+                      >
+                        + Ajouter
+                      </button>
+                    </div>
+
+                    <div className="space-y-2">
+                      {(((cvDraft as any).xp || []) as any[]).map((x, idx) => (
+                        <details key={idx} className="rounded-xl border border-[var(--border)] bg-[var(--bg)] p-2">
+                          <summary className="cursor-pointer text-[12px] font-semibold text-[var(--ink)]">
+                            {(x.role || "Rôle")} — {(x.company || "Entreprise")} <span className="text-[10px] text-[var(--muted)]">#{idx + 1}</span>
+                          </summary>
+
+                          <div className="mt-2 space-y-2">
+                            <div className="grid sm:grid-cols-2 gap-2">
+                              <input
+                                className="input w-full"
+                                placeholder="Rôle"
+                                value={x.role || ""}
+                                onChange={(e) => {
+                                  setCvDraftDirty(true);
+                                  setCvDraft((prev) => {
+                                    if (!prev) return prev;
+                                    const xp = [...((prev as any).xp || [])];
+                                    xp[idx] = { ...xp[idx], role: e.target.value };
+                                    return { ...(prev as any), xp };
+                                  });
+                                }}
+                              />
+                              <input
+                                className="input w-full"
+                                placeholder="Entreprise"
+                                value={x.company || ""}
+                                onChange={(e) => {
+                                  setCvDraftDirty(true);
+                                  setCvDraft((prev) => {
+                                    if (!prev) return prev;
+                                    const xp = [...((prev as any).xp || [])];
+                                    xp[idx] = { ...xp[idx], company: e.target.value };
+                                    return { ...(prev as any), xp };
+                                  });
+                                }}
+                              />
+                            </div>
+
+                            <div className="grid sm:grid-cols-2 gap-2">
+                              <input
+                                className="input w-full"
+                                placeholder="Dates (ex: 2022–2024)"
+                                value={x.dates || ""}
+                                onChange={(e) => {
+                                  setCvDraftDirty(true);
+                                  setCvDraft((prev) => {
+                                    if (!prev) return prev;
+                                    const xp = [...((prev as any).xp || [])];
+                                    xp[idx] = { ...xp[idx], dates: e.target.value };
+                                    return { ...(prev as any), xp };
+                                  });
+                                }}
+                              />
+                              <input
+                                className="input w-full"
+                                placeholder="Ville / Lieu"
+                                value={x.city || ""}
+                                onChange={(e) => {
+                                  setCvDraftDirty(true);
+                                  setCvDraft((prev) => {
+                                    if (!prev) return prev;
+                                    const xp = [...((prev as any).xp || [])];
+                                    xp[idx] = { ...xp[idx], city: e.target.value };
+                                    return { ...(prev as any), xp };
+                                  });
+                                }}
+                              />
+                            </div>
+
+                            <textarea
+                              rows={4}
+                              className="input textarea w-full"
+                              placeholder={"Bullets (1 ligne = 1 bullet)\n- Exemple: Mise en place MFA\n- Exemple: Durcissement AD"}
+                              value={bulletsToText(x.bullets || [])}
+                              onChange={(e) => {
+                                const bullets = textToBullets(e.target.value);
+                                setCvDraftDirty(true);
+                                setCvDraft((prev) => {
+                                  if (!prev) return prev;
+                                  const xp = [...((prev as any).xp || [])];
+                                  xp[idx] = { ...xp[idx], bullets };
+                                  return { ...(prev as any), xp };
+                                });
+                              }}
+                            />
+
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                className="btn-secondary !py-1 !px-3 text-[11px]"
+                                onClick={() => {
+                                  setCvDraftDirty(true);
+                                  setCvDraft((prev) => {
+                                    if (!prev) return prev;
+                                    const xp = [...((prev as any).xp || [])];
+                                    if (idx > 0) [xp[idx - 1], xp[idx]] = [xp[idx], xp[idx - 1]];
+                                    return { ...(prev as any), xp };
+                                  });
+                                }}
+                              >
+                                ↑ Monter
+                              </button>
+
+                              <button
+                                type="button"
+                                className="btn-secondary !py-1 !px-3 text-[11px]"
+                                onClick={() => {
+                                  setCvDraftDirty(true);
+                                  setCvDraft((prev) => {
+                                    if (!prev) return prev;
+                                    const xp = [...((prev as any).xp || [])];
+                                    if (idx < xp.length - 1) [xp[idx + 1], xp[idx]] = [xp[idx], xp[idx + 1]];
+                                    return { ...(prev as any), xp };
+                                  });
+                                }}
+                              >
+                                ↓ Descendre
+                              </button>
+
+                              <button
+                                type="button"
+                                className="btn-secondary !py-1 !px-3 text-[11px] border-red-500/40 text-red-300 hover:border-red-500"
+                                onClick={() => {
+                                  setCvDraftDirty(true);
+                                  setCvDraft((prev) => {
+                                    if (!prev) return prev;
+                                    const xp = [...((prev as any).xp || [])];
+                                    xp.splice(idx, 1);
+                                    return { ...(prev as any), xp };
+                                  });
+                                }}
+                              >
+                                Supprimer
+                              </button>
+                            </div>
+                          </div>
+                        </details>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Hobbies */}
+                  <div>
+                    <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Hobbies (virgules)</label>
+                    <input
+                      className="input w-full"
+                      value={joinList(((cvDraft as any).hobbies || []) as string[])}
+                      onChange={(e) => {
+                        const hobbies = splitList(e.target.value);
+                        setCvDraftDirty(true);
+                        setCvDraft((prev) => (prev ? ({ ...prev, hobbies } as any) : prev));
+                      }}
+                    />
+                  </div>
+
+                  {/* Reset */}
+                  <button
+                    type="button"
+                    className="btn-secondary w-full"
+                    onClick={() => {
+                      if (!baseCvModel) return;
+                      setCvDraft(baseCvModel);
+                      setCvDraftDirty(false);
+                      setCvSections(DEFAULT_CV_SECTIONS);
+                    }}
+                  >
+                    Réinitialiser au profil IA
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* RIGHT: preview */}
+            <div className={`${cvMobileView === "edit" ? "hidden" : ""} lg:block min-h-0 bg-white border-t lg:border-t-0 lg:border-l border-[var(--border)]`}>
+              <PdfCanvasViewer fileUrl={cvPreviewUrl} />
+            </div>
           </div>
         </div>
       </FullScreenModal>
@@ -2447,7 +2491,7 @@ ${name || "—"}
             <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={() => prepareLmPreview({ ensureText: true })} disabled={lmPdfLoading}>
               Régénérer aperçu
             </button>
-            <button type="button" className="btn-primary !py-2 !px-3 text-[12px]" onClick={downloadLm} disabled={!lmLastBlob}>
+            <button type="button" className="btn-primary !py-2 !px-3 text-[12px]" onClick={downloadLm}>
               Télécharger
             </button>
           </>
@@ -2473,7 +2517,7 @@ ${name || "—"}
                 <button type="button" className="btn-secondary" onClick={() => prepareLmPreview({ ensureText: false })} disabled={lmPdfLoading}>
                   Régénérer
                 </button>
-                <button type="button" className="btn-primary" onClick={downloadLm} disabled={!lmLastBlob}>
+                <button type="button" className="btn-primary" onClick={downloadLm}>
                   Télécharger
                 </button>
               </div>
@@ -2496,7 +2540,7 @@ ${name || "—"}
             <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={prepareCvLmPreview} disabled={cvLoading}>
               Régénérer aperçu
             </button>
-            <button type="button" className="btn-primary !py-2 !px-3 text-[12px]" onClick={downloadCvLm} disabled={!cvLmLastBlob}>
+            <button type="button" className="btn-primary !py-2 !px-3 text-[12px]" onClick={downloadCvLm}>
               Télécharger
             </button>
           </>
@@ -2523,12 +2567,7 @@ ${name || "—"}
                 <p className="text-[10px] text-[var(--muted)]">Recherche + sélection instantanée</p>
               </div>
               <div className="flex items-center gap-2">
-                <input
-                  value={templateSearch}
-                  onChange={(e) => setTemplateSearch(e.target.value)}
-                  className="input !py-2 !text-[12px] w-[220px]"
-                  placeholder="Rechercher (ex: pro, ats, tech)"
-                />
+                <input value={templateSearch} onChange={(e) => setTemplateSearch(e.target.value)} className="input !py-2 !text-[12px] w-[220px]" placeholder="Rechercher (ex: pro, ats, tech)" />
                 <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={() => setTemplatesModalOpen(false)}>
                   Fermer
                 </button>
@@ -2548,15 +2587,11 @@ ${name || "—"}
                         setTemplatesModalOpen(false);
                         setTemplateSearch("");
                       }}
-                      className={`text-left rounded-2xl border p-2 bg-[var(--bg-soft)] transition
-                        ${active ? "border-[var(--brand)] ring-2 ring-[var(--brand)]/20" : "border-[var(--border)] hover:border-[var(--brand)]/50"}`}
+                      className={`text-left rounded-2xl border p-2 bg-[var(--bg-soft)] transition ${
+                        active ? "border-[var(--brand)] ring-2 ring-[var(--brand)]/20" : "border-[var(--border)] hover:border-[var(--brand)]/50"
+                      }`}
                     >
-                      <img
-                        src={t.previewSrc}
-                        alt={t.label}
-                        className="w-full h-[150px] object-cover rounded-xl border border-[var(--border)] bg-white"
-                        loading="lazy"
-                      />
+                      <img src={t.previewSrc} alt={t.label} className="w-full h-[150px] object-cover rounded-xl border border-[var(--border)] bg-white" loading="lazy" />
                       <div className="mt-2">
                         <p className="text-[12px] font-semibold text-[var(--ink)] flex items-center justify-between gap-2">
                           <span>{t.label}</span>
