@@ -1,36 +1,59 @@
 "use client";
 
-import { useState, useEffect, useRef, ChangeEvent, FormEvent } from "react";
-import { motion } from "framer-motion";
+import React, { useEffect, useMemo, useRef, useState, ChangeEvent, FormEvent } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import Chart from "chart.js/auto";
+
+// Firebase
 import { auth, db } from "@/lib/firebase";
 import { onAuthStateChanged } from "firebase/auth";
-import {
-  doc,
-  getDoc,
-  setDoc,
-  collection,
-  query,
-  where,
-  onSnapshot,
-} from "firebase/firestore";
-import Chart from "chart.js/auto";
+import { doc, getDoc, setDoc, collection, query, where, onSnapshot } from "firebase/firestore";
+
+// Contexts / services
 import { useAuth } from "@/context/AuthContext";
 import { useUserProfile } from "@/hooks/useUserProfile";
 import { consumeCredits } from "@/lib/credits";
 import { logUsage } from "@/lib/userTracking";
 import { getRecaptchaToken } from "@/lib/recaptcha";
 
-// --- TYPES ---
+// Icons
+import {
+  Zap,
+  FileText,
+  Mail,
+  Phone,
+  Linkedin,
+  MapPin,
+  Briefcase,
+  Car,
+  BadgeCheck,
+  Languages,
+  Sparkles,
+  Upload,
+  ChevronRight,
+  Info,
+  PencilLine,
+  X,
+  Plus,
+  Trash2,
+  Save,
+  Download,
+  ArrowUp,
+  ArrowDown,
+  ShieldCheck,
+  Cpu,
+  AlertTriangle,
+  CheckCircle2,
+} from "lucide-react";
 
-type CvSkillsSection = {
-  title: string;
-  items: string[];
-};
+// ✅ Proxy Next.js
+const WORKER_URL = "/api/extractProfile";
 
-type CvSkills = {
-  sections: CvSkillsSection[];
-  tools: string[];
-};
+/* =========================
+   TYPES
+========================= */
+type CvSkillsSection = { title: string; items: string[] };
+type CvSkills = { sections: CvSkillsSection[]; tools: string[] };
 
 type CvExperience = {
   company: string;
@@ -75,709 +98,21 @@ type CvProfile = {
   certs: string;
   langLine: string;
   hobbies: string[];
+
   updatedAt?: number;
 };
 
-type DashboardCounts = {
-  totalApps: number;
-  cvCount: number;
-  lmCount: number;
-};
+type DashboardCounts = { totalApps: number; cvCount: number; lmCount: number };
 
-// ✅ Appelle le proxy Next.js (pas la Cloud Function en direct)
-const WORKER_URL = "/api/extractProfile";
+type ActiveModal = "infos" | "skills" | "experience" | "education" | "languages" | "hobbies" | null;
 
-// --- HELPERS GÉNÉRAUX ---
+type ExperienceDraft = { company: string; role: string; dates: string; bulletsText: string; location?: string };
+type EducationDraft = { school: string; degree: string; dates: string; location: string };
+type LanguageDraft = { language: string; level: string };
 
-function getInitials(name?: string) {
-  if (!name) return "?";
-  const parts = name.trim().split(/\s+/);
-  if (parts.length === 0) return "?";
-  if (parts.length === 1) return (parts[0][0] || "?").toUpperCase();
-  return (
-    ((parts[0][0] || "") + (parts[parts.length - 1][0] || "")).toUpperCase()
-  );
-}
-
-function formatUpdatedAt(ts?: number) {
-  if (!ts) return "";
-  const d = new Date(ts);
-  return new Intl.DateTimeFormat("fr-FR", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(d);
-}
-
-function normalizeText(str: string): string {
-  return str
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
-}
-
-// 🌐 Drapeaux langues (robuste, ignore natif/bilingue/etc.)
-function getFlagEmoji(langPart: string): string {
-  if (!langPart) return "🌐";
-
-  const lower = langPart.toLowerCase();
-
-  // On enlève ce qu'il y a entre parenthèses (souvent le niveau)
-  let base = lower.replace(/\(.*?\)/g, " ").trim();
-
-  const levelWords = [
-    "natif",
-    "bilingue",
-    "courant",
-    "intermédiaire",
-    "intermediaire",
-    "débutant",
-    "debutant",
-    "langue maternelle",
-    "maternelle",
-    "maternel",
-    "c1",
-    "c2",
-    "b1",
-    "b2",
-    "a1",
-    "a2",
-  ];
-
-  levelWords.forEach((w) => {
-    base = base.replace(new RegExp("\\b" + w + "\\b", "g"), " ");
-  });
-
-  base = base.trim();
-  if (!base) base = lower;
-
-  if (base.match(/\bfrançais\b|\bfrancais\b|\bfrench\b/)) return "🇫🇷";
-  if (base.match(/\banglais\b|\benglish\b/)) return "🇬🇧";
-  if (base.match(/\bamericain\b|\bétats-unis\b|\busa\b|\bamerican\b/))
-    return "🇺🇸";
-
-  if (base.match(/\bespagnol\b|\bspanish\b/)) return "🇪🇸";
-  if (base.match(/\ballemand\b|\bgerman\b/)) return "🇩🇪";
-  if (base.match(/\bitalien\b|\bitalian\b/)) return "🇮🇹";
-  if (base.match(/\bportugais\b|\bportuguese\b/)) return "🇵🇹";
-  if (base.match(/\bnéerlandais\b|\bneerlandais\b|\bdutch\b/)) return "🇳🇱";
-
-  if (base.match(/\barabe\b|\barabic\b|\barab\b/)) return "🇸🇦";
-  if (base.match(/\bchinois\b|\bmandarin\b|\bchinese\b/)) return "🇨🇳";
-  if (base.match(/\brusse\b|\brussian\b/)) return "🇷🇺";
-  if (base.match(/\bjaponais\b|\bjapanese\b/)) return "🇯🇵";
-  if (base.match(/\bcoréen\b|\bcoreen\b|\bkorean\b/)) return "🇰🇷";
-  if (base.match(/\bhindi\b|\bhindou\b/)) return "🇮🇳";
-  if (base.match(/\bturc\b|\bturkish\b/)) return "🇹🇷";
-
-  return "🌐";
-}
-
-// 🌐 Parse le champ langLine en { flag, text }[]
-function parseLangLine(langLine: string): { flag: string; text: string }[] {
-  if (!langLine) return [];
-  const parts = langLine
-    .split("·")
-    .join("|")
-    .split(",")
-    .join("|")
-    .split("|")
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
-
-  return parts.map((part) => ({
-    flag: getFlagEmoji(part),
-    text: part,
-  }));
-}
-
-// 🎯 Emoji pour les hobbies
-function getHobbyEmoji(hobby: string): string {
-  const p = hobby.toLowerCase();
-  if (p.includes("football") || p.includes("foot")) return "⚽";
-  if (p.includes("basket") || p.includes("basketball")) return "🏀";
-  if (p.includes("sport") || p.includes("fitness") || p.includes("gym"))
-    return "💪";
-  if (p.includes("musique") || p.includes("guitare") || p.includes("piano"))
-    return "🎵";
-  if (p.includes("lecture") || p.includes("livre")) return "📚";
-  if (p.includes("cinéma") || p.includes("cinema") || p.includes("film"))
-    return "🎬";
-  if (p.includes("jeu vidéo") || p.includes("jeux vidéo") || p.includes("gaming"))
-    return "🎮";
-  if (p.includes("voyage") || p.includes("travel")) return "✈️";
-  if (p.includes("cuisine") || p.includes("cooking")) return "🍳";
-  if (p.includes("photo") || p.includes("photographie")) return "📸";
-  if (p.includes("dessin") || p.includes("peinture") || p.includes("art"))
-    return "🎨";
-  if (p.includes("randonnée") || p.includes("rando") || p.includes("hiking"))
-    return "🥾";
-  return "⭐";
-}
-
-// --- RADAR GÉNÉRIQUE (multi-métiers, robuste) ---
-
-type RadarAxisDef = {
-  id: string;
-  label: string;
-  keywords: string[];
-};
-
-const DOMAIN_AXES: RadarAxisDef[] = [
-  {
-    id: "finance",
-    label: "Finance & Contrôle",
-    keywords: [
-      "finance",
-      "financier",
-      "controle de gestion",
-      "contrôle de gestion",
-      "controle interne",
-      "contrôle interne",
-      "audit",
-      "conformite",
-      "conformité",
-      "risque",
-      "risques",
-      "reporting",
-      "budget",
-      "bilan",
-      "comptable",
-      "tresorerie",
-      "trésorerie",
-      "analyse financiere",
-      "analyse financière",
-      "cfa",
-      "ifrs",
-    ],
-  },
-  {
-    id: "it_dev",
-    label: "IT & Développement",
-    keywords: [
-      "developpement",
-      "développement",
-      "javascript",
-      "typescript",
-      "python",
-      "java",
-      "c++",
-      "c#",
-      "php",
-      "go",
-      "react",
-      "node",
-      "angular",
-      "vue",
-      "api",
-      "application",
-      "fullstack",
-      "frontend",
-      "backend",
-      "devops",
-      "git",
-      "docker",
-      "kubernetes",
-    ],
-  },
-  {
-    id: "cyber",
-    label: "Cybersécurité & Réseaux",
-    keywords: [
-      "cyber",
-      "cybersecurite",
-      "cybersécurité",
-      "pentest",
-      "penetration test",
-      "vulnerabilite",
-      "vulnérabilité",
-      "soc",
-      "firewall",
-      "pare feu",
-      "pare-feu",
-      "vpn",
-      "ids",
-      "ips",
-      "wireshark",
-      "nmap",
-      "kali",
-      "siem",
-      "owasp",
-    ],
-  },
-  {
-    id: "data",
-    label: "Data & Analytics",
-    keywords: [
-      "data",
-      "donnees",
-      "données",
-      "sql",
-      "power bi",
-      "tableau",
-      "statistique",
-      "statistiques",
-      "machine learning",
-      "intelligence artificielle",
-      "ia ",
-      "analyse de donnees",
-      "analyse de données",
-      "data analyst",
-      "data engineer",
-      "pandas",
-      "numpy",
-    ],
-  },
-  {
-    id: "marketing",
-    label: "Marketing & Communication",
-    keywords: [
-      "marketing",
-      "communication",
-      "social media",
-      "réseaux sociaux",
-      "reseaux sociaux",
-      "seo",
-      "sea",
-      "content",
-      "contenu",
-      "campagne",
-      "publicite",
-      "publicité",
-      "branding",
-      "influence",
-      "community manager",
-    ],
-  },
-  {
-    id: "sales",
-    label: "Commerce & Vente",
-    keywords: [
-      "commercial",
-      "vente",
-      "business developer",
-      "account manager",
-      "prospection",
-      "negociation",
-      "négociation",
-      "pipeline",
-      "portefeuille clients",
-      "chiffre d affaires",
-      "ca ",
-      "b2b",
-      "b2c",
-    ],
-  },
-  {
-    id: "hr",
-    label: "RH & Recrutement",
-    keywords: [
-      "ressources humaines",
-      "rh",
-      "recrutement",
-      "onboarding",
-      "formation",
-      "gestion du personnel",
-      "talent acquisition",
-      "people",
-      "paie",
-      "gestion des talents",
-    ],
-  },
-  {
-    id: "project",
-    label: "Gestion de projet",
-    keywords: [
-      "chef de projet",
-      "gestion de projet",
-      "project manager",
-      "planning",
-      "pilotage",
-      "agile",
-      "scrum",
-      "kanban",
-      "coordination",
-      "roadmap",
-      "livrable",
-      "livrables",
-      "planning",
-    ],
-  },
-  {
-    id: "ops",
-    label: "Opérations & Logistique",
-    keywords: [
-      "logistique",
-      "supply chain",
-      "transport",
-      "flux",
-      "optimisation des processus",
-      "lean",
-      "maintenance",
-      "production",
-      "magasinier",
-      "preparation de commandes",
-      "exploitation",
-    ],
-  },
-  {
-    id: "health",
-    label: "Santé & Social",
-    keywords: [
-      "infirmier",
-      "infirmière",
-      "aide soignant",
-      "aide-soignant",
-      "medecin",
-      "médecin",
-      "paramedical",
-      "paramédical",
-      "social",
-      "accompagnement",
-      "patients",
-      "soins",
-      "assistante sociale",
-      "assistant social",
-      "ehpad",
-    ],
-  },
-  {
-    id: "education",
-    label: "Éducation & Formation",
-    keywords: [
-      "enseignant",
-      "professeur",
-      "formateur",
-      "formatrice",
-      "pedagogie",
-      "pédagogie",
-      "cours",
-      "formation",
-      "apprentissage",
-      "eleves",
-      "élèves",
-      "etudiants",
-      "étudiants",
-      "éducation",
-    ],
-  },
-];
-
-const DOMAIN_CORE_KEYWORDS: Record<string, string[]> = {
-  finance: [
-    "comptable",
-    "controle de gestion",
-    "contrôle de gestion",
-    "controle interne",
-    "contrôle interne",
-    "audit",
-    "bilan",
-    "compte de resultat",
-    "compte de résultat",
-    "tresorerie",
-    "trésorerie",
-    "analyse financiere",
-    "analyse financière",
-    "cfa",
-    "ifrs",
-  ],
-  it_dev: [
-    "developpement",
-    "développement",
-    "javascript",
-    "typescript",
-    "python",
-    "java",
-    "c++",
-    "c#",
-    "php",
-    "react",
-    "node",
-    "angular",
-    "vue",
-    "fullstack",
-    "frontend",
-    "backend",
-    "devops",
-    "docker",
-    "kubernetes",
-  ],
-  cyber: [
-    "pentest",
-    "penetration test",
-    "wireshark",
-    "nmap",
-    "kali",
-    "ids",
-    "ips",
-    "soc",
-    "siem",
-    "owasp",
-    "firewall",
-    "pare feu",
-    "pare-feu",
-  ],
-  data: [
-    "data analyst",
-    "data engineer",
-    "power bi",
-    "tableau",
-    "sql",
-    "pandas",
-    "numpy",
-    "machine learning",
-    "intelligence artificielle",
-  ],
-  marketing: [
-    "seo",
-    "sea",
-    "community manager",
-    "social media",
-    "campagne",
-    "branding",
-    "communication digitale",
-  ],
-  sales: [
-    "business developer",
-    "account manager",
-    "commercial",
-    "prospection",
-    "negociation",
-    "négociation",
-    "pipeline",
-  ],
-  hr: [
-    "ressources humaines",
-    "rh",
-    "recrutement",
-    "talent acquisition",
-    "gestion de la paie",
-    "gestion du personnel",
-  ],
-  project: [
-    "chef de projet",
-    "project manager",
-    "scrum master",
-    "agile",
-    "gestion de projet",
-  ],
-  ops: ["supply chain", "logistique", "exploitation", "maintenance", "production"],
-  health: ["infirmier", "infirmière", "medecin", "médecin", "aide soignant", "aide-soignant", "soins", "patients"],
-  education: ["enseignant", "professeur", "formateur", "formatrice", "pedagogie", "pédagogie", "eleves", "élèves", "etudiants", "étudiants"],
-};
-
-const SOFT_SKILLS_KEYWORDS = [
-  "communication",
-  "travail en equipe",
-  "travail en équipe",
-  "collaboration",
-  "autonome",
-  "autonomie",
-  "rigoureux",
-  "rigoureuse",
-  "organise",
-  "organisé",
-  "organisee",
-  "organisée",
-  "adaptabilite",
-  "adaptabilité",
-  "gestion du stress",
-  "leadership",
-  "esprit d analyse",
-  "esprit d'analyse",
-  "empathie",
-  "relationnel",
-];
-
-function countHits(keywords: string[], text: string): number {
-  let hits = 0;
-  for (const k of keywords) {
-    const normK = normalizeText(k);
-    if (text.includes(normK)) hits++;
-  }
-  return hits;
-}
-
-function scaleScore(hits: number): number {
-  if (hits <= 0) return 3;
-  if (hits === 1) return 5;
-  if (hits === 2) return 7;
-  if (hits === 3) return 9;
-  return 10;
-}
-
-// 🔎 construit les données du radar à partir du profil (générique multi-métiers)
-function buildRadarData(profile: CvProfile | null) {
-  const defaultLabels = [
-    "Analyse / Résolution",
-    "Organisation & Processus",
-    "Outils & Tech",
-    "Apprentissage",
-    "Soft skills",
-  ];
-
-  if (!profile) {
-    return { labels: defaultLabels, data: [3, 3, 3, 3, 3] };
-  }
-
-  const rawText =
-    JSON.stringify(profile.skills.sections || "") +
-    JSON.stringify(profile.skills.tools || "") +
-    JSON.stringify(profile.experiences || "") +
-    JSON.stringify(profile.education || "") +
-    (profile.profileSummary || "") +
-    (profile.contractType || "") +
-    (profile.certs || "") +
-    (profile.langLine || "");
-
-  const lower = normalizeText(rawText);
-
-  const aiDomainIds: string[] = [];
-  if (profile.primaryDomain && profile.primaryDomain !== "autre") {
-    aiDomainIds.push(profile.primaryDomain);
-  }
-  if (Array.isArray(profile.secondaryDomains)) {
-    for (const d of profile.secondaryDomains) {
-      if (d && d !== "autre" && !aiDomainIds.includes(d)) {
-        aiDomainIds.push(d);
-      }
-    }
-  }
-
-  let relevant: {
-    axis: RadarAxisDef;
-    totalHits: number;
-    coreHits: number;
-    score: number;
-  }[] = [];
-
-  if (aiDomainIds.length > 0) {
-    relevant = aiDomainIds
-      .map((id) => {
-        const axis = DOMAIN_AXES.find((a) => a.id === id);
-        if (!axis) return null;
-
-        const totalHits = countHits(axis.keywords, lower);
-        const coreKeywords = DOMAIN_CORE_KEYWORDS[axis.id] || axis.keywords;
-        const coreHits = countHits(coreKeywords, lower);
-
-        const rawHits = Math.max(totalHits, coreHits);
-        const score = scaleScore(rawHits);
-
-        return { axis, totalHits, coreHits, score };
-      })
-      .filter(
-        (
-          x
-        ): x is {
-          axis: RadarAxisDef;
-          totalHits: number;
-          coreHits: number;
-          score: number;
-        } => !!x
-      );
-  } else {
-    const domainScores = DOMAIN_AXES.map((axis) => {
-      const totalHits = countHits(axis.keywords, lower);
-      const coreKeywords = DOMAIN_CORE_KEYWORDS[axis.id] || axis.keywords;
-      const coreHits = countHits(coreKeywords, lower);
-
-      const isRelevant = coreHits > 0 && totalHits > 0;
-      const score = isRelevant ? scaleScore(totalHits) : 0;
-
-      return { axis, totalHits, coreHits, isRelevant, score };
-    });
-
-    relevant = domainScores
-      .filter((d) => d.isRelevant)
-      .sort((a, b) => b.totalHits - a.totalHits)
-      .slice(0, 4) as any;
-  }
-
-  let softHits = countHits(SOFT_SKILLS_KEYWORDS, lower);
-  const softSkillsCount = Array.isArray(profile.softSkills)
-    ? profile.softSkills.length
-    : 0;
-
-  if (softSkillsCount > 0) {
-    softHits += Math.min(4, Math.floor(softSkillsCount / 2));
-  }
-
-  const softScore = scaleScore(softHits);
-
-  if (!relevant.length) {
-    const generic = [
-      scaleScore(countHits(["analyse", "diagnostic"], lower)),
-      scaleScore(countHits(["processus", "organisation"], lower)),
-      scaleScore(countHits(["outil", "logiciel", "technique"], lower)),
-      scaleScore(countHits(["apprentissage", "formation", "veille"], lower)),
-    ];
-    return {
-      labels: defaultLabels,
-      data: [...generic, softScore],
-    };
-  }
-
-  const labels = relevant.map((r) => r.axis.label).concat("Soft skills");
-  const data = relevant.map((r) => r.score).concat(softScore);
-
-  console.debug(
-    "[Radar IA] Domaines retenus :",
-    relevant.map((r) => ({
-      id: r.axis.id,
-      label: r.axis.label,
-      hits: r.totalHits,
-      score: r.score,
-    })),
-    "SoftSkillsCount:",
-    softSkillsCount,
-    "SoftScore:",
-    softScore
-  );
-
-  return { labels, data };
-}
-
-// Items pour la navigation rapide
-const navItems = [
-  { id: "infos-personnelles", label: "Infos & CV" },
-  { id: "competences", label: "Compétences & Outils" },
-  { id: "experience", label: "Expérience" },
-  { id: "formation", label: "Formation & Certifs" },
-  { id: "langues", label: "Langues" },
-  { id: "hobbies", label: "Centres d'intérêt" },
-];
-
-type ActiveModal =
-  | "infos"
-  | "skills"
-  | "experience"
-  | "education"
-  | "languages"
-  | "hobbies"
-  | null;
-
-type ExperienceDraft = {
-  company: string;
-  role: string;
-  dates: string;
-  bulletsText: string;
-};
-
-type EducationDraft = {
-  school: string;
-  degree: string;
-  dates: string;
-  location: string;
-};
-
-type LanguageDraft = {
-  language: string;
-  level: string;
-};
-
+/* =========================
+   CONSTANTES / OPTIONS
+========================= */
 const LANGUAGE_OPTIONS = [
   "Français",
   "Anglais",
@@ -802,6 +137,8 @@ const LANGUAGE_LEVEL_OPTIONS = [
   "Opérationnel (B1)",
   "Débutant (A2 - A1)",
 ];
+
+const CONTRACT_TYPE_OPTIONS = ["CDI", "CDD", "Intérim", "Alternance", "Stage", "Freelance", "Temps plein", "Temps partiel"];
 
 const CERTIFICATION_OPTIONS = [
   "TOEIC",
@@ -856,45 +193,363 @@ const HOBBY_OPTIONS = [
   "Podcasts",
 ];
 
-const CONTRACT_TYPE_OPTIONS = [
-  "CDI",
-  "CDD",
-  "Intérim",
-  "Alternance",
-  "Stage",
-  "Freelance",
-  "Temps plein",
-  "Temps partiel",
-  "Indépendant",
-  "Contrat pro",
+/* =========================
+   HELPERS UI / TEXT
+========================= */
+function getInitials(name?: string) {
+  if (!name) return "IA";
+  const parts = name.trim().split(/\s+/);
+  if (!parts.length) return "IA";
+  if (parts.length === 1) return (parts[0][0] || "I").toUpperCase();
+  return (((parts[0][0] || "I") + (parts[parts.length - 1][0] || "A")).toUpperCase()).slice(0, 2);
+}
+
+function formatUpdatedAt(ts?: number) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  return new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
+}
+
+function normalizeText(str: string): string {
+  return (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+function getFlagEmoji(langPart: string): string {
+  if (!langPart) return "🌐";
+  const lower = langPart.toLowerCase();
+  let base = lower.replace(/\(.*?\)/g, " ").trim();
+
+  const levelWords = [
+    "natif",
+    "bilingue",
+    "courant",
+    "intermédiaire",
+    "intermediaire",
+    "débutant",
+    "debutant",
+    "langue maternelle",
+    "maternelle",
+    "c1",
+    "c2",
+    "b1",
+    "b2",
+    "a1",
+    "a2",
+  ];
+
+  levelWords.forEach((w) => {
+    base = base.replace(new RegExp("\\b" + w + "\\b", "g"), " ");
+  });
+
+  base = base.trim() || lower;
+
+  if (base.match(/\bfrançais\b|\bfrancais\b|\bfrench\b/)) return "🇫🇷";
+  if (base.match(/\banglais\b|\benglish\b/)) return "🇬🇧";
+  if (base.match(/\bamericain\b|\bétats-unis\b|\busa\b|\bamerican\b/)) return "🇺🇸";
+  if (base.match(/\bespagnol\b|\bspanish\b/)) return "🇪🇸";
+  if (base.match(/\ballemand\b|\bgerman\b/)) return "🇩🇪";
+  if (base.match(/\bitalien\b|\bitalian\b/)) return "🇮🇹";
+  if (base.match(/\bportugais\b|\bportuguese\b/)) return "🇵🇹";
+  if (base.match(/\bnéerlandais\b|\bdutch\b/)) return "🇳🇱";
+  if (base.match(/\barabe\b|\barabic\b/)) return "🇸🇦";
+  if (base.match(/\bchinois\b|\bmandarin\b|\bchinese\b/)) return "🇨🇳";
+  if (base.match(/\brusse\b|\brussian\b/)) return "🇷🇺";
+  if (base.match(/\bjaponais\b|\bjapanese\b/)) return "🇯🇵";
+  if (base.match(/\bcoréen\b|\bcoreen\b|\bkorean\b/)) return "🇰🇷";
+  if (base.match(/\bhindi\b/)) return "🇮🇳";
+  if (base.match(/\bturc\b|\bturkish\b/)) return "🇹🇷";
+
+  return "🌐";
+}
+
+function parseLangLine(langLine: string): { flag: string; text: string }[] {
+  if (!langLine) return [];
+  const parts = langLine
+    .split("·")
+    .join("|")
+    .split(",")
+    .join("|")
+    .split("|")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  return parts.map((part) => ({ flag: getFlagEmoji(part), text: part }));
+}
+
+function getHobbyEmoji(hobby: string): string {
+  const p = hobby.toLowerCase();
+  if (p.includes("football") || p.includes("foot")) return "⚽";
+  if (p.includes("basket")) return "🏀";
+  if (p.includes("sport") || p.includes("fitness") || p.includes("gym")) return "💪";
+  if (p.includes("musique") || p.includes("guitare") || p.includes("piano")) return "🎵";
+  if (p.includes("lecture") || p.includes("livre")) return "📚";
+  if (p.includes("cinéma") || p.includes("cinema") || p.includes("film")) return "🎬";
+  if (p.includes("jeu") || p.includes("gaming")) return "🎮";
+  if (p.includes("voyage") || p.includes("travel")) return "✈️";
+  if (p.includes("cuisine") || p.includes("cooking")) return "🍳";
+  if (p.includes("photo")) return "📸";
+  if (p.includes("dessin") || p.includes("peinture") || p.includes("art")) return "🎨";
+  if (p.includes("randonnée") || p.includes("rando") || p.includes("hiking")) return "🥾";
+  return "⭐";
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Impossible de lire le fichier."));
+    reader.onload = () => {
+      const result = reader.result as string;
+      const base64 = result.split(",")[1];
+      if (!base64) reject(new Error("Encodage base64 invalide."));
+      else resolve(base64);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function downloadJson(filename: string, data: unknown) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* =========================
+   RADAR (multi-domaines)
+========================= */
+type RadarAxisDef = { id: string; label: string; keywords: string[] };
+
+const DOMAIN_AXES: RadarAxisDef[] = [
+  { id: "finance", label: "Finance & Contrôle", keywords: ["finance", "audit", "ifrs", "budget", "reporting", "tresorerie", "trésorerie", "controle de gestion", "contrôle de gestion"] },
+  { id: "it_dev", label: "IT & Développement", keywords: ["react", "next", "typescript", "javascript", "python", "api", "node", "git", "docker", "kubernetes", "devops"] },
+  { id: "cyber", label: "Cybersécurité & Réseaux", keywords: ["cyber", "pentest", "soc", "siem", "owasp", "vpn", "firewall", "nmap", "kali", "wireshark"] },
+  { id: "data", label: "Data & Analytics", keywords: ["data", "sql", "power bi", "tableau", "pandas", "numpy", "machine learning", "ia", "analyse de données"] },
+  { id: "marketing", label: "Marketing & Communication", keywords: ["seo", "sea", "community", "social media", "branding", "campagne", "communication"] },
+  { id: "sales", label: "Commerce & Vente", keywords: ["commercial", "vente", "prospection", "negociation", "pipeline", "account manager", "business developer", "b2b"] },
+  { id: "hr", label: "RH & Recrutement", keywords: ["rh", "recrutement", "talent acquisition", "paie", "gestion du personnel", "onboarding"] },
+  { id: "project", label: "Gestion de projet", keywords: ["chef de projet", "agile", "scrum", "kanban", "roadmap", "planning", "pilotage"] },
 ];
 
-// --- COMPOSANT PRINCIPAL ---
+const SOFT_SKILLS_KEYWORDS = [
+  "communication",
+  "travail en equipe",
+  "collaboration",
+  "autonomie",
+  "rigoureux",
+  "organise",
+  "adaptabilite",
+  "gestion du stress",
+  "leadership",
+  "esprit d analyse",
+  "empathie",
+  "relationnel",
+];
 
-export default function DashboardPage() {
+function countHits(keywords: string[], text: string): number {
+  let hits = 0;
+  for (const k of keywords) if (text.includes(normalizeText(k))) hits++;
+  return hits;
+}
+
+function scaleScore(hits: number): number {
+  if (hits <= 0) return 3;
+  if (hits === 1) return 5;
+  if (hits === 2) return 7;
+  if (hits === 3) return 9;
+  return 10;
+}
+
+function buildRadarData(profile: CvProfile | null) {
+  const defaultLabels = ["Analyse", "Organisation", "Outils", "Apprentissage", "Soft skills"];
+  if (!profile) return { labels: defaultLabels, data: [3, 3, 3, 3, 3] };
+
+  const rawText =
+    JSON.stringify(profile.skills?.sections || []) +
+    JSON.stringify(profile.skills?.tools || []) +
+    JSON.stringify(profile.experiences || []) +
+    JSON.stringify(profile.education || []) +
+    (profile.profileSummary || "") +
+    (profile.certs || "") +
+    (profile.langLine || "");
+
+  const lower = normalizeText(rawText);
+
+  // Si domaines fournis, on les privilégie ; sinon top 4 par hits.
+  const ids = new Set<string>();
+  if (profile.primaryDomain) ids.add(profile.primaryDomain);
+  (profile.secondaryDomains || []).forEach((d) => d && ids.add(d));
+
+  let relevant = Array.from(ids)
+    .map((id) => DOMAIN_AXES.find((a) => a.id === id))
+    .filter(Boolean) as RadarAxisDef[];
+
+  if (!relevant.length) {
+    relevant = DOMAIN_AXES
+      .map((axis) => ({ axis, hits: countHits(axis.keywords, lower) }))
+      .filter((x) => x.hits > 0)
+      .sort((a, b) => b.hits - a.hits)
+      .slice(0, 4)
+      .map((x) => x.axis);
+  }
+
+  const softHits = countHits(SOFT_SKILLS_KEYWORDS, lower) + Math.min(4, Math.floor((profile.softSkills?.length || 0) / 2));
+  const softScore = scaleScore(softHits);
+
+  if (!relevant.length) {
+    const generic = [
+      scaleScore(countHits(["analyse", "diagnostic"], lower)),
+      scaleScore(countHits(["processus", "organisation"], lower)),
+      scaleScore(countHits(["outil", "logiciel", "technique"], lower)),
+      scaleScore(countHits(["apprentissage", "formation", "veille"], lower)),
+    ];
+    return { labels: defaultLabels, data: [...generic, softScore] };
+  }
+
+  const labels = relevant.map((r) => r.label).concat("Soft skills");
+  const data = relevant.map((r) => scaleScore(countHits(r.keywords, lower))).concat(softScore);
+
+  return { labels, data };
+}
+
+/* =========================
+   NAV
+========================= */
+type NavItem = {
+  id: string;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+};
+
+const navItems: NavItem[] = [
+  { id: "infos-personnelles", label: "Dashboard", icon: Cpu },
+  { id: "competences", label: "Expertise", icon: Sparkles },
+  { id: "experience", label: "Expériences", icon: Briefcase },
+  { id: "formation", label: "Formations", icon: BadgeCheck },
+  { id: "langues", label: "Langues", icon: Languages },
+  { id: "hobbies", label: "Loisirs", icon: Sparkles },
+];
+
+/* =========================
+   UI ATOMS
+========================= */
+function KpiItem({ label, value, sub, icon: Icon, color }: any) {
+  return (
+    <div className="p-5 rounded-[1.5rem] bg-slate-900/50 border border-white/5 backdrop-blur-md">
+      <div className="flex items-center gap-3 mb-3">
+        <div className={`p-2 rounded-lg bg-white/5 ${color}`}>
+          <Icon className="h-4 w-4" />
+        </div>
+        <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">{label}</p>
+      </div>
+      <p className="text-2xl font-mono font-bold text-white">{value}</p>
+      <p className="text-[10px] text-slate-600 mt-1 uppercase font-bold tracking-tighter">{sub}</p>
+    </div>
+  );
+}
+
+function SectionWrapper({ id, title, icon: Icon, children, onEdit }: any) {
+  return (
+    <section id={id} className="p-8 rounded-[2rem] bg-slate-900/40 border border-white/5 relative group">
+      <div className="flex justify-between items-center mb-8">
+        <div className="flex items-center gap-4">
+          <div className="p-3 rounded-2xl bg-blue-600/10 border border-blue-600/20">
+            <Icon className="h-6 w-6 text-blue-500" />
+          </div>
+          <h3 className="text-2xl font-black text-white tracking-tighter italic">{title}</h3>
+        </div>
+        {onEdit && (
+          <button
+            onClick={onEdit}
+            className="p-2 rounded-xl bg-white/5 border border-white/10 opacity-0 group-hover:opacity-100 transition-all text-blue-400 hover:bg-blue-600 hover:text-white"
+          >
+            <PencilLine className="h-4 w-4" />
+          </button>
+        )}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function EmptyState({ text }: { text: string }) {
+  return (
+    <div className="py-12 border-2 border-dashed border-white/5 rounded-3xl text-center">
+      <p className="text-sm text-slate-600 italic font-mono uppercase tracking-widest">{text}</p>
+    </div>
+  );
+}
+
+function Toast({ text, tone = "info" }: { text: string; tone?: "info" | "success" | "error" }) {
+  const toneCls =
+    tone === "success"
+      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-50"
+      : tone === "error"
+      ? "border-red-500/30 bg-red-500/10 text-red-50"
+      : "border-blue-500/30 bg-blue-500/10 text-blue-50";
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8, scale: 0.98 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      exit={{ opacity: 0, y: 8, scale: 0.98 }}
+      className={`fixed bottom-5 left-1/2 -translate-x-1/2 z-[200] px-4 py-3 rounded-2xl border ${toneCls} backdrop-blur-xl shadow-xl`}
+    >
+      <div className="flex items-center gap-2 text-sm">
+        {tone === "success" ? <CheckCircle2 className="h-4 w-4" /> : tone === "error" ? <AlertTriangle className="h-4 w-4" /> : <Info className="h-4 w-4" />}
+        <span className="font-medium">{text}</span>
+      </div>
+    </motion.div>
+  );
+}
+
+/* =========================
+   PAGE
+========================= */
+export default function FullProfilCVIAPageMerged() {
+  const { user } = useAuth();
+  const { profile: accountProfile, loading: loadingAccountProfile } = useUserProfile();
+  const remainingCredits = accountProfile?.credits ?? 0;
+  const isBlocked = accountProfile?.blocked === true;
+
+  const [profile, setProfile] = useState<CvProfile | null>(null);
+  const [loadingProfileFromDb, setLoadingProfileFromDb] = useState(true);
+
+  const [dashboardCounts, setDashboardCounts] = useState<DashboardCounts>({ totalApps: 0, cvCount: 0, lmCount: 0 });
+  const [loadingCounts, setLoadingCounts] = useState(true);
+
+  // Upload states
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [profile, setProfile] = useState<CvProfile | null>(null);
 
-  const radarCanvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  const [userId, setUserId] = useState<string | null>(null);
-  const [userEmail, setUserEmail] = useState<string | null>(null);
-  const [loadingProfileFromDb, setLoadingProfileFromDb] =
-    useState<boolean>(true);
-
-  const [dashboardCounts, setDashboardCounts] = useState<DashboardCounts>({
-    totalApps: 0,
-    cvCount: 0,
-    lmCount: 0,
-  });
-  const [loadingCounts, setLoadingCounts] = useState<boolean>(true);
-
-  // --- ÉTATS MODALES ---
-
+  // UI
+  const [activeSection, setActiveSection] = useState<string>("infos-personnelles");
   const [activeModal, setActiveModal] = useState<ActiveModal>(null);
 
+  // Toast
+  const [toast, setToast] = useState<{ text: string; tone?: "info" | "success" | "error" } | null>(null);
+  const toastTimer = useRef<number | null>(null);
+  const showToast = (text: string, tone: "info" | "success" | "error" = "info") => {
+    setToast({ text, tone });
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 2600);
+  };
+
+  // Radar
+  const radarCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // ====== Modals drafts ======
   const [infosDraft, setInfosDraft] = useState({
     fullName: "",
     email: "",
@@ -910,10 +565,7 @@ export default function DashboardPage() {
   const [skillsSectionsText, setSkillsSectionsText] = useState("");
   const [skillsToolsText, setSkillsToolsText] = useState("");
 
-  const [experiencesDraft, setExperiencesDraft] = useState<ExperienceDraft[]>(
-    []
-  );
-
+  const [experiencesDraft, setExperiencesDraft] = useState<ExperienceDraft[]>([]);
   const [educationDrafts, setEducationDrafts] = useState<EducationDraft[]>([]);
   const [certsList, setCertsList] = useState<string[]>([]);
   const [certInput, setCertInput] = useState("");
@@ -922,25 +574,36 @@ export default function DashboardPage() {
   const [hobbiesList, setHobbiesList] = useState<string[]>([]);
   const [hobbyInput, setHobbyInput] = useState("");
 
-  const { user } = useAuth();
-  const { profile: accountProfile, loading: loadingAccountProfile } =
-    useUserProfile();
-  const remainingCredits = accountProfile?.credits ?? 0;
-  const isBlocked = accountProfile?.blocked === true;
-
-  // 🔐 Auth + chargement du profil Firestore + stats candidatures
+  // ====== scroll spy (IntersectionObserver) ======
   useEffect(() => {
+    const ids = navItems.map((n) => n.id);
+    const els = ids.map((id) => document.getElementById(id)).filter(Boolean) as HTMLElement[];
+    if (!els.length) return;
+
+    const obs = new IntersectionObserver(
+      (entries) => {
+        const best = entries
+          .filter((e) => e.isIntersecting)
+          .sort((a, b) => (b.intersectionRatio ?? 0) - (a.intersectionRatio ?? 0))[0];
+        if (best?.target?.id) setActiveSection(best.target.id);
+      },
+      { threshold: [0.2, 0.35, 0.5], rootMargin: "-20% 0px -65% 0px" }
+    );
+
+    els.forEach((el) => obs.observe(el));
+    return () => obs.disconnect();
+  }, []);
+
+  // ====== Load auth + profile realtime + applications stats realtime ======
+  useEffect(() => {
+    let unsubProfile: (() => void) | null = null;
     let unsubApps: (() => void) | null = null;
 
-    const unsubAuth = onAuthStateChanged(auth, async (user) => {
-      if (unsubApps) {
-        unsubApps();
-        unsubApps = null;
-      }
+    const unsubAuth = onAuthStateChanged(auth, async (fbUser) => {
+      if (unsubProfile) unsubProfile();
+      if (unsubApps) unsubApps();
 
-      if (!user) {
-        setUserId(null);
-        setUserEmail(null);
+      if (!fbUser) {
         setProfile(null);
         setLoadingProfileFromDb(false);
         setDashboardCounts({ totalApps: 0, cvCount: 0, lmCount: 0 });
@@ -948,128 +611,100 @@ export default function DashboardPage() {
         return;
       }
 
-      setUserId(user.uid);
-      setUserEmail(user.email ?? null);
-
-      // --- Chargement du profil
-      try {
-        const ref = doc(db, "profiles", user.uid);
-        const snap = await getDoc(ref);
-        if (snap.exists()) {
-          const data = snap.data() as any;
-
-          const loadedProfile: CvProfile = {
-            fullName: data.fullName || "",
-            email: data.email || "",
-            phone: data.phone || "",
-            linkedin: data.linkedin || "",
-            profileSummary: data.profileSummary || "",
-            city: data.city || "",
-            address: data.address || "",
-            contractType: data.contractType || data.contractTypeStandard || "",
-            contractTypeStandard: data.contractTypeStandard || "",
-            contractTypeFull: data.contractTypeFull || "",
-            primaryDomain: data.primaryDomain || "",
-            secondaryDomains: Array.isArray(data.secondaryDomains)
-              ? data.secondaryDomains
-              : [],
-            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
-            drivingLicense: data.drivingLicense || "",
-            vehicle: data.vehicle || "",
-            skills: {
-              sections: Array.isArray(data.skills?.sections)
-                ? data.skills.sections
-                : [],
-              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
-            },
-            experiences: Array.isArray(data.experiences) ? data.experiences : [],
-            education: Array.isArray(data.education) ? data.education : [],
-            educationShort: Array.isArray(data.educationShort)
-              ? data.educationShort
-              : [],
-            certs: data.certs || "",
-            langLine: data.langLine || "",
-            hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
-            updatedAt:
-              typeof data.updatedAt === "number" ? data.updatedAt : undefined,
-          };
-
-          setProfile(loadedProfile);
-        } else {
-          setProfile(null);
-        }
-      } catch (e) {
-        console.error("Erreur chargement profil Firestore:", e);
-      } finally {
-        setLoadingProfileFromDb(false);
-      }
-
-      // --- Stats candidatures
-      setLoadingCounts(true);
-
-      const q = query(
-        collection(db, "applications"),
-        where("userId", "==", user.uid)
+      // Profil realtime
+      setLoadingProfileFromDb(true);
+      const ref = doc(db, "profiles", fbUser.uid);
+      unsubProfile = onSnapshot(
+        ref,
+        (snap) => {
+          if (snap.exists()) {
+            const data = snap.data() as any;
+            const loadedProfile: CvProfile = {
+              fullName: data.fullName || "",
+              email: data.email || "",
+              phone: data.phone || "",
+              linkedin: data.linkedin || "",
+              profileSummary: data.profileSummary || "",
+              city: data.city || "",
+              address: data.address || "",
+              contractType: data.contractType || data.contractTypeStandard || "",
+              contractTypeStandard: data.contractTypeStandard || "",
+              contractTypeFull: data.contractTypeFull || "",
+              primaryDomain: data.primaryDomain || "",
+              secondaryDomains: Array.isArray(data.secondaryDomains) ? data.secondaryDomains : [],
+              softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
+              drivingLicense: data.drivingLicense || "",
+              vehicle: data.vehicle || "",
+              skills: {
+                sections: Array.isArray(data.skills?.sections) ? data.skills.sections : [],
+                tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
+              },
+              experiences: Array.isArray(data.experiences) ? data.experiences : [],
+              education: Array.isArray(data.education) ? data.education : [],
+              educationShort: Array.isArray(data.educationShort) ? data.educationShort : [],
+              certs: data.certs || "",
+              langLine: data.langLine || "",
+              hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
+              updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : undefined,
+            };
+            setProfile(loadedProfile);
+          } else {
+            setProfile(null);
+          }
+          setLoadingProfileFromDb(false);
+        },
+        () => setLoadingProfileFromDb(false)
       );
 
+      // Apps stats realtime
+      setLoadingCounts(true);
+      const q = query(collection(db, "applications"), where("userId", "==", fbUser.uid));
       unsubApps = onSnapshot(
         q,
         (snap) => {
           let totalApps = 0;
           let cvCount = 0;
           let lmCount = 0;
-
-          snap.docs.forEach((docSnap) => {
-            const data = docSnap.data() as any;
+          snap.docs.forEach((d) => {
+            const data = d.data() as any;
             totalApps++;
             if (data.hasCv) cvCount++;
             if (data.hasLm) lmCount++;
           });
-
           setDashboardCounts({ totalApps, cvCount, lmCount });
           setLoadingCounts(false);
         },
-        (err) => {
-          console.error("Erreur chargement stats dashboard:", err);
-          setLoadingCounts(false);
-        }
+        () => setLoadingCounts(false)
       );
     });
 
     return () => {
+      if (unsubProfile) unsubProfile();
       if (unsubApps) unsubApps();
       unsubAuth();
     };
   }, []);
 
-  // 💾 sauvegarde du profil en base (Firestore)
+  // ====== Save helpers ======
   const saveProfileToDb = async (p: CvProfile) => {
-    if (!userId) return;
-    const ref = doc(db, "profiles", userId);
-    const payload = {
-      ...p,
-      ownerUid: userId,
-      ownerEmail: userEmail ?? null,
-      updatedAt: Date.now(),
-    };
-    await setDoc(ref, payload, { merge: true });
+    if (!user) return;
+    const ref = doc(db, "profiles", user.uid);
+    await setDoc(ref, { ...p, ownerUid: user.uid, ownerEmail: user.email ?? null, updatedAt: Date.now() }, { merge: true });
   };
 
-  // 🎯 Radar Chart
+  // ====== Radar chart render ======
   useEffect(() => {
-    if (!radarCanvasRef.current || !profile) return;
+    if (!radarCanvasRef.current) return;
 
     const ctx = radarCanvasRef.current.getContext("2d");
     if (!ctx) return;
 
-    const existingChart = Chart.getChart(radarCanvasRef.current as any);
-    if (existingChart) {
-      existingChart.destroy();
-    }
+    const existing = Chart.getChart(radarCanvasRef.current as any);
+    if (existing) existing.destroy();
 
     const { labels, data } = buildRadarData(profile);
 
-    const chartInstance = new Chart(ctx, {
+    const chart = new Chart(ctx, {
       type: "radar",
       data: {
         labels,
@@ -1077,10 +712,10 @@ export default function DashboardPage() {
           {
             label: "Niveau estimé",
             data,
-            backgroundColor: "rgba(56, 189, 248, 0.25)",
-            borderColor: "rgba(56, 189, 248, 0.9)",
+            backgroundColor: "rgba(59, 130, 246, 0.18)",
+            borderColor: "rgba(59, 130, 246, 0.85)",
             borderWidth: 2,
-            pointBackgroundColor: "rgba(56, 189, 248, 1)",
+            pointBackgroundColor: "rgba(59, 130, 246, 1)",
             pointRadius: 3,
           },
         ],
@@ -1088,121 +723,53 @@ export default function DashboardPage() {
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        devicePixelRatio: typeof window !== "undefined" ? window.devicePixelRatio : 1,
         scales: {
           r: {
             beginAtZero: true,
             min: 0,
             max: 10,
-            ticks: {
-              stepSize: 2,
-              showLabelBackdrop: false,
-              display: false,
-            },
-            grid: {
-              color: "rgba(148, 163, 184, 0.35)",
-            },
-            angleLines: {
-              color: "rgba(148, 163, 184, 0.35)",
-            },
-            pointLabels: {
-              font: { size: 11 },
-              color: "#e5e7eb",
-            },
+            ticks: { stepSize: 2, showLabelBackdrop: false, display: false },
+            grid: { color: "rgba(255, 255, 255, 0.08)" },
+            angleLines: { color: "rgba(255, 255, 255, 0.08)" },
+            pointLabels: { font: { size: 11 }, color: "rgba(226, 232, 240, 0.7)" },
           },
         },
-        plugins: {
-          legend: { display: false },
-        },
+        plugins: { legend: { display: false } },
       },
     });
 
-    return () => {
-      chartInstance.destroy();
-    };
+    return () => chart.destroy();
   }, [profile]);
 
-  // --- UPLOAD CV ---
-
+  // ====== Upload handlers ======
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
     setError(null);
     const f = e.target.files?.[0];
     if (!f) return;
-
     if (!f.type.includes("pdf")) {
       setError("Merci d'importer un CV au format PDF.");
       return;
     }
-
     setFile(f);
   };
 
-  const fileToBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onerror = () => reject(new Error("Impossible de lire le fichier."));
-      reader.onload = () => {
-        const result = reader.result as string;
-        const base64 = result.split(",")[1];
-        if (!base64) {
-          reject(new Error("Encodage base64 invalide."));
-        } else {
-          resolve(base64);
-        }
-      };
-      reader.readAsDataURL(file);
-    });
-  };
-
   const handleUpload = async () => {
-    if (!file) {
-      setError("Choisis d'abord un CV au format PDF.");
-      return;
-    }
+    if (!file) return setError("Choisis d'abord un CV au format PDF.");
+    if (!user) return setError("Tu dois être connecté pour analyser ton CV.");
+    if (loadingAccountProfile) return setError("Ton profil utilisateur charge, réessaie dans un instant.");
+    if (isBlocked) return setError("Ton compte est bloqué. Contacte l'administrateur.");
 
-    if (!user) {
-      setError("Tu dois être connecté pour analyser ton CV.");
-      return;
-    }
-
-    if (loadingAccountProfile) {
-      setError(
-        "Ton profil utilisateur est en cours de chargement, réessaie dans un instant."
-      );
-      return;
-    }
-
-    if (isBlocked) {
-      setError(
-        "Ton compte est bloqué. Contacte l'administrateur pour en savoir plus."
-      );
-      return;
-    }
-
-    const cost = 1; // 💰 coût d'une analyse de CV
-    if (remainingCredits < cost) {
-      setError(
-        "Tu n'as plus assez de crédits pour analyser un CV. Contacte l'administrateur."
-      );
-      return;
-    }
+    const cost = 1;
+    if (remainingCredits < cost) return setError("Tu n'as plus assez de crédits pour analyser un CV.");
 
     setError(null);
     setUploading(true);
 
     try {
-      // 1) Consommation des crédits (transaction Firestore)
-      await consumeCredits(user.uid, cost);
+      await logUsage(user, "cv_analyze", { fileName: file.name, fileSize: file.size, feature: "cv-profile-merged" });
 
-      // 2) Log d'usage
-      await logUsage(user, "cv_analyze", {
-        fileName: file.name,
-        fileSize: file.size,
-        feature: "dashboard-cv-upload",
-      });
-
-      // 3) Appel via l'API Next.js (✅ auth + recaptcha)
       const base64Pdf = await fileToBase64(file);
-
       const idToken = await user.getIdToken();
       const recaptchaToken = await getRecaptchaToken("extract_profile");
 
@@ -1215,65 +782,45 @@ export default function DashboardPage() {
         },
         body: JSON.stringify({
           base64Pdf,
-          meta: {
-            fileName: file.name,
-            fileSize: file.size,
-            feature: "dashboard-cv-upload",
-          },
+          meta: { fileName: file.name, fileSize: file.size, feature: "cv-profile-merged" },
         }),
       });
 
       const json = await res.json().catch(() => null);
-
       if (!res.ok) {
         const msg = (json && (json.error || json.message)) || `HTTP ${res.status}`;
-        if (res.status === 401 || msg === "unauthenticated") {
-          throw new Error("unauthenticated");
-        }
         throw new Error(msg);
       }
+
+      // ✅ On consomme le crédit après un OK
+      await consumeCredits(user.uid, cost);
 
       const now = Date.now();
       const rawProfile = json?.profile ?? json;
 
       const receivedProfile: CvProfile = {
         fullName: rawProfile.fullName || "",
-        email: rawProfile.email || "",
+        email: rawProfile.email || user.email || "",
         phone: rawProfile.phone || "",
         linkedin: rawProfile.linkedin || "",
         profileSummary: rawProfile.profileSummary || "",
         city: rawProfile.city || "",
         address: rawProfile.address || "",
-        contractType:
-          rawProfile.contractType || rawProfile.contractTypeStandard || "",
+        contractType: rawProfile.contractType || rawProfile.contractTypeStandard || "",
         contractTypeStandard: rawProfile.contractTypeStandard || "",
         contractTypeFull: rawProfile.contractTypeFull || "",
         primaryDomain: rawProfile.primaryDomain || "",
-        secondaryDomains: Array.isArray(rawProfile.secondaryDomains)
-          ? rawProfile.secondaryDomains
-          : [],
-        softSkills: Array.isArray(rawProfile.softSkills)
-          ? rawProfile.softSkills
-          : [],
+        secondaryDomains: Array.isArray(rawProfile.secondaryDomains) ? rawProfile.secondaryDomains : [],
+        softSkills: Array.isArray(rawProfile.softSkills) ? rawProfile.softSkills : [],
         drivingLicense: rawProfile.drivingLicense || "",
         vehicle: rawProfile.vehicle || "",
         skills: {
-          sections: Array.isArray(rawProfile.skills?.sections)
-            ? rawProfile.skills.sections
-            : [],
-          tools: Array.isArray(rawProfile.skills?.tools)
-            ? rawProfile.skills.tools
-            : [],
+          sections: Array.isArray(rawProfile.skills?.sections) ? rawProfile.skills.sections : [],
+          tools: Array.isArray(rawProfile.skills?.tools) ? rawProfile.skills.tools : [],
         },
-        experiences: Array.isArray(rawProfile.experiences)
-          ? rawProfile.experiences
-          : [],
-        education: Array.isArray(rawProfile.education)
-          ? rawProfile.education
-          : [],
-        educationShort: Array.isArray(rawProfile.educationShort)
-          ? rawProfile.educationShort
-          : [],
+        experiences: Array.isArray(rawProfile.experiences) ? rawProfile.experiences : [],
+        education: Array.isArray(rawProfile.education) ? rawProfile.education : [],
+        educationShort: Array.isArray(rawProfile.educationShort) ? rawProfile.educationShort : [],
         certs: rawProfile.certs || "",
         langLine: rawProfile.langLine || "",
         hobbies: Array.isArray(rawProfile.hobbies) ? rawProfile.hobbies : [],
@@ -1281,49 +828,73 @@ export default function DashboardPage() {
       };
 
       setProfile(receivedProfile);
-
-      if (userId) {
-        await saveProfileToDb(receivedProfile);
-      }
+      await saveProfileToDb(receivedProfile);
+      showToast("CV analysé et profil mis à jour ✅", "success");
     } catch (err: any) {
       console.error(err);
-      if (err instanceof Error) {
-        if (err.message === "unauthenticated") {
-          setError("Session expirée. Déconnecte-toi / reconnecte-toi puis réessaie.");
-        } else if (err.message === "NOT_ENOUGH_CREDITS" || err.message === "NO_CREDITS") {
-          setError(
-            "Tu n'as plus assez de crédits pour analyser un CV. Contacte l'administrateur."
-          );
-        } else if (err.message === "USER_BLOCKED") {
-          setError(
-            "Ton compte est bloqué. Contacte l'administrateur pour en savoir plus."
-          );
-        } else if (err.message === "USER_DOC_NOT_FOUND") {
-          setError(
-            "Profil utilisateur introuvable dans la base. Contacte l'administrateur."
-          );
-        } else {
-          setError(err.message || "Impossible d'analyser ton CV pour le moment.");
-        }
-      } else {
-        setError("Impossible d'analyser ton CV pour le moment.");
-      }
+      setError(err?.message || "Impossible d'analyser ton CV pour le moment.");
+      showToast("Erreur d'analyse du CV", "error");
     } finally {
       setUploading(false);
     }
   };
 
-  // --- MODALES : OUVERTURE ---
+  /* =========================
+     NOUVEAU : Profil Strength + Checklist
+  ========================= */
+  const profileStrength = useMemo(() => {
+    if (!profile) return { score: 0, filled: 0, total: 10 };
 
+    const checks = [
+      !!profile.fullName?.trim(),
+      !!(profile.email || user?.email)?.trim(),
+      !!profile.phone?.trim(),
+      !!profile.linkedin?.trim(),
+      !!profile.profileSummary?.trim(),
+      !!profile.contractType?.trim(),
+      (profile.skills?.sections?.length || 0) > 0 || (profile.skills?.tools?.length || 0) > 0,
+      (profile.experiences?.length || 0) > 0,
+      (profile.education?.length || 0) > 0 || !!profile.certs?.trim(),
+      !!profile.langLine?.trim(),
+    ];
+
+    const filled = checks.filter(Boolean).length;
+    const total = checks.length;
+    const score = Math.round((filled / total) * 100);
+    return { score, filled, total };
+  }, [profile, user?.email]);
+
+  const checklist = useMemo(() => {
+    if (!profile) {
+      return [
+        { label: "Analyser ton CV", modal: null as ActiveModal, action: "upload" as const },
+      ];
+    }
+
+    const items: { label: string; modal: ActiveModal; ok: boolean }[] = [
+      { label: "Compléter tes infos (email/tel/LinkedIn)", modal: "infos", ok: !!(profile.email && profile.phone && profile.linkedin) },
+      { label: "Ajouter un résumé de profil", modal: "infos", ok: !!profile.profileSummary?.trim() },
+      { label: "Renseigner tes compétences & outils", modal: "skills", ok: (profile.skills?.sections?.length || 0) > 0 || (profile.skills?.tools?.length || 0) > 0 },
+      { label: "Ajouter au moins une expérience", modal: "experience", ok: (profile.experiences?.length || 0) > 0 },
+      { label: "Ajouter formation / certifs", modal: "education", ok: (profile.education?.length || 0) > 0 || !!profile.certs?.trim() },
+      { label: "Ajouter tes langues", modal: "languages", ok: !!profile.langLine?.trim() },
+      { label: "Ajouter tes loisirs", modal: "hobbies", ok: (profile.hobbies?.length || 0) > 0 },
+    ];
+
+    return items;
+  }, [profile]);
+
+  /* =========================
+     MODAL OPENERS
+  ========================= */
   const openInfosModal = () => {
     if (!profile) return;
     setInfosDraft({
-      fullName: profile.fullName,
-      email: profile.email || userEmail || "",
+      fullName: profile.fullName || "",
+      email: profile.email || user?.email || "",
       phone: profile.phone || "",
       linkedin: profile.linkedin || "",
-      contractType:
-        profile.contractType || profile.contractTypeStandard || "",
+      contractType: profile.contractType || profile.contractTypeStandard || "",
       profileSummary: profile.profileSummary || "",
       drivingLicense: profile.drivingLicense || "",
       vehicle: profile.vehicle || "",
@@ -1338,7 +909,6 @@ export default function DashboardPage() {
       .map((sec) => `${sec.title}: ${sec.items.join(", ")}`)
       .join("\n");
     const toolsText = (profile.skills.tools || []).join(", ");
-
     setSkillsSectionsText(sectionsText);
     setSkillsToolsText(toolsText);
     setActiveModal("skills");
@@ -1352,100 +922,40 @@ export default function DashboardPage() {
         role: exp.role || "",
         dates: exp.dates || "",
         bulletsText: (exp.bullets || []).join("\n"),
+        location: exp.location || "",
       })) || [];
-
-    if (drafts.length === 0) {
-      drafts.push({ company: "", role: "", dates: "", bulletsText: "" });
-    }
-
+    if (drafts.length === 0) drafts.push({ company: "", role: "", dates: "", bulletsText: "" });
     setExperiencesDraft(drafts);
     setActiveModal("experience");
   };
 
-  const addExperienceDraft = () => {
-    setExperiencesDraft((prev) => [
-      ...prev,
-      { company: "", role: "", dates: "", bulletsText: "" },
-    ]);
-  };
-
-  const updateExperienceDraft = (
-    index: number,
-    field: keyof ExperienceDraft,
-    value: string
-  ) => {
-    setExperiencesDraft((prev) =>
-      prev.map((exp, i) =>
-        i === index
-          ? {
-              ...exp,
-              [field]: value,
-            }
-          : exp
-      )
-    );
-  };
-
   const openEducationModal = () => {
     if (!profile) return;
-
     const drafts: EducationDraft[] =
       Array.isArray(profile.education) && profile.education.length > 0
         ? profile.education.map((edu) => ({
             school: edu.school || "",
             degree: edu.degree || "",
             dates: edu.dates || "",
-            location: (edu as any).location || "",
+            location: (edu.location || "") as string,
           }))
-        : [
-            {
-              school: "",
-              degree: "",
-              dates: "",
-              location: "",
-            },
-          ];
+        : [{ school: "", degree: "", dates: "", location: "" }];
 
     setEducationDrafts(drafts);
 
     const list =
       profile.certs
         ?.split(/[,\n]/)
-        .map((c: string) => c.trim())
-        .filter((c: string) => c.length > 0) || [];
+        .map((c) => c.trim())
+        .filter(Boolean) || [];
+
     setCertsList(list);
     setCertInput("");
-
     setActiveModal("education");
-  };
-
-  const addEducationDraft = () => {
-    setEducationDrafts((prev) => [
-      ...prev,
-      { school: "", degree: "", dates: "", location: "" },
-    ]);
-  };
-
-  const updateEducationDraft = (
-    index: number,
-    field: keyof EducationDraft,
-    value: string
-  ) => {
-    setEducationDrafts((prev) =>
-      prev.map((edu, i) =>
-        i === index
-          ? {
-              ...edu,
-              [field]: value,
-            }
-          : edu
-      )
-    );
   };
 
   const openLanguagesModal = () => {
     if (!profile) return;
-
     const parsed = parseLangLine(profile.langLine || "");
     let drafts: LanguageDraft[] = [];
 
@@ -1453,23 +963,12 @@ export default function DashboardPage() {
       drafts = parsed.map((p) => {
         const txt = p.text;
         const match = txt.match(/^(.*?)\s*\((.*)\)$/);
-        if (match) {
-          return {
-            language: match[1].trim(),
-            level: match[2].trim(),
-          };
-        }
-        return {
-          language: txt,
-          level: "",
-        };
+        if (match) return { language: match[1].trim(), level: match[2].trim() };
+        return { language: txt, level: "" };
       });
     }
 
-    if (drafts.length === 0) {
-      drafts = [{ language: "", level: "" }];
-    }
-
+    if (drafts.length === 0) drafts = [{ language: "", level: "" }];
     setLanguagesDraft(drafts);
     setActiveModal("languages");
   };
@@ -1481,8 +980,19 @@ export default function DashboardPage() {
     setActiveModal("hobbies");
   };
 
-  // --- MODALES : SAUVEGARDE ---
+  /* =========================
+     REORDER (NEW)
+  ========================= */
+  const moveItem = <T,>(arr: T[], from: number, to: number) => {
+    const copy = [...arr];
+    const item = copy.splice(from, 1)[0];
+    copy.splice(to, 0, item);
+    return copy;
+  };
 
+  /* =========================
+     MODAL SAVE
+  ========================= */
   const handleModalSave = async (e?: FormEvent) => {
     if (e) e.preventDefault();
     if (!profile || !activeModal) {
@@ -1504,10 +1014,7 @@ export default function DashboardPage() {
         drivingLicense: infosDraft.drivingLicense.trim(),
         vehicle: infosDraft.vehicle.trim(),
         address: infosDraft.address.trim(),
-        city:
-          infosDraft.address.trim().split(",")[0].trim() ||
-          profile.city ||
-          "",
+        city: infosDraft.address.trim().split(",")[0].trim() || profile.city || "",
       };
     }
 
@@ -1520,26 +1027,13 @@ export default function DashboardPage() {
           const [titlePart, itemsPart] = line.split(":");
           const title = (titlePart || "Compétences").trim();
           const items = itemsPart
-            ? itemsPart
-                .split(",")
-                .map((s) => s.trim())
-                .filter(Boolean)
+            ? itemsPart.split(",").map((s) => s.trim()).filter(Boolean)
             : [];
           return { title, items };
         });
 
-      const tools = skillsToolsText
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean);
-
-      updated = {
-        ...profile,
-        skills: {
-          sections,
-          tools,
-        },
-      };
+      const tools = skillsToolsText.split(",").map((t) => t.trim()).filter(Boolean);
+      updated = { ...profile, skills: { sections, tools } };
     }
 
     if (activeModal === "experience") {
@@ -1548,20 +1042,12 @@ export default function DashboardPage() {
           company: d.company.trim(),
           role: d.role.trim(),
           dates: d.dates.trim(),
-          bullets: d.bulletsText
-            .split("\n")
-            .map((b) => b.trim())
-            .filter(Boolean),
+          location: (d.location || "").trim(),
+          bullets: d.bulletsText.split("\n").map((b) => b.trim()).filter(Boolean),
         }))
-        .filter(
-          (exp) =>
-            exp.company || exp.role || exp.dates || exp.bullets.length > 0
-        );
+        .filter((exp) => exp.company || exp.role || exp.dates || exp.bullets.length > 0);
 
-      updated = {
-        ...profile,
-        experiences,
-      };
+      updated = { ...profile, experiences };
     }
 
     if (activeModal === "education") {
@@ -1572,1304 +1058,874 @@ export default function DashboardPage() {
           dates: d.dates.trim(),
           location: d.location.trim(),
         }))
-        .filter(
-          (e) => e.school || e.degree || e.dates || (e.location ?? "").length
-        );
+        .filter((ed) => ed.school || ed.degree || ed.dates || (ed.location ?? "").length);
 
-      const educationShort = education.map((e) => {
+      const educationShort = education.map((ed) => {
         const parts: string[] = [];
-        if (e.dates) parts.push(e.dates);
+        if (ed.dates) parts.push(ed.dates);
+
         let main = "";
-        if (e.degree && e.school) main = `${e.degree} – ${e.school}`;
-        else if (e.degree) main = e.degree;
-        else if (e.school) main = e.school;
+        if (ed.degree && ed.school) main = `${ed.degree} – ${ed.school}`;
+        else if (ed.degree) main = ed.degree;
+        else if (ed.school) main = ed.school;
+
         if (main) parts.push(main);
-        if (e.location) {
-          if (parts.length > 1) {
-            parts[parts.length - 1] = `${parts[parts.length - 1]} (${e.location})`;
-          } else {
-            parts.push(`(${e.location})`);
-          }
+        if (ed.location) {
+          if (parts.length > 1) parts[parts.length - 1] = `${parts[parts.length - 1]} (${ed.location})`;
+          else parts.push(`(${ed.location})`);
         }
         return parts.join(" · ");
       });
 
-      const certsJoined = certsList.join(", ");
-
-      updated = {
-        ...profile,
-        education,
-        educationShort,
-        certs: certsJoined,
-      };
+      updated = { ...profile, education, educationShort, certs: certsList.join(", ") };
     }
 
     if (activeModal === "languages") {
       const cleaned = languagesDraft
-        .map((l) => ({
-          language: l.language.trim(),
-          level: l.level.trim(),
-        }))
+        .map((l) => ({ language: l.language.trim(), level: l.level.trim() }))
         .filter((l) => l.language.length > 0);
 
-      const langLine = cleaned
-        .map((l) => (l.level ? `${l.language} (${l.level})` : `${l.language}`))
-        .join(" · ");
-
-      updated = {
-        ...profile,
-        langLine,
-      };
+      const langLine = cleaned.map((l) => (l.level ? `${l.language} (${l.level})` : `${l.language}`)).join(" · ");
+      updated = { ...profile, langLine };
     }
 
     if (activeModal === "hobbies") {
-      const hobbies = hobbiesList
-        .map((h) => h.trim())
-        .filter((h) => h.length > 0);
-      updated = {
-        ...profile,
-        hobbies,
-      };
+      updated = { ...profile, hobbies: hobbiesList.map((h) => h.trim()).filter(Boolean) };
     }
 
     setProfile(updated);
-    if (userId) {
-      await saveProfileToDb(updated);
-    }
+    await saveProfileToDb(updated);
     setActiveModal(null);
+    showToast("Modifications sauvegardées ✅", "success");
   };
 
-  const handleModalCancel = () => {
-    setActiveModal(null);
-  };
-
-  const headline =
-    profile?.profileSummary?.split(".")[0] ||
-    (profile?.contractType
-      ? profile.contractType
-      : "Profil en cours de configuration");
-
-  const updatedLabel = profile?.updatedAt
-    ? `Profil mis à jour le ${formatUpdatedAt(profile.updatedAt)}`
-    : "Profil non encore enregistré";
+  const updatedLabel =
+    profile?.updatedAt ? `Profil mis à jour le ${formatUpdatedAt(profile.updatedAt)}` : profile ? "Profil non encore enregistré" : "";
 
   const langDisplay = parseLangLine(profile?.langLine || "");
-  const visibilityLabel = userId ? "Associé à ton compte" : "Invité";
 
-  // --- RENDER ---
+  // Export
+  const handleExport = () => {
+    if (!profile) return;
+    downloadJson(`profil-${(profile.fullName || "candidat").replace(/\s+/g, "-").toLowerCase()}.json`, profile);
+    showToast("Export JSON prêt ✅", "success");
+  };
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.25 }}
-      className="max-w-6xl mx-auto px-3 sm:px-4 py-5 sm:py-6 space-y-5"
-    >
-      {/* 1. VUE D'ENSEMBLE + STATS */}
-      <section className="space-y-4">
-        <div>
-          <p className="badge-muted mb-2 flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-            <span className="text-[11px] uppercase tracking-wider text-[var(--muted)]">
-              Vue d&apos;ensemble
-            </span>
-          </p>
-          <h1 className="text-xl sm:text-2xl font-semibold">
-            Ton tableau de bord de candidatures
-          </h1>
-          <p className="text-xs sm:text-sm text-[var(--muted)] mt-1 max-w-xl">
-            Accède rapidement à ton CV IA et à toutes les infos qui serviront à
-            générer ton CV, tes lettres de motivation et ton pitch.
-          </p>
+    <div className="min-h-screen bg-[#020617] text-slate-300 font-sans">
+      {/* MOBILE TOPBAR */}
+      <div className="lg:hidden sticky top-0 z-50 bg-slate-900/80 backdrop-blur-md border-b border-white/5 p-4 flex justify-between items-center">
+        <h1 className="text-lg font-bold text-white flex items-center gap-2">
+          <Cpu className="h-5 w-5 text-blue-500" /> Profil IA
+        </h1>
+        <div className="flex items-center gap-2 bg-blue-500/10 px-3 py-1 rounded-full border border-blue-500/20">
+          <Zap className="h-3 w-3 text-yellow-400" />
+          <span className="text-xs font-mono font-bold text-white">{loadingAccountProfile ? "…" : remainingCredits}</span>
         </div>
+      </div>
 
-        {/* STATS CARDS */}
-        <div className="grid gap-3 md:grid-cols-4">
-          {/* Crédits */}
-          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
-            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-              Crédits restants
-            </p>
-            <p className="text-2xl font-semibold">
-              {loadingAccountProfile ? "…" : remainingCredits}
-            </p>
-            <p className="text-[11px] text-[var(--muted)]">
-              Utilisés pour analyser ton CV et générer des contenus.
-            </p>
-          </div>
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 lg:flex gap-8">
+        {/* SIDEBAR */}
+        <aside className="hidden lg:block w-64 shrink-0">
+          <div className="sticky top-8 space-y-6">
+            <div className="p-6 rounded-3xl bg-gradient-to-b from-slate-900 to-slate-950 border border-white/5 shadow-2xl">
+              <div className="h-16 w-16 rounded-2xl bg-blue-600 flex items-center justify-center text-2xl font-bold text-white mb-4 shadow-lg shadow-blue-900/40">
+                {getInitials(profile?.fullName || user?.email || "")}
+              </div>
+              <h2 className="text-white font-bold text-lg truncate">{profile?.fullName || "Utilisateur"}</h2>
+              <p className="text-xs text-slate-500 font-mono mt-1 uppercase tracking-tighter">
+                Status: {user ? "Connecté" : "Invité"} {loadingProfileFromDb ? "· Sync..." : ""}
+              </p>
 
-          {/* CV générés */}
-          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
-            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-              CV générés
-            </p>
-            <p className="text-2xl font-semibold">
-              {loadingCounts ? "…" : dashboardCounts.cvCount}
-            </p>
-            <p className="text-[11px] text-[var(--muted)]">
-              Nombre de candidatures où un <strong>CV IA</strong> est associé
-              (coché ou généré).
-            </p>
-          </div>
+              <div className="mt-4">
+                <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono">
+                  <span>Profile Strength</span>
+                  <span className="text-white font-bold">{profileStrength.score}%</span>
+                </div>
+                <div className="mt-2 h-2 rounded-full bg-white/5 overflow-hidden border border-white/5">
+                  <div className="h-full bg-blue-500" style={{ width: `${profileStrength.score}%` }} />
+                </div>
+                <p className="mt-2 text-[10px] text-slate-500">
+                  {profileStrength.filled}/{profileStrength.total} éléments complétés · {updatedLabel}
+                </p>
+              </div>
 
-          {/* LM IA générées */}
-          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
-            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-              LM IA générées
-            </p>
-            <p className="text-2xl font-semibold">
-              {loadingCounts ? "…" : dashboardCounts.lmCount}
-            </p>
-            <p className="text-[11px] text-[var(--muted)]">
-              Nombre de candidatures avec une <strong>lettre IA</strong>{" "}
-              associée.
-            </p>
-          </div>
-
-          {/* Candidatures suivies */}
-          <div className="glass p-4 rounded-2xl border border-[var(--border)]/80">
-            <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">
-              Candidatures suivies
-            </p>
-            <p className="text-2xl font-semibold">
-              {loadingCounts ? "…" : dashboardCounts.totalApps}
-            </p>
-            <p className="text-[11px] text-[var(--muted)]">
-              Total de lignes dans ton{" "}
-              <strong>tracker de candidatures</strong>.
-            </p>
-          </div>
-        </div>
-      </section>
-
-      {/* 2. HEADER PROFIL + MON CV + RADAR */}
-      <header
-        id="infos-personnelles"
-        className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 flex flex-col lg:flex-row gap-4 md:items-stretch"
-      >
-        {/* Colonne gauche : identité, résumé, CV, infos clés */}
-        <div className="flex flex-col flex-1 gap-3">
-          {/* Identité */}
-          <div className="flex items-center gap-3 sm:gap-4">
-            <div className="flex h-14 w-14 sm:h-16 sm:w-16 items-center justify-center rounded-full bg-[var(--bg-soft)] border border-[var(--border)] text-base sm:text-lg font-semibold">
-              {getInitials(profile?.fullName || userEmail || "")}
+              <div className="mt-4 flex gap-2">
+                <button
+                  onClick={handleExport}
+                  disabled={!profile}
+                  className="flex-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-xs font-bold text-white flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  <Download className="h-4 w-4" />
+                  Export
+                </button>
+                <button
+                  onClick={() => openInfosModal()}
+                  disabled={!profile}
+                  className="px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-xs font-bold text-white border border-blue-500/30 disabled:opacity-50"
+                >
+                  Edit
+                </button>
+              </div>
             </div>
-            <div className="space-y-1">
-              <div className="flex flex-wrap items-center gap-1.5">
-                <h2 className="text-base sm:text-lg font-semibold">
-                  {profile?.fullName || "Ton profil candidat"}
-                </h2>
-                {userEmail && (
-                  <span className="rounded-full border border-[var(--border)] px-2 py-[2px] text-[10px] text-[var(--muted)]">
-                    Connecté·e en tant que{" "}
-                    <span className="font-medium text-[11px] text-white">
-                      {userEmail}
-                    </span>
-                  </span>
+
+            <nav className="space-y-1">
+              {navItems.map((item) => (
+                <a
+                  key={item.id}
+                  href={`#${item.id}`}
+                  className={`flex items-center justify-between px-4 py-3 rounded-2xl transition-all duration-200 group ${
+                    activeSection === item.id
+                      ? "bg-blue-600 text-white shadow-lg shadow-blue-900/20"
+                      : "text-slate-500 hover:bg-white/5 hover:text-slate-200"
+                  }`}
+                >
+                  <div className="flex items-center gap-3">
+                    <item.icon className="h-4 w-4" />
+                    <span className="text-sm font-semibold">{item.label}</span>
+                  </div>
+                  <ChevronRight className={`h-3 w-3 transition-transform ${activeSection === item.id ? "rotate-90" : "group-hover:translate-x-1"}`} />
+                </a>
+              ))}
+            </nav>
+
+            {/* NEW: Checklist */}
+            <div className="p-4 rounded-2xl bg-slate-900/30 border border-white/5">
+              <div className="flex items-center gap-3 mb-3">
+                <AlertTriangle className="h-4 w-4 text-amber-400" />
+                <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">À compléter</span>
+              </div>
+
+              <div className="space-y-2">
+                {checklist.map((it: any, idx: number) => {
+                  if (it.action === "upload") {
+                    return (
+                      <button
+                        key={idx}
+                        onClick={() => document.getElementById("file-input-hidden")?.click()}
+                        className="w-full text-left px-3 py-2 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-xs text-slate-200"
+                      >
+                        • {it.label}
+                      </button>
+                    );
+                  }
+
+                  return (
+                    <button
+                      key={idx}
+                      onClick={() => it.ok ? null : setActiveModal(it.modal)}
+                      className={`w-full text-left px-3 py-2 rounded-xl border text-xs ${
+                        it.ok
+                          ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-100"
+                          : "bg-white/5 border-white/10 hover:bg-white/10 text-slate-200"
+                      }`}
+                      title={it.ok ? "OK" : "Cliquer pour compléter"}
+                    >
+                      {it.ok ? "✓" : "•"} {it.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-slate-900/30 border border-white/5">
+              <div className="flex items-center gap-3 mb-3">
+                <ShieldCheck className="h-4 w-4 text-emerald-500" />
+                <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">Confidentialité</span>
+              </div>
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Données chiffrées · utilisées pour optimiser tes candidatures via IA.
+              </p>
+            </div>
+          </div>
+        </aside>
+
+        {/* MAIN */}
+        <main className="flex-1 space-y-8">
+          {/* KPI ROW */}
+          <section className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <KpiItem label="Crédits IA" value={loadingAccountProfile ? "…" : remainingCredits} sub="Disponibles" icon={Zap} color="text-yellow-400" />
+            <KpiItem label="CV générés" value={loadingCounts ? "…" : dashboardCounts.cvCount} sub="Depuis candidatures" icon={FileText} color="text-blue-400" />
+            <KpiItem label="Force Profil" value={`${profileStrength.score}%`} sub="Score global" icon={Sparkles} color="text-purple-400" />
+            <KpiItem label="Candidatures" value={loadingCounts ? "…" : dashboardCounts.totalApps} sub="Suivies" icon={Briefcase} color="text-emerald-400" />
+          </section>
+
+          {/* HERO + RADAR */}
+          <section id="infos-personnelles" className="grid lg:grid-cols-[1fr,350px] gap-6">
+            <motion.div
+              className="p-8 rounded-[2rem] bg-slate-900/50 border border-white/10 shadow-2xl relative overflow-hidden"
+              whileHover={{ borderColor: "rgba(59, 130, 246, 0.3)" }}
+            >
+              <div className="relative z-10">
+                <div className="flex justify-between items-start">
+                  <div>
+                    <h3 className="text-3xl font-black text-white tracking-tighter">
+                      {profile?.fullName || "Configure ton identité"}
+                    </h3>
+                    <p className="text-blue-400 font-mono text-sm mt-2 uppercase tracking-widest flex items-center gap-2">
+                      <Cpu className="h-4 w-4" /> {profile?.contractType || "Recherche active"}
+                    </p>
+                    <p className="mt-2 text-xs text-slate-500 font-mono">
+                      {loadingProfileFromDb ? "Synchronisation..." : updatedLabel}
+                    </p>
+                  </div>
+
+                  <button
+                    onClick={openInfosModal}
+                    disabled={!profile}
+                    className="p-3 rounded-2xl bg-white/5 hover:bg-blue-600 hover:text-white transition-all border border-white/10 disabled:opacity-50"
+                  >
+                    <PencilLine className="h-5 w-5" />
+                  </button>
+                </div>
+
+                <p className="mt-6 text-slate-400 text-sm leading-relaxed max-w-2xl line-clamp-3">
+                  {profile?.profileSummary || "Importe ton CV PDF pour générer ton profil IA automatiquement."}
+                </p>
+
+                <div className="mt-10 flex flex-wrap gap-4 items-center">
+                  <div className="flex-1 min-w-[240px]">
+                    <label className="flex items-center gap-4 p-4 rounded-2xl border-2 border-dashed border-white/10 hover:border-blue-500/50 hover:bg-blue-500/5 transition-all cursor-pointer group">
+                      <input
+                        id="file-input-hidden"
+                        type="file"
+                        accept="application/pdf"
+                        className="hidden"
+                        onChange={handleFileChange}
+                      />
+                      <div className="p-2 rounded-lg bg-white/5 group-hover:bg-blue-500 group-hover:text-white transition-colors">
+                        <Upload className="h-5 w-5" />
+                      </div>
+                      <span className="text-sm font-semibold truncate">
+                        {file ? file.name : "Glisser / choisir ton CV (PDF)"}
+                      </span>
+                    </label>
+                  </div>
+
+                  <button
+                    onClick={handleUpload}
+                    disabled={!file || uploading || loadingAccountProfile || isBlocked || remainingCredits <= 0}
+                    className="h-14 px-8 rounded-2xl bg-blue-600 hover:bg-blue-500 text-white font-bold shadow-lg shadow-blue-900/40 transition-all disabled:opacity-50 flex items-center gap-3"
+                  >
+                    {uploading ? (
+                      <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 1 }}>
+                        <Cpu className="h-5 w-5" />
+                      </motion.div>
+                    ) : (
+                      <Zap className="h-5 w-5" />
+                    )}
+                    {uploading ? "Analyse..." : isBlocked ? "Compte bloqué" : remainingCredits <= 0 ? "Plus de crédits" : "Analyser l'Expertise"}
+                  </button>
+                </div>
+
+                {error && (
+                  <div className="mt-4 rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-100">
+                    {error}
+                  </div>
                 )}
               </div>
-              <p className="text-[12px] text-[var(--muted)] line-clamp-2">
-                {headline}
-              </p>
-              {(profile?.address || profile?.city) && (
-                <p className="text-[11px] text-[var(--muted)]">
-                  {profile.address || profile.city}
-                </p>
-              )}
-              <p className="text-[11px] text-[var(--muted)]">{updatedLabel}</p>
-            </div>
-          </div>
+              <div className="absolute -right-20 -top-20 h-64 w-64 bg-blue-600/10 rounded-full blur-[100px]" />
+            </motion.div>
 
-          {/* Mon CV */}
-          <section className="rounded-xl border border-[var(--border)]/80 bg-[var(--bg-soft)] p-3 sm:p-3.5 flex flex-col md:flex-row gap-3 md:items-center">
-            <div className="flex-1 space-y-1">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="inline-flex items-center rounded-full border border-[var(--border)] bg-[var(--bg)] px-2 py-[2px] text-[11px]">
-                  Mon CV
-                </span>
-                <p className="text-[11px] text-[var(--muted)]">
-                  {profile
-                    ? "Ton CV a été analysé et ton profil est sauvegardé."
-                    : "Aucun CV analysé pour le moment."}
-                </p>
+            <div className="p-8 rounded-[2rem] bg-slate-900 border border-white/5 flex flex-col items-center">
+              <h4 className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 mb-8 flex items-center gap-2">
+                <Sparkles className="h-3 w-3" /> Skill_Matrix.v3
+              </h4>
+              <div className="w-full h-64">
+                <canvas ref={radarCanvasRef} />
               </div>
-              {loadingProfileFromDb && (
-                <p className="text-[11px] text-[var(--muted)]">
-                  Chargement de ton profil sauvegardé...
-                </p>
-              )}
-            </div>
-
-            <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center md:ml-auto">
-              <label className="flex-1 cursor-pointer">
-                <div className="w-full rounded-lg border border-dashed border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 text-[12px] text-[var(--muted)] hover:border-[var(--brand)]/80 hover:bg-[var(--bg-soft)] transition-colors">
-                  {file ? (
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="truncate">{file.name}</span>
-                      <span className="text-[11px] text-[var(--muted)]">
-                        {(file.size / 1024 / 1024).toFixed(2)} Mo
-                      </span>
-                    </div>
-                  ) : (
-                    <span>Choisir un CV (PDF)</span>
-                  )}
+              <div className="mt-8 grid grid-cols-2 gap-2 w-full">
+                <div className="p-3 rounded-xl bg-white/5 border border-white/5 text-center">
+                  <p className="text-[10px] text-slate-500 uppercase font-bold">Profil</p>
+                  <p className="text-white font-mono font-bold">{profileStrength.score}%</p>
                 </div>
-                <input
-                  type="file"
-                  accept="application/pdf"
-                  className="hidden"
-                  onChange={handleFileChange}
-                />
-              </label>
-
-              <button
-                type="button"
-                onClick={handleUpload}
-                disabled={
-                  uploading ||
-                  !file ||
-                  loadingAccountProfile ||
-                  isBlocked ||
-                  remainingCredits <= 0
-                }
-                className="sm:w-[160px] inline-flex items-center justify-center rounded-lg bg-[var(--brand)] hover:bg-[var(--brandDark)] disabled:opacity-60 disabled:cursor-not-allowed text-[13px] font-medium text-white px-3 py-2 transition-colors"
-              >
-                {uploading
-                  ? "Analyse en cours..."
-                  : isBlocked
-                  ? "Compte bloqué"
-                  : remainingCredits <= 0
-                  ? "Plus de crédits"
-                  : "Analyser / Mettre à jour"}
-              </button>
+                <div className="p-3 rounded-xl bg-white/5 border border-white/5 text-center">
+                  <p className="text-[10px] text-slate-500 uppercase font-bold">Crédits</p>
+                  <p className="text-white font-mono font-bold">{loadingAccountProfile ? "…" : remainingCredits}</p>
+                </div>
+              </div>
             </div>
           </section>
 
-          {/* Informations clés */}
-          {profile && (
-            <div className="rounded-xl border border-[var(--border)]/60 bg-[var(--bg-soft)] p-3 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <p className="text-[11px] text-[var(--muted)] font-medium">
-                  Informations clés
-                </p>
-                <button
-                  type="button"
-                  onClick={openInfosModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
+          {/* INFOS KEY */}
+          <SectionWrapper id="infos" title="Informations clés" icon={Info} onEdit={openInfosModal}>
+            {profile ? (
+              <div className="grid md:grid-cols-2 gap-4 text-sm">
+                <InfoRow icon={Mail} label="Email" value={profile.email || user?.email || "—"} />
+                <InfoRow icon={Phone} label="Téléphone" value={profile.phone || "—"} />
+                <InfoRow icon={Linkedin} label="LinkedIn" value={profile.linkedin || "—"} />
+                <InfoRow icon={MapPin} label="Adresse" value={profile.address || profile.city || "—"} />
+                <InfoRow icon={Briefcase} label="Contrat" value={profile.contractType || "—"} />
+                <InfoRow
+                  icon={Car}
+                  label="Permis / Véhicule"
+                  value={`${profile.drivingLicense || "—"}${profile.vehicle ? ` · ${profile.vehicle}` : ""}`}
+                />
               </div>
-              <div className="grid gap-3 sm:grid-cols-2 text-[12px]">
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">Email</p>
-                  <p className="font-medium">
-                    {profile.email || userEmail || "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">Téléphone</p>
-                  <p className="font-medium">{profile.phone || "—"}</p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">LinkedIn</p>
-                  <p className="font-medium break-all">
-                    {profile.linkedin || "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">Adresse</p>
-                  <p className="font-medium line-clamp-2">
-                    {profile.address || profile.city || "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">
-                    Contrat recherché
-                  </p>
-                  <p className="font-medium line-clamp-2">
-                    {profile.contractType || "Non renseigné"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">
-                    Permis de conduire
-                  </p>
-                  <p className="font-medium">
-                    {profile.drivingLicense || "—"}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-[var(--muted)]">Véhicule</p>
-                  <p className="font-medium">{profile.vehicle || "—"}</p>
-                </div>
-              </div>
+            ) : (
+              <EmptyState text={loadingProfileFromDb ? "Chargement du profil..." : "Aucun profil. Analyse un CV pour commencer."} />
+            )}
+          </SectionWrapper>
+
+          {/* EXPERIENCE */}
+          <SectionWrapper id="experience" title="Parcours Professionnel" icon={Briefcase} onEdit={openExperienceModal}>
+            <div className="space-y-4">
+              {profile?.experiences?.length ? (
+                profile.experiences.map((exp, i) => (
+                  <div key={i} className="p-6 rounded-2xl bg-white/5 border border-white/5 hover:border-blue-500/30 transition-all relative">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <h4 className="text-white font-bold text-lg">{exp.role || "Poste"}</h4>
+                        <p className="text-blue-400 font-semibold">{exp.company || "Entreprise"}</p>
+                        {exp.location && <p className="text-xs text-slate-500 mt-1">{exp.location}</p>}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-mono bg-slate-800 px-3 py-1 rounded-full h-fit border border-white/10 uppercase">
+                          {exp.dates || "—"}
+                        </span>
+                      </div>
+                    </div>
+
+                    {!!exp.bullets?.length && (
+                      <ul className="mt-4 space-y-2">
+                        {exp.bullets.map((b, j) => (
+                          <li key={j} className="text-sm text-slate-400 flex items-start gap-3">
+                            <div className="h-1.5 w-1.5 rounded-full bg-blue-500 mt-1.5 shrink-0" />
+                            {b}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                ))
+              ) : (
+                <EmptyState text="Aucune expérience ajoutée." />
+              )}
             </div>
-          )}
+          </SectionWrapper>
 
-          {error && (
-            <div className="mt-1 w-full rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-[11px] text-red-100">
-              {error}
-            </div>
-          )}
+          {/* SKILLS + LANGUAGES */}
+          <div className="grid md:grid-cols-2 gap-6">
+            <SectionWrapper id="competences" title="Expertise" icon={Sparkles} onEdit={openSkillsModal}>
+              {profile?.skills ? (
+                <div className="space-y-6">
+                  {!!profile.skills.sections?.length && (
+                    <div className="space-y-5">
+                      {profile.skills.sections.map((sec, i) => (
+                        <div key={i} className="space-y-3">
+                          <p className="text-[10px] font-black uppercase text-slate-500 tracking-widest">{sec.title}</p>
+                          <div className="flex flex-wrap gap-2">
+                            {sec.items.map((item, j) => (
+                              <span key={j} className="px-3 py-1 rounded-lg bg-blue-500/10 border border-blue-500/20 text-xs font-medium text-blue-300">
+                                {item}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
 
-          {/* Visibilité */}
-          <div className="text-[11px] text-[var(--muted)]">
-            Visibilité :{" "}
-            <span className="font-medium text-[var(--text)]">
-              {visibilityLabel}
-            </span>
-          </div>
-        </div>
-
-        {/* Colonne droite : RADAR */}
-        <div className="md:w-[320px] lg:w-[360px] flex-shrink-0">
-          <div className="rounded-2xl bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-3 sm:p-4 h-full flex flex-col">
-            <p className="text-[11px] text-[var(--muted)] mb-2">
-              Radar de compétences estimé
-            </p>
-            <div className="relative flex-1 min-h-[210px]">
-              <canvas
-                id="skillsRadarChart"
-                ref={radarCanvasRef}
-                className="w-full h-full"
-              />
-            </div>
-          </div>
-        </div>
-      </header>
-
-      {/* 3. CONTENU PRINCIPAL : NAV GAUCHE + SECTIONS */}
-      <div className="lg:grid lg:grid-cols-[220px,1fr] gap-4 sm:gap-5">
-        {/* Sidebar navigation */}
-        <aside className="mb-3 lg:mb-0">
-          <motion.nav
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.35 }}
-            className="glass border border-[var(--border)]/80 rounded-2xl py-3 text-[12px] sticky top-20 lg:top-24"
-          >
-            <p className="px-3 pb-1 text-[11px] text-[var(--muted)]">
-              Navigation rapide
-            </p>
-            <ul className="space-y-0.5">
-              {navItems.map((item, idx) => (
-                <motion.li
-                  key={item.id}
-                  initial={{ opacity: 0, x: -8 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: 0.1 + idx * 0.05 }}
-                >
-                  <a
-                    href={`#${item.id}`}
-                    className="flex items-center justify-between px-3 py-2 hover:bg-[var(--bg-soft)] text-[12px] rounded-md transition-colors"
-                  >
-                    <span>{item.label}</span>
-                    <motion.span
-                      whileHover={{ x: 2 }}
-                      className="text-[10px] text-[var(--muted)]"
-                    >
-                      ↗
-                    </motion.span>
-                  </a>
-                </motion.li>
-              ))}
-            </ul>
-          </motion.nav>
-        </aside>
-
-        {/* Main content */}
-        <main className="space-y-4 sm:space-y-5">
-          {/* Compétences */}
-          {profile?.skills && (
-            <section
-              id="competences"
-              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4"
-            >
-              <div className="flex items-center justify-between gap-2 mb-1">
-                <h2 className="text-sm sm:text-base font-semibold">
-                  Compétences &amp; Outils
-                </h2>
-                <button
-                  type="button"
-                  onClick={openSkillsModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
-              </div>
-
-              {profile.skills.sections?.length > 0 && (
-                <div className="space-y-4">
-                  {profile.skills.sections.map((section, idx) => (
-                    <div key={idx} className="space-y-1">
-                      <p className="text-[11px] uppercase tracking-wide text-[var(--muted)]">
-                        {section.title}
-                      </p>
-                      <div className="flex flex-wrap gap-2 text-[12px]">
-                        {section.items.map((s, i) => (
-                          <span key={i} className="badge">
-                            {s}
+                  {!!profile.skills.tools?.length && (
+                    <div className="pt-4 border-t border-white/5">
+                      <p className="text-[10px] font-black uppercase text-slate-500 tracking-widest mb-3">Outils</p>
+                      <div className="flex flex-wrap gap-2">
+                        {profile.skills.tools.map((tool, idx) => (
+                          <span key={idx} className="px-3 py-1 rounded-lg bg-white/5 border border-white/10 text-xs font-medium text-slate-300">
+                            {tool}
                           </span>
                         ))}
                       </div>
                     </div>
-                  ))}
+                  )}
                 </div>
+              ) : (
+                <EmptyState text="Aucune compétence renseignée." />
               )}
+            </SectionWrapper>
 
-              {profile.skills.tools?.length > 0 && (
-                <div className="space-y-1 pt-2 border-t border-[var(--border)]/80">
-                  <p className="text-[11px] uppercase tracking-wide text-[var(--muted)]">
-                    Outils / logiciels
-                  </p>
-                  <div className="flex flex-wrap gap-2 text-[12px]">
-                    {profile.skills.tools.map((tool, idx) => (
-                      <span key={idx} className="badge">
-                        {tool}
-                      </span>
+            <SectionWrapper id="langues" title="Langues & Communication" icon={Languages} onEdit={openLanguagesModal}>
+              <div className="grid gap-4">
+                {langDisplay.length ? (
+                  langDisplay.map((lang, i) => (
+                    <div key={i} className="flex items-center justify-between p-4 rounded-2xl bg-white/5 border border-white/5">
+                      <div className="flex items-center gap-4">
+                        <span className="text-2xl">{lang.flag}</span>
+                        <span className="font-bold text-white">{lang.text}</span>
+                      </div>
+                      <BadgeCheck className="h-5 w-5 text-blue-500" />
+                    </div>
+                  ))
+                ) : (
+                  <EmptyState text="Aucune langue renseignée." />
+                )}
+              </div>
+            </SectionWrapper>
+          </div>
+
+          {/* FORMATION */}
+          <SectionWrapper id="formation" title="Formations & Certifications" icon={BadgeCheck} onEdit={openEducationModal}>
+            {profile ? (
+              <div className="space-y-6">
+                {profile.educationShort?.length ? (
+                  <div className="space-y-2">
+                    {profile.educationShort.map((l, idx) => (
+                      <div key={idx} className="p-4 rounded-2xl bg-white/5 border border-white/5 text-sm text-slate-300">
+                        {l}
+                      </div>
                     ))}
                   </div>
-                </div>
-              )}
-            </section>
-          )}
+                ) : (
+                  <EmptyState text="Aucune formation renseignée." />
+                )}
 
-          {/* Expérience */}
-          {profile?.experiences?.length ? (
-            <section
-              id="experience"
-              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5"
-            >
-              <div className="flex items-center justify-between gap-2 mb-2">
-                <h2 className="text-sm sm:text-base font-semibold">
-                  Expériences principales
-                </h2>
-                <button
-                  type="button"
-                  onClick={openExperienceModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
+                {profile.certs?.trim() ? (
+                  <div className="p-4 rounded-2xl bg-white/5 border border-white/5">
+                    <p className="text-[10px] font-black uppercase text-slate-500 tracking-widest mb-2">Certifications</p>
+                    <p className="text-sm text-slate-200">{profile.certs}</p>
+                  </div>
+                ) : null}
               </div>
+            ) : (
+              <EmptyState text="Aucun profil chargé." />
+            )}
+          </SectionWrapper>
 
-              <ul className="space-y-3 text-[12px]">
-                {profile.experiences.map((exp, idx) => (
-                  <li
-                    key={idx}
-                    className="rounded-lg bg-[var(--bg-soft)] border border-[var(--border)]/70 px-3 py-3"
-                  >
-                    <p className="font-medium">
-                      {exp.role || "Poste"} · {exp.company || "Entreprise"}
-                    </p>
-                    <p className="text-[11px] text-[var(--muted)]">
-                      {exp.dates || ""}
-                    </p>
-                    {exp.bullets?.length > 0 && (
-                      <ul className="mt-1 list-disc list-inside space-y-0.5">
-                        {exp.bullets.map((b, i) => (
-                          <li key={i}>{b}</li>
-                        ))}
-                      </ul>
-                    )}
-                  </li>
+          {/* HOBBIES */}
+          <SectionWrapper id="hobbies" title="Loisirs & Centres d'intérêt" icon={Sparkles} onEdit={openHobbiesModal}>
+            {profile?.hobbies?.length ? (
+              <div className="flex flex-wrap gap-2">
+                {profile.hobbies.map((h) => (
+                  <span key={h} className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/5 border border-white/10 text-xs text-slate-200">
+                    <span>{getHobbyEmoji(h)}</span>
+                    <span>{h}</span>
+                  </span>
                 ))}
-              </ul>
-            </section>
-          ) : null}
-
-          {/* Formation & certifs */}
-          {profile && (profile.educationShort?.length || profile.certs) && (
-            <section
-              id="formation"
-              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4"
-            >
-              <div className="flex items-center justify-between gap-2 mb-2">
-                <h2 className="text-sm sm:text-base font-semibold">
-                  Formation &amp; Certifications
-                </h2>
-                <button
-                  type="button"
-                  onClick={openEducationModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
               </div>
-
-              {profile?.educationShort?.length ? (
-                <div>
-                  <ul className="space-y-1.5 text-[12px]">
-                    {profile.educationShort.map((line, idx) => (
-                      <li key={idx}>{line}</li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
-
-              {profile?.certs && (
-                <div>
-                  <p className="text-[11px] text-[var(--muted)] mb-1">
-                    Certifications
-                  </p>
-                  <p className="text-[12px]">{profile.certs}</p>
-                </div>
-              )}
-            </section>
-          )}
-
-          {/* Langues */}
-          {profile && (
-            <section
-              id="langues"
-              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3"
-            >
-              <div className="flex items-center justify-between gap-2 mb-1">
-                <h2 className="text-sm sm:text-base font-semibold">Langues</h2>
-                <button
-                  type="button"
-                  onClick={openLanguagesModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
-              </div>
-              {langDisplay.length > 0 ? (
-                <div className="flex flex-wrap gap-x-6 gap-y-3 text-[13px]">
-                  {langDisplay.map((lang, idx) => (
-                    <div key={idx} className="flex items-center gap-2">
-                      <span className="text-2xl">{lang.flag}</span>
-                      <span className="font-medium text-[var(--text)]">
-                        {lang.text}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-[12px] text-[var(--muted)]">
-                  Aucune langue renseignée pour le moment.
-                </p>
-              )}
-            </section>
-          )}
-
-          {/* Hobbies */}
-          {profile && (
-            <section
-              id="hobbies"
-              className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5"
-            >
-              <div className="flex items-center justify-between gap-2 mb-2">
-                <h2 className="text-sm sm:text-base font-semibold">
-                  Centres d&apos;intérêt
-                </h2>
-                <button
-                  type="button"
-                  onClick={openHobbiesModal}
-                  className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2.5 py-1 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                >
-                  <span className="text-[13px]">✏️</span>
-                  <span>Modifier / ajouter</span>
-                </button>
-              </div>
-              {profile.hobbies?.length ? (
-                <div className="flex flex-wrap gap-2 text-[12px]">
-                  {profile.hobbies.map((hobby) => (
-                    <span
-                      key={hobby}
-                      className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-[3px]"
-                    >
-                      <span>{getHobbyEmoji(hobby)}</span>
-                      <span>{hobby}</span>
-                    </span>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-[12px] text-[var(--muted)]">
-                  Aucun centre d&apos;intérêt renseigné pour le moment.
-                </p>
-              )}
-            </section>
-          )}
+            ) : (
+              <EmptyState text="Aucun loisir renseigné." />
+            )}
+          </SectionWrapper>
         </main>
       </div>
 
-      {/* Message si aucun profil */}
-      {!profile && !loadingProfileFromDb && (
-        <div className="text-center p-10 glass border border-[var(--border)]/80 rounded-2xl">
-          <h3 className="text-lg font-semibold mb-2">
-            Aucun profil enregistré ou analysé
-          </h3>
-          <p className="text-[13px] text-[var(--muted)]">
-            Veuille uploader un CV PDF dans le header ci-dessus pour initialiser
-            ton profil candidat IA.
-          </p>
-        </div>
-      )}
-
-      {/* --- MODALE GÉNÉRIQUE D'ÉDITION --- */}
-      {activeModal && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 px-3">
-          <motion.form
-            onSubmit={handleModalSave}
-            initial={{ opacity: 0, y: 16, scale: 0.97 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 16, scale: 0.97 }}
-            className="w-full max-w-lg rounded-2xl bg-[var(--bg)] border border-[var(--border)] shadow-xl p-4 sm:p-5 space-y-4"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <h3 className="text-sm sm:text-base font-semibold">
-                {activeModal === "infos" && "Modifier tes informations clés"}
-                {activeModal === "skills" && "Modifier tes compétences & outils"}
-                {activeModal === "experience" &&
-                  "Modifier tes expériences principales"}
-                {activeModal === "education" &&
-                  "Modifier ta formation & tes certifications"}
-                {activeModal === "languages" && "Modifier tes langues"}
-                {activeModal === "hobbies" && "Modifier tes centres d’intérêt"}
-              </h3>
-              <button
-                type="button"
-                onClick={handleModalCancel}
-                className="rounded-full px-2 py-1 text-[11px] text-[var(--muted)] hover:bg-[var(--bg-soft)]"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="space-y-3 max-h-[60vh] overflow-auto pr-1">
-              {/* INFOS */}
-              {activeModal === "infos" && (
-                <>
-                  <div className="grid sm:grid-cols-2 gap-3 text-[12px]">
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Nom complet
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.fullName}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            fullName: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Email
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.email}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            email: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Téléphone
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.phone}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            phone: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        LinkedIn
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.linkedin}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            linkedin: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Permis (ex : Permis B)
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.drivingLicense}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            drivingLicense: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Véhicule (ex : Véhiculé)
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        value={infosDraft.vehicle}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            vehicle: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div className="sm:col-span-2">
-                      <label className="text-[11px] text-[var(--muted)]">
-                        Adresse (ville, code postal, etc.)
-                      </label>
-                      <input
-                        className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        placeholder="Ex : 12 rue Exemple, 75000 Paris"
-                        value={infosDraft.address}
-                        onChange={(e) =>
-                          setInfosDraft((p) => ({
-                            ...p,
-                            address: e.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                  </div>
-                  <div className="text-[12px]">
-                    <label className="text-[11px] text-[var(--muted)]">
-                      Contrat recherché
-                    </label>
-                    <input
-                      list="contract-type-options"
-                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                      placeholder="Ex : CDI, Alternance, Stage, Freelance..."
-                      value={infosDraft.contractType}
-                      onChange={(e) =>
-                        setInfosDraft((p) => ({
-                          ...p,
-                          contractType: e.target.value,
-                        }))
-                      }
-                    />
-                    <datalist id="contract-type-options">
-                      {CONTRACT_TYPE_OPTIONS.map((c) => (
-                        <option key={c} value={c} />
-                      ))}
-                    </datalist>
-                  </div>
-                  <div className="text-[12px]">
-                    <label className="text-[11px] text-[var(--muted)]">
-                      Résumé de profil / Pitch
-                    </label>
-                    <textarea
-                      rows={4}
-                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
-                      value={infosDraft.profileSummary}
-                      onChange={(e) =>
-                        setInfosDraft((p) => ({
-                          ...p,
-                          profileSummary: e.target.value,
-                        }))
-                      }
-                    />
-                  </div>
-                </>
-              )}
-
-              {/* COMPÉTENCES */}
-              {activeModal === "skills" && (
-                <>
-                  <div className="text-[12px] space-y-1">
-                    <label className="text-[11px] text-[var(--muted)]">
-                      Sections de compétences
-                    </label>
-                    <p className="text-[11px] text-[var(--muted)]">
-                      Format conseillé : une ligne par section. Exemple :
-                      <br />
-                      <span className="italic">
-                        &quot;Compétences analytiques : Analyse financière,
-                        Reporting, Budget&quot;
-                      </span>
-                    </p>
-                    <textarea
-                      rows={5}
-                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
-                      value={skillsSectionsText}
-                      onChange={(e) => setSkillsSectionsText(e.target.value)}
-                    />
-                  </div>
-                  <div className="text-[12px] space-y-1">
-                    <label className="text-[11px] text-[var(--muted)]">
-                      Outils / logiciels (séparés par des virgules)
-                    </label>
-                    <textarea
-                      rows={2}
-                      className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
-                      value={skillsToolsText}
-                      onChange={(e) => setSkillsToolsText(e.target.value)}
-                    />
-                  </div>
-                </>
-              )}
-
-              {/* EXPÉRIENCE */}
-              {activeModal === "experience" && (
-                <div className="space-y-3 text-[12px]">
-                  {experiencesDraft.map((exp, idx) => (
-                    <div
-                      key={idx}
-                      className="rounded-lg border border-[var(--border)]/70 bg-[var(--bg-soft)] p-3 space-y-2"
-                    >
-                      <div className="grid sm:grid-cols-2 gap-2">
-                        <div>
-                          <label className="text-[11px] text-[var(--muted)]">
-                            Poste
-                          </label>
-                          <input
-                            className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                            value={exp.role}
-                            onChange={(e) =>
-                              updateExperienceDraft(idx, "role", e.target.value)
-                            }
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-[var(--muted)]">
-                            Entreprise
-                          </label>
-                          <input
-                            className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                            value={exp.company}
-                            onChange={(e) =>
-                              updateExperienceDraft(
-                                idx,
-                                "company",
-                                e.target.value
-                              )
-                            }
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] text-[var(--muted)]">
-                            Dates
-                          </label>
-                          <input
-                            className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                            value={exp.dates}
-                            onChange={(e) =>
-                              updateExperienceDraft(
-                                idx,
-                                "dates",
-                                e.target.value
-                              )
-                            }
-                          />
-                        </div>
-                      </div>
-                      <div>
-                        <label className="text-[11px] text-[var(--muted)]">
-                          Missions / Réalisations (une par ligne)
-                        </label>
-                        <textarea
-                          rows={3}
-                          className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)] resize-vertical"
-                          value={exp.bulletsText}
-                          onChange={(e) =>
-                            updateExperienceDraft(
-                              idx,
-                              "bulletsText",
-                              e.target.value
-                            )
-                          }
-                        />
-                      </div>
-                    </div>
-                  ))}
-
-                  <button
-                    type="button"
-                    onClick={addExperienceDraft}
-                    className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                  >
-                    <span className="text-[14px]">＋</span>
-                    <span>Ajouter une expérience</span>
-                  </button>
+      {/* MODAL ENGINE */}
+      <AnimatePresence>
+        {activeModal && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-slate-950/80 backdrop-blur-xl"
+              onClick={() => setActiveModal(null)}
+            />
+            <motion.form
+              onSubmit={handleModalSave}
+              initial={{ scale: 0.95, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.95, opacity: 0, y: 20 }}
+              className="relative w-full max-w-2xl bg-slate-900 border border-white/10 rounded-[2.5rem] shadow-3xl overflow-hidden flex flex-col max-h-[90vh]"
+            >
+              <div className="p-8 border-b border-white/5 flex justify-between items-center bg-slate-900">
+                <div>
+                  <h3 className="text-2xl font-bold text-white tracking-tighter capitalize flex items-center gap-3">
+                    <PencilLine className="h-6 w-6 text-blue-500" />
+                    {activeModal === "infos" && "Modifier informations"}
+                    {activeModal === "skills" && "Modifier compétences"}
+                    {activeModal === "experience" && "Modifier expériences"}
+                    {activeModal === "education" && "Modifier formation"}
+                    {activeModal === "languages" && "Modifier langues"}
+                    {activeModal === "hobbies" && "Modifier loisirs"}
+                  </h3>
+                  <p className="text-xs text-slate-500 uppercase font-mono mt-1">Section_Update // {activeModal}</p>
                 </div>
-              )}
+                <button type="button" onClick={() => setActiveModal(null)} className="p-2 hover:bg-white/5 rounded-full">
+                  <X />
+                </button>
+              </div>
 
-              {/* FORMATION & CERTIFS */}
-              {activeModal === "education" && (
-                <>
-                  <div className="space-y-3 text-[12px]">
-                    {educationDrafts.map((edu, idx) => (
-                      <div
-                        key={idx}
-                        className="rounded-lg border border-[var(--border)]/70 bg-[var(--bg-soft)] p-3 space-y-2"
-                      >
-                        <div className="grid sm:grid-cols-2 gap-2">
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              Diplôme
-                            </label>
-                            <input
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              value={edu.degree}
-                              onChange={(e) =>
-                                updateEducationDraft(
-                                  idx,
-                                  "degree",
-                                  e.target.value
-                                )
-                              }
-                            />
-                          </div>
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              École / Université
-                            </label>
-                            <input
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              value={edu.school}
-                              onChange={(e) =>
-                                updateEducationDraft(
-                                  idx,
-                                  "school",
-                                  e.target.value
-                                )
-                              }
-                            />
-                          </div>
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              Lieu (optionnel)
-                            </label>
-                            <input
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              value={edu.location}
-                              onChange={(e) =>
-                                updateEducationDraft(
-                                  idx,
-                                  "location",
-                                  e.target.value
-                                )
-                              }
-                            />
-                          </div>
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              Dates
-                            </label>
-                            <input
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              placeholder="Ex : 2022–2024"
-                              value={edu.dates}
-                              onChange={(e) =>
-                                updateEducationDraft(
-                                  idx,
-                                  "dates",
-                                  e.target.value
-                                )
-                              }
-                            />
-                          </div>
+              <div className="p-8 overflow-y-auto custom-scrollbar space-y-6">
+                {/* INFOS */}
+                {activeModal === "infos" && (
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <Field label="Nom complet">
+                        <input className={inputCls} value={infosDraft.fullName} onChange={(e) => setInfosDraft((p) => ({ ...p, fullName: e.target.value }))} />
+                      </Field>
+                      <Field label="Email">
+                        <input className={inputCls} value={infosDraft.email} onChange={(e) => setInfosDraft((p) => ({ ...p, email: e.target.value }))} />
+                      </Field>
+                      <Field label="Téléphone">
+                        <input className={inputCls} value={infosDraft.phone} onChange={(e) => setInfosDraft((p) => ({ ...p, phone: e.target.value }))} />
+                      </Field>
+                      <Field label="LinkedIn">
+                        <input className={inputCls} value={infosDraft.linkedin} onChange={(e) => setInfosDraft((p) => ({ ...p, linkedin: e.target.value }))} />
+                      </Field>
+                      <Field label="Contrat recherché">
+                        <input list="contract-type-options" className={inputCls} value={infosDraft.contractType} onChange={(e) => setInfosDraft((p) => ({ ...p, contractType: e.target.value }))} />
+                        <datalist id="contract-type-options">
+                          {CONTRACT_TYPE_OPTIONS.map((c) => (
+                            <option key={c} value={c} />
+                          ))}
+                        </datalist>
+                      </Field>
+                      <Field label="Adresse">
+                        <input className={inputCls} placeholder="Ex : 12 rue Exemple, 75000 Paris" value={infosDraft.address} onChange={(e) => setInfosDraft((p) => ({ ...p, address: e.target.value }))} />
+                      </Field>
+                      <Field label="Permis">
+                        <input className={inputCls} placeholder="Ex : Permis B" value={infosDraft.drivingLicense} onChange={(e) => setInfosDraft((p) => ({ ...p, drivingLicense: e.target.value }))} />
+                      </Field>
+                      <Field label="Véhicule">
+                        <input className={inputCls} placeholder="Ex : Véhiculé" value={infosDraft.vehicle} onChange={(e) => setInfosDraft((p) => ({ ...p, vehicle: e.target.value }))} />
+                      </Field>
+                    </div>
+
+                    <Field label="Résumé de profil">
+                      <textarea rows={5} className={textareaCls} value={infosDraft.profileSummary} onChange={(e) => setInfosDraft((p) => ({ ...p, profileSummary: e.target.value }))} />
+                    </Field>
+                  </div>
+                )}
+
+                {/* SKILLS */}
+                {activeModal === "skills" && (
+                  <div className="space-y-6">
+                    <Field label="Sections (1 ligne = 1 section) · Format : Titre: item1, item2">
+                      <textarea rows={6} className={textareaCls} value={skillsSectionsText} onChange={(e) => setSkillsSectionsText(e.target.value)} placeholder={"Ex:\nIT: React, Next.js, TypeScript\nCloud: AWS, Azure"} />
+                    </Field>
+                    <Field label="Outils / logiciels (virgules)">
+                      <textarea rows={3} className={textareaCls} value={skillsToolsText} onChange={(e) => setSkillsToolsText(e.target.value)} placeholder="VS Code, Docker, Jira..." />
+                    </Field>
+                  </div>
+                )}
+
+                {/* EXPERIENCE (NEW: reorder) */}
+                {activeModal === "experience" && (
+                  <div className="space-y-4">
+                    {experiencesDraft.map((exp, idx) => (
+                      <div key={idx} className="p-5 rounded-[2rem] bg-white/5 border border-white/10 relative space-y-4">
+                        <div className="absolute top-4 right-4 flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() => idx > 0 && setExperiencesDraft((p) => moveItem(p, idx, idx - 1))}
+                            className="p-2 rounded-full hover:bg-white/5 text-slate-300"
+                            title="Monter"
+                          >
+                            <ArrowUp className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => idx < experiencesDraft.length - 1 && setExperiencesDraft((p) => moveItem(p, idx, idx + 1))}
+                            className="p-2 rounded-full hover:bg-white/5 text-slate-300"
+                            title="Descendre"
+                          >
+                            <ArrowDown className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setExperiencesDraft((p) => p.filter((_, i) => i !== idx))}
+                            className="p-2 rounded-full hover:bg-red-500/10 text-red-300"
+                            title="Supprimer"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
                         </div>
-                        {educationDrafts.length > 1 && (
-                          <div className="flex justify-end">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setEducationDrafts((prev) =>
-                                  prev.filter((_, i) => i !== idx)
-                                )
-                              }
-                              className="text-[11px] text-[var(--muted)] hover:text-red-400"
-                            >
-                              Supprimer cette formation
-                            </button>
-                          </div>
-                        )}
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <Field label="Entreprise">
+                            <input className={inputCls} value={exp.company} onChange={(e) => setExperiencesDraft((p) => p.map((x, i) => (i === idx ? { ...x, company: e.target.value } : x)))} />
+                          </Field>
+                          <Field label="Poste">
+                            <input className={inputCls} value={exp.role} onChange={(e) => setExperiencesDraft((p) => p.map((x, i) => (i === idx ? { ...x, role: e.target.value } : x)))} />
+                          </Field>
+                          <Field label="Dates">
+                            <input className={inputCls} placeholder="Ex : 2022 - Présent" value={exp.dates} onChange={(e) => setExperiencesDraft((p) => p.map((x, i) => (i === idx ? { ...x, dates: e.target.value } : x)))} />
+                          </Field>
+                          <Field label="Lieu (optionnel)">
+                            <input className={inputCls} placeholder="Paris, FR" value={exp.location || ""} onChange={(e) => setExperiencesDraft((p) => p.map((x, i) => (i === idx ? { ...x, location: e.target.value } : x)))} />
+                          </Field>
+                        </div>
+
+                        <Field label="Missions (1 par ligne)">
+                          <textarea rows={4} className={textareaCls} value={exp.bulletsText} onChange={(e) => setExperiencesDraft((p) => p.map((x, i) => (i === idx ? { ...x, bulletsText: e.target.value } : x)))} />
+                        </Field>
                       </div>
                     ))}
 
                     <button
                       type="button"
-                      onClick={addEducationDraft}
-                      className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
+                      onClick={() => setExperiencesDraft((p) => [...p, { company: "", role: "", dates: "", bulletsText: "" }])}
+                      className="w-full py-4 border-2 border-dashed border-white/10 rounded-2xl text-slate-300 hover:border-blue-500 hover:text-blue-300 font-bold flex items-center justify-center gap-2"
                     >
-                      <span className="text-[14px]">＋</span>
-                      <span>Ajouter une formation</span>
+                      <Plus className="h-5 w-5" /> Ajouter une expérience
                     </button>
                   </div>
+                )}
 
-                  {/* Certifications */}
-                  <div className="text-[12px] space-y-2 pt-3">
-                    <label className="text-[11px] text-[var(--muted)]">
-                      Certifications (avec auto-complétion)
-                    </label>
-                    <div className="flex gap-2">
-                      <input
-                        list="certification-options"
-                        className="flex-1 rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                        placeholder="Ex : Tosa Excel, Azure AZ-900..."
-                        value={certInput}
-                        onChange={(e) => setCertInput(e.target.value)}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const val = certInput.trim();
-                          if (!val) return;
-                          if (!certsList.includes(val)) {
-                            setCertsList((prev) => [...prev, val]);
-                          }
-                          setCertInput("");
-                        }}
-                        className="rounded-md bg-[var(--brand)] hover:bg-[var(--brandDark)] px-3 py-1.5 text-[12px] text-white"
-                      >
-                        Ajouter
-                      </button>
-                      <datalist id="certification-options">
-                        {CERTIFICATION_OPTIONS.map((c) => (
-                          <option key={c} value={c} />
-                        ))}
-                      </datalist>
-                    </div>
-
-                    {certsList.length > 0 && (
-                      <div className="flex flex-wrap gap-2 mt-1">
-                        {certsList.map((cert) => (
-                          <span
-                            key={cert}
-                            className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-[2px] text-[11px]"
-                          >
-                            {cert}
+                {/* EDUCATION (NEW: reorder) */}
+                {activeModal === "education" && (
+                  <div className="space-y-6">
+                    <div className="space-y-4">
+                      {educationDrafts.map((edu, idx) => (
+                        <div key={idx} className="p-5 rounded-[2rem] bg-white/5 border border-white/10 relative space-y-4">
+                          <div className="absolute top-4 right-4 flex gap-2">
                             <button
                               type="button"
-                              onClick={() =>
-                                setCertsList((prev) =>
-                                  prev.filter((c) => c !== cert)
-                                )
-                              }
-                              className="text-[10px] text-[var(--muted)] hover:text-red-400"
+                              onClick={() => idx > 0 && setEducationDrafts((p) => moveItem(p, idx, idx - 1))}
+                              className="p-2 rounded-full hover:bg-white/5 text-slate-300"
+                              title="Monter"
                             >
+                              <ArrowUp className="h-4 w-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => idx < educationDrafts.length - 1 && setEducationDrafts((p) => moveItem(p, idx, idx + 1))}
+                              className="p-2 rounded-full hover:bg-white/5 text-slate-300"
+                              title="Descendre"
+                            >
+                              <ArrowDown className="h-4 w-4" />
+                            </button>
+                            {educationDrafts.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => setEducationDrafts((p) => p.filter((_, i) => i !== idx))}
+                                className="p-2 rounded-full hover:bg-red-500/10 text-red-300"
+                                title="Supprimer"
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </button>
+                            )}
+                          </div>
+
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <Field label="Diplôme">
+                              <input className={inputCls} value={edu.degree} onChange={(e) => setEducationDrafts((p) => p.map((x, i) => (i === idx ? { ...x, degree: e.target.value } : x)))} />
+                            </Field>
+                            <Field label="École">
+                              <input className={inputCls} value={edu.school} onChange={(e) => setEducationDrafts((p) => p.map((x, i) => (i === idx ? { ...x, school: e.target.value } : x)))} />
+                            </Field>
+                            <Field label="Lieu">
+                              <input className={inputCls} value={edu.location} onChange={(e) => setEducationDrafts((p) => p.map((x, i) => (i === idx ? { ...x, location: e.target.value } : x)))} />
+                            </Field>
+                            <Field label="Dates">
+                              <input className={inputCls} placeholder="Ex : 2022–2024" value={edu.dates} onChange={(e) => setEducationDrafts((p) => p.map((x, i) => (i === idx ? { ...x, dates: e.target.value } : x)))} />
+                            </Field>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setEducationDrafts((p) => [...p, { school: "", degree: "", dates: "", location: "" }])}
+                      className="w-full py-4 border-2 border-dashed border-white/10 rounded-2xl text-slate-300 hover:border-blue-500 hover:text-blue-300 font-bold flex items-center justify-center gap-2"
+                    >
+                      <Plus className="h-5 w-5" /> Ajouter une formation
+                    </button>
+
+                    {/* Certifications */}
+                    <div className="space-y-2">
+                      <p className="text-[10px] font-bold text-slate-500 uppercase ml-2">Certifications (auto-complétion)</p>
+                      <div className="flex gap-2">
+                        <input
+                          list="certification-options"
+                          className={inputCls}
+                          placeholder="Ex : Azure AZ-900..."
+                          value={certInput}
+                          onChange={(e) => setCertInput(e.target.value)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const val = certInput.trim();
+                            if (!val) return;
+                            if (!certsList.includes(val)) setCertsList((p) => [...p, val]);
+                            setCertInput("");
+                          }}
+                          className="px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold"
+                        >
+                          Ajouter
+                        </button>
+                        <datalist id="certification-options">
+                          {CERTIFICATION_OPTIONS.map((c) => (
+                            <option key={c} value={c} />
+                          ))}
+                        </datalist>
+                      </div>
+
+                      {!!certsList.length && (
+                        <div className="flex flex-wrap gap-2 pt-2">
+                          {certsList.map((cert) => (
+                            <span key={cert} className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/5 border border-white/10 text-xs">
+                              {cert}
+                              <button type="button" onClick={() => setCertsList((p) => p.filter((x) => x !== cert))} className="text-slate-400 hover:text-red-300">
+                                ✕
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* LANGUAGES */}
+                {activeModal === "languages" && (
+                  <div className="space-y-4">
+                    {languagesDraft.map((lang, idx) => {
+                      const flag = lang.language.trim() ? getFlagEmoji(lang.language) : "🌐";
+                      return (
+                        <div key={idx} className="p-4 rounded-2xl bg-white/5 border border-white/10 flex items-start gap-3">
+                          <div className="text-2xl w-10 text-center pt-2">{flag}</div>
+                          <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <Field label="Langue">
+                              <input
+                                list="language-options"
+                                className={inputCls}
+                                value={lang.language}
+                                onChange={(e) => setLanguagesDraft((p) => p.map((x, i) => (i === idx ? { ...x, language: e.target.value } : x)))}
+                              />
+                            </Field>
+                            <Field label="Niveau">
+                              <select
+                                className={selectCls}
+                                value={lang.level}
+                                onChange={(e) => setLanguagesDraft((p) => p.map((x, i) => (i === idx ? { ...x, level: e.target.value } : x)))}
+                              >
+                                <option value="">Sélectionner</option>
+                                {LANGUAGE_LEVEL_OPTIONS.map((lvl) => (
+                                  <option key={lvl} value={lvl} className="bg-slate-900">
+                                    {lvl}
+                                  </option>
+                                ))}
+                              </select>
+                            </Field>
+                          </div>
+
+                          {languagesDraft.length > 1 && (
+                            <button type="button" onClick={() => setLanguagesDraft((p) => p.filter((_, i) => i !== idx))} className="p-2 rounded-full hover:bg-red-500/10 text-red-300">
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+
+                    <datalist id="language-options">
+                      {LANGUAGE_OPTIONS.map((l) => (
+                        <option key={l} value={l} />
+                      ))}
+                    </datalist>
+
+                    <button
+                      type="button"
+                      onClick={() => setLanguagesDraft((p) => [...p, { language: "", level: "" }])}
+                      className="w-full py-4 border-2 border-dashed border-white/10 rounded-2xl text-slate-300 hover:border-blue-500 hover:text-blue-300 font-bold flex items-center justify-center gap-2"
+                    >
+                      <Plus className="h-5 w-5" /> Ajouter une langue
+                    </button>
+                  </div>
+                )}
+
+                {/* HOBBIES */}
+                {activeModal === "hobbies" && (
+                  <div className="space-y-3">
+                    <Field label="Ajouter un loisir (auto-complétion)">
+                      <div className="flex gap-2">
+                        <input list="hobby-options" className={inputCls} value={hobbyInput} onChange={(e) => setHobbyInput(e.target.value)} placeholder="Voyage, Lecture..." />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const val = hobbyInput.trim();
+                            if (!val) return;
+                            if (!hobbiesList.includes(val)) setHobbiesList((p) => [...p, val]);
+                            setHobbyInput("");
+                          }}
+                          className="px-4 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold"
+                        >
+                          Ajouter
+                        </button>
+                        <datalist id="hobby-options">
+                          {HOBBY_OPTIONS.map((h) => (
+                            <option key={h} value={h} />
+                          ))}
+                        </datalist>
+                      </div>
+                    </Field>
+
+                    {!!hobbiesList.length ? (
+                      <div className="flex flex-wrap gap-2">
+                        {hobbiesList.map((h) => (
+                          <span key={h} className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/5 border border-white/10 text-xs">
+                            <span>{getHobbyEmoji(h)}</span>
+                            <span>{h}</span>
+                            <button type="button" onClick={() => setHobbiesList((p) => p.filter((x) => x !== h))} className="text-slate-400 hover:text-red-300">
                               ✕
                             </button>
                           </span>
                         ))}
                       </div>
+                    ) : (
+                      <EmptyState text="Aucun loisir ajouté pour le moment." />
                     )}
                   </div>
-                </>
-              )}
+                )}
+              </div>
 
-              {/* LANGUES */}
-              {activeModal === "languages" && (
-                <div className="text-[12px] space-y-3">
-                  <p className="text-[11px] text-[var(--muted)]">
-                    Ajoute tes langues avec leur niveau. Tu peux choisir dans la
-                    liste ou taper manuellement.
-                  </p>
-                  {languagesDraft.map((lang, idx) => {
-                    const flag =
-                      lang.language.trim() !== ""
-                        ? getFlagEmoji(lang.language)
-                        : "🌐";
-                    return (
-                      <div
-                        key={idx}
-                        className="flex items-center gap-2 rounded-lg border border-[var(--border)]/70 bg-[var(--bg-soft)] px-2.5 py-2"
-                      >
-                        <span className="text-xl w-7 text-center">{flag}</span>
-                        <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              Langue
-                            </label>
-                            <input
-                              list="language-options"
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              value={lang.language}
-                              onChange={(e) =>
-                                setLanguagesDraft((prev) =>
-                                  prev.map((l, i) =>
-                                    i === idx
-                                      ? { ...l, language: e.target.value }
-                                      : l
-                                  )
-                                )
-                              }
-                            />
-                          </div>
-                          <div>
-                            <label className="text-[11px] text-[var(--muted)]">
-                              Niveau
-                            </label>
-                            <select
-                              className="mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                              value={lang.level}
-                              onChange={(e) =>
-                                setLanguagesDraft((prev) =>
-                                  prev.map((l, i) =>
-                                    i === idx
-                                      ? { ...l, level: e.target.value }
-                                      : l
-                                  )
-                                )
-                              }
-                            >
-                              <option value="">Sélectionner un niveau</option>
-                              {LANGUAGE_LEVEL_OPTIONS.map((lvl) => (
-                                <option key={lvl} value={lvl}>
-                                  {lvl}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        </div>
-                        {languagesDraft.length > 1 && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setLanguagesDraft((prev) =>
-                                prev.filter((_, i) => i !== idx)
-                              )
-                            }
-                            className="ml-1 text-[11px] text-[var(--muted)] hover:text-red-400"
-                          >
-                            ✕
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
+              <div className="p-6 border-t border-white/5 flex justify-end gap-3 bg-slate-900">
+                <button
+                  type="button"
+                  onClick={() => setActiveModal(null)}
+                  className="px-5 py-3 rounded-2xl bg-white/5 border border-white/10 text-slate-200 font-bold hover:bg-white/10"
+                >
+                  Annuler
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-3 rounded-2xl bg-blue-600 border border-blue-500/30 text-white font-bold hover:bg-blue-500 flex items-center gap-2"
+                >
+                  <Save className="h-5 w-5" /> Enregistrer
+                </button>
+              </div>
+            </motion.form>
+          </div>
+        )}
+      </AnimatePresence>
 
-                  <datalist id="language-options">
-                    {LANGUAGE_OPTIONS.map((l) => (
-                      <option key={l} value={l} />
-                    ))}
-                  </datalist>
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setLanguagesDraft((prev) => [
-                        ...prev,
-                        { language: "", level: "" },
-                      ])
-                    }
-                    className="inline-flex items-center gap-1 rounded-full border border-dashed border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[11px] text-[var(--muted)] hover:border-[var(--brand)] hover:text-[var(--brand)] transition-colors"
-                  >
-                    <span className="text-[14px]">＋</span>
-                    <span>Ajouter une langue</span>
-                  </button>
-                </div>
-              )}
-
-              {/* HOBBIES */}
-              {activeModal === "hobbies" && (
-                <div className="text-[12px] space-y-2">
-                  <label className="text-[11px] text-[var(--muted)]">
-                    Centres d&apos;intérêt (avec auto-complétion)
-                  </label>
-                  <div className="flex gap-2">
-                    <input
-                      list="hobby-options"
-                      className="flex-1 rounded-md border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1.5 text-[12px] outline-none focus:ring-1 focus:ring-[var(--brand)]"
-                      placeholder="Ex : Voyage, Football, Lecture..."
-                      value={hobbyInput}
-                      onChange={(e) => setHobbyInput(e.target.value)}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const val = hobbyInput.trim();
-                        if (!val) return;
-                        if (!hobbiesList.includes(val)) {
-                          setHobbiesList((prev) => [...prev, val]);
-                        }
-                        setHobbyInput("");
-                      }}
-                      className="rounded-md bg-[var(--brand)] hover:bg-[var(--brandDark)] px-3 py-1.5 text-[12px] text-white"
-                    >
-                      Ajouter
-                    </button>
-                    <datalist id="hobby-options">
-                      {HOBBY_OPTIONS.map((h) => (
-                        <option key={h} value={h} />
-                      ))}
-                    </datalist>
-                  </div>
-
-                  {hobbiesList.length > 0 ? (
-                    <div className="flex flex-wrap gap-2 mt-2">
-                      {hobbiesList.map((hobby) => (
-                        <span
-                          key={hobby}
-                          className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-[2px] text-[11px]"
-                        >
-                          <span>{getHobbyEmoji(hobby)}</span>
-                          <span>{hobby}</span>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setHobbiesList((prev) =>
-                                prev.filter((h) => h !== hobby)
-                              )
-                            }
-                            className="text-[10px] text-[var(--muted)] hover:text-red-400"
-                          >
-                            ✕
-                          </button>
-                        </span>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-[11px] text-[var(--muted)] mt-1">
-                      Aucun centre d&apos;intérêt ajouté pour le moment.
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={handleModalCancel}
-                className="inline-flex items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--bg-soft)] px-3 py-1.5 text-[12px] text-[var(--muted)] hover:bg-[var(--bg)] transition-colors"
-              >
-                Annuler
-              </button>
-              <button
-                type="submit"
-                className="inline-flex items-center justify-center rounded-lg bg-[var(--brand)] hover:bg-[var(--brandDark)] px-3 py-1.5 text-[12px] font-medium text-white transition-colors"
-              >
-                Enregistrer
-              </button>
-            </div>
-          </motion.form>
-        </div>
-      )}
-    </motion.div>
+      <AnimatePresence>{toast && <Toast text={toast.text} tone={toast.tone} />}</AnimatePresence>
+    </div>
   );
 }
+
+/* =========================
+   SMALL COMPONENTS
+========================= */
+function InfoRow({ icon: Icon, label, value }: any) {
+  return (
+    <div className="p-4 rounded-2xl bg-white/5 border border-white/5 flex items-center gap-3">
+      <div className="p-2 rounded-xl bg-white/5 border border-white/10">
+        <Icon className="h-4 w-4 text-slate-300" />
+      </div>
+      <div className="flex-1">
+        <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">{label}</p>
+        <p className="text-sm text-white break-all">{value}</p>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="space-y-2">
+      <label className="text-[10px] font-bold text-slate-500 uppercase ml-2">{label}</label>
+      {children}
+    </div>
+  );
+}
+
+const inputCls =
+  "w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:border-blue-500 outline-none placeholder:text-slate-500";
+const textareaCls =
+  "w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:border-blue-500 outline-none resize-none placeholder:text-slate-500";
+const selectCls =
+  "w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:border-blue-500 outline-none";

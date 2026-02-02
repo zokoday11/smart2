@@ -1,6 +1,8 @@
 // /lib/gemini.ts
 // Client-side helpers to call Firebase Cloud Functions (Gemini / PDF / Interview / reCAPTCHA / Jobs / Polar).
-// ✅ Fix: exports GenerateInterviewQAResult (required by /app/app/interview/page.tsx)
+// ✅ Single source of truth: NEXT_PUBLIC_API_BASE_URL
+// ✅ Optional emulator: NEXT_PUBLIC_USE_FUNCTIONS_EMULATOR + NEXT_PUBLIC_FUNCTIONS_EMULATOR_URL
+// ✅ No runtime "process" usage beyond build-time inlined NEXT_PUBLIC_*.
 
 export type Lang = "fr" | "en";
 
@@ -70,7 +72,6 @@ export type GenerateLetterAndPitchResult = {
 
 export type InterviewQAItem = { question: string; answer: string };
 
-// ✅ THIS TYPE WAS MISSING → fixes your build error
 export type GenerateInterviewQAResult = {
   questions: InterviewQAItem[];
   lang: Lang;
@@ -89,32 +90,46 @@ export type InterviewStartResult = {
 export type InterviewAnswerResult = InterviewStartResult;
 
 export type RecaptchaVerifyResult =
-  | { ok: true; score?: number }
-  | { ok: false; reason: string; score?: number; invalidReason?: string };
+  | { ok: true; score?: number; threshold?: number }
+  | {
+      ok: false;
+      reason: string;
+      score?: number;
+      threshold?: number;
+      invalidReason?: string;
+    };
 
 type JsonValue = any;
 
-function getEnv(name: string): string | undefined {
-  // Next exposes only NEXT_PUBLIC_*
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const v = (process.env as any)?.[name];
-  return typeof v === "string" && v.trim() ? v.trim() : undefined;
+function stripTrailingSlash(u: string) {
+  return u.replace(/\/+$/, "");
 }
+
+// --- base url selection (prod by default) ---
+const BASE_URL = (() => {
+  const prod =
+    process.env.NEXT_PUBLIC_API_BASE_URL ||
+    process.env.NEXT_PUBLIC_FUNCTIONS_BASE_URL || // backward compat if still present
+    "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+
+  const useEmu =
+    (process.env.NEXT_PUBLIC_USE_FUNCTIONS_EMULATOR || "").trim() === "1";
+
+  const emu =
+    process.env.NEXT_PUBLIC_FUNCTIONS_EMULATOR_URL ||
+    "http://127.0.0.1:5001/assistant-ia-v4/europe-west1";
+
+  return stripTrailingSlash(useEmu ? emu : prod);
+})();
 
 function getFunctionsBaseUrl(): string {
-  // Allow overriding by env
-  const fromEnv =
-    getEnv("NEXT_PUBLIC_FUNCTIONS_BASE_URL") ||
-    getEnv("NEXT_PUBLIC_FUNCTIONS_URL") ||
-    getEnv("NEXT_PUBLIC_FIREBASE_FUNCTIONS_URL");
-
-  if (fromEnv) return fromEnv.replace(/\/+$/, "");
-
-  // Default to your deployed project (matches your logs)
-  return "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
+  return BASE_URL;
 }
 
-function buildHeaders(opts?: { idToken?: string; extra?: Record<string, string> }): HeadersInit {
+function buildHeaders(opts?: {
+  idToken?: string;
+  extra?: Record<string, string>;
+}): HeadersInit {
   const h: Record<string, string> = {
     "Content-Type": "application/json",
     ...(opts?.extra || {}),
@@ -209,7 +224,7 @@ export async function callRecaptchaVerify(args: {
 export async function callExtractProfile(args: {
   base64Pdf: string;
   recaptchaToken?: string;
-  idToken?: string; // optional (bypasses recaptcha server-side)
+  idToken?: string;
 }): Promise<ExtractProfileResult> {
   return await postJson<ExtractProfileResult>(
     "extractProfile",
@@ -224,7 +239,7 @@ export async function callExtractProfile(args: {
 }
 
 // -----------------------------
-// Gemini: generate letter + pitch (JSON strict)
+// Gemini: generate letter + pitch
 // -----------------------------
 export async function callGenerateLetterAndPitch(args: {
   profile: Profile;
@@ -233,7 +248,7 @@ export async function callGenerateLetterAndPitch(args: {
   companyName?: string;
   lang?: Lang;
   recaptchaToken?: string;
-  idToken?: string; // optional
+  idToken?: string;
 }): Promise<GenerateLetterAndPitchResult> {
   return await postJson<GenerateLetterAndPitchResult>(
     "generateLetterAndPitch",
@@ -252,14 +267,14 @@ export async function callGenerateLetterAndPitch(args: {
 }
 
 // -----------------------------
-// Gemini: generate interview Q&A (3 questions/answers for one experience)
+// Gemini: generate interview Q&A
 // -----------------------------
 export async function callGenerateInterviewQA(args: {
   profile: Profile;
   experienceIndex: number;
   lang?: Lang;
   recaptchaToken?: string;
-  idToken?: string; // optional
+  idToken?: string;
 }): Promise<GenerateInterviewQAResult> {
   return await postJson<GenerateInterviewQAResult>(
     "generateInterviewQA",
@@ -276,7 +291,7 @@ export async function callGenerateInterviewQA(args: {
 }
 
 // -----------------------------
-// Interview simulation (start / answer)
+// Interview simulation
 // -----------------------------
 export async function callInterviewStart(args: {
   userId: string;
@@ -285,7 +300,7 @@ export async function callInterviewStart(args: {
   interviewMode?: "complet" | "rapide" | "technique" | "comportemental";
   difficulty?: "standard" | "difficile";
   recaptchaToken?: string;
-  idToken?: string; // optional
+  idToken?: string;
 }): Promise<InterviewStartResult> {
   return await postJson<InterviewStartResult>(
     "interview",
@@ -308,7 +323,7 @@ export async function callInterviewAnswer(args: {
   sessionId: string;
   userMessage: string;
   recaptchaToken?: string;
-  idToken?: string; // optional
+  idToken?: string;
 }): Promise<InterviewAnswerResult> {
   return await postJson<InterviewAnswerResult>(
     "interview",
@@ -336,7 +351,7 @@ export async function callGenerateCvPdf(args: {
   jobDescription?: string;
   companyName?: string;
   recaptchaToken?: string;
-  idToken: string; // required (server debits credits)
+  idToken: string; // required
 }): Promise<Blob> {
   return await postBinary(
     "generateCvPdf",
@@ -370,7 +385,7 @@ export async function callGenerateCvLmZip(args: {
     lang?: Lang;
   };
   recaptchaToken?: string;
-  idToken: string; // required
+  idToken: string;
 }): Promise<Blob> {
   return await postBinary(
     "generateCvLmZip",
@@ -397,7 +412,7 @@ export async function callGenerateLetterPdf(args: {
   candidateName?: string;
   lang?: Lang;
   recaptchaToken?: string;
-  idToken?: string; // optional
+  idToken?: string;
 }): Promise<Blob> {
   return await postBinary(
     "generateLetterPdf",
@@ -436,7 +451,7 @@ export async function callJobsSearch(args: {
   location?: string;
   page?: number;
   recaptchaToken?: string;
-  idToken?: string; // optional
+  idToken?: string;
 }): Promise<JobsSearchResult> {
   return await postJson<JobsSearchResult>(
     "jobs",
@@ -464,7 +479,7 @@ export async function callPolarCheckout(args: {
   userId: string;
   email: string;
   recaptchaToken?: string;
-  idToken?: string; // optional
+  idToken?: string;
 }): Promise<PolarCheckoutResult> {
   return await postJson<PolarCheckoutResult>(
     "polarCheckout",

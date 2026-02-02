@@ -1,24 +1,56 @@
 // components/I18nClientProvider.tsx
 "use client";
 
-import "@/lib/i18n"; // initialise i18n une fois
-import { ReactNode, useEffect } from "react";
-import i18n from "@/lib/i18n";
+import { ReactNode, useEffect, useState } from "react";
+import i18n, { APP_LANG_KEY, SUPPORTED_LANGS, getInitialClientLang } from "@/lib/i18n";
+
+function applyHtmlLangDir(lng: string) {
+  const html = document.documentElement;
+
+  const base = (lng || "fr").toLowerCase().split("-")[0];
+  html.setAttribute("lang", base);
+
+  const isRTL = base.startsWith("ar");
+  html.setAttribute("dir", isRTL ? "rtl" : "ltr");
+}
 
 export default function I18nClientProvider({ children }: { children: ReactNode }) {
-  // Optionnel : mettre <html lang> et RTL
+  const [ready, setReady] = useState(false);
+
   useEffect(() => {
-    const apply = (lng: string) => {
-      document.documentElement.lang = lng;
-      document.documentElement.dir = lng === "ar" ? "rtl" : "ltr";
+    let mounted = true;
+
+    const run = async () => {
+      const target = getInitialClientLang();
+
+      // sécurité
+      const safe =
+        (SUPPORTED_LANGS as readonly string[]).includes(target) ? target : "fr";
+
+      // stocke si pas déjà (ça stabilise le refresh)
+      try {
+        localStorage.setItem(APP_LANG_KEY, safe);
+      } catch {}
+
+      // change language (attendre => pas de mismatch)
+      try {
+        await i18n.changeLanguage(safe);
+      } catch {}
+
+      applyHtmlLangDir(safe);
+
+      if (mounted) setReady(true);
     };
 
-    apply(i18n.language);
-    i18n.on("languageChanged", apply);
+    run();
+
     return () => {
-      i18n.off("languageChanged", apply);
+      mounted = false;
     };
   }, []);
+
+  // ✅ Gate : empêche tout SSR/hydration mismatch lié à la langue
+  if (!ready) return null;
 
   return <>{children}</>;
 }

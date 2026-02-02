@@ -1,425 +1,330 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { 
+  Zap, 
+  History, 
+  ShieldCheck, 
+  CreditCard, 
+  ArrowRight, 
+  CheckCircle2, 
+  Loader2, 
+  Sparkles,
+  Clock,
+  Info
+} from "lucide-react";
+
 import { useUserCredits } from "@/hooks/useUserCredits";
 import { useAuth } from "@/context/AuthContext";
 import { getRecaptchaToken } from "@/lib/recaptcha";
 import { useRechargeHistory } from "@/hooks/useRechargeHistory";
 
+// --- TYPES ---
 type PackKey = "20" | "50" | "100";
 
 const CREDIT_PACKS: {
   key: PackKey;
   label: string;
   credits: number;
+  price: string;
   desc: string;
+  color: string;
+  popular?: boolean;
 }[] = [
   {
     key: "20",
     credits: 20,
+    price: "4.99€",
     label: "Pack Découverte",
-    desc: "Idéal pour tester les fonctionnalités IA.",
+    desc: "Idéal pour tester les fonctionnalités IA ponctuellement.",
+    color: "from-blue-500 to-cyan-500",
   },
   {
     key: "50",
     credits: 50,
+    price: "9.99€",
     label: "Pack Boost",
-    desc: "Parfait pour une phase active de recherche.",
+    desc: "Parfait pour une phase active de recherche d'emploi.",
+    color: "from-indigo-600 to-blue-600",
+    popular: true,
   },
   {
     key: "100",
     credits: 100,
+    price: "17.99€",
     label: "Pack Intensif",
-    desc: "Pour candidatures + entretiens à fond.",
+    desc: "Pour une préparation complète : CV, lettres et entretiens.",
+    color: "from-purple-600 to-indigo-600",
   },
 ];
 
-// ⚙️ Base de l'API :
-// - en prod : Cloud Functions
-// - en dev : tu peux override avec NEXT_PUBLIC_API_BASE_URL dans .env.local
 const DEFAULT_API_BASE = "https://europe-west1-assistant-ia-v4.cloudfunctions.net";
-
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE).replace(/\/+$/, "");
 
 export default function CreditsPage() {
   const { user } = useAuth();
   const { credits, loading, error } = useUserCredits();
+  const { items: recharges, loading: rechargesLoading } = useRechargeHistory(30);
 
   const [buyLoading, setBuyLoading] = useState<PackKey | null>(null);
   const [buyError, setBuyError] = useState<string | null>(null);
-
-  // 👉 URL d’embed du checkout Polar (quand non null, on affiche la popup)
   const [embedUrl, setEmbedUrl] = useState<string | null>(null);
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
-
-  // 🎉 Animation / bandeau succès dans la page
   const [showSuccessAnimation, setShowSuccessAnimation] = useState(false);
-
-  // Pour info, si un jour tu veux savoir quel pack a été démarré
-  const [lastPack, setLastPack] = useState<PackKey | null>(null);
-
-  // Message global en haut de page (success / cancel)
+  const [creditsBeforePurchase, setCreditsBeforePurchase] = useState<number | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
-  // ✅ IMPORTANT (Option B) :
-  // on mémorise le solde AVANT l’achat, puis on ferme automatiquement la popup
-  // dès que credits > soldeAvant (webhook OK -> Firestore se met à jour)
-  const [creditsBeforePurchase, setCreditsBeforePurchase] = useState<number | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
-  // ✅ Historique des recharges
-  const { items: recharges, loading: rechargesLoading, error: rechargesError } = useRechargeHistory(30);
-
-  const triggerSuccessClose = (message?: string) => {
-    setEmbedUrl(null);
-    setBuyLoading(null);
-    setLastPack(null);
-    setCreditsBeforePurchase(null);
-
-    setShowSuccessAnimation(true);
-    window.setTimeout(() => setShowSuccessAnimation(false), 4000);
-
-    setStatusMessage(message || "✅ Paiement confirmé ! Tes crédits ont été ajoutés à ton compte.");
-  };
-
+  // --- ACTIONS ---
   const handleBuy = async (pack: PackKey) => {
     try {
       setBuyError(null);
-      setStatusMessage(null);
-
-      if (!user?.uid || !user.email) {
-        setBuyError("Tu dois être connecté pour recharger tes crédits.");
-        return;
-      }
+      if (!user?.uid || !user.email) return setBuyError("Veuillez vous connecter.");
 
       setBuyLoading(pack);
-      setLastPack(pack);
+      setCreditsBeforePurchase(credits ?? 0);
 
-      // On capture le solde actuel pour détecter l’augmentation après webhook
-      if (typeof credits === "number") {
-        setCreditsBeforePurchase(credits);
-      } else {
-        setCreditsBeforePurchase(0);
-      }
-
-      // 👉 Appel à ta Cloud Function HTTPS : /polarCheckout
-      const endpoint = `${API_BASE}/polarCheckout`;
-
-      // ✅ reCAPTCHA token
-      let recaptchaToken = "";
-      try {
-        recaptchaToken = await getRecaptchaToken("polar_checkout");
-      } catch {
-        setBuyError(
-          "Sécurité: impossible de valider reCAPTCHA (script bloqué ?). Désactive l'adblock et réessaie."
-        );
-        setBuyLoading(null);
-        setCreditsBeforePurchase(null);
-        return;
-      }
-
-      const res = await fetch(endpoint, {
+      const recaptchaToken = await getRecaptchaToken("polar_checkout");
+      const res = await fetch(`${API_BASE}/polarCheckout`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          packId: pack, // "20" | "50" | "100"
-          userId: user.uid, // pour externalCustomerId
-          email: user.email, // pour customerEmail
-          recaptchaToken, // ✅ ajouté
-        }),
+        body: JSON.stringify({ packId: pack, userId: user.uid, email: user.email, recaptchaToken }),
       });
 
-      const contentType = res.headers.get("content-type") || "";
-      let data: any = null;
+      const data = await res.json();
+      if (!res.ok || !data?.url) throw new Error(data?.error || "Erreur de paiement.");
 
-      if (contentType.includes("application/json")) {
-        data = await res.json();
-      } else {
-        const text = await res.text();
-        console.error("[Credits] Réponse non JSON de /polarCheckout :", text.slice(0, 300));
-        throw new Error(
-          "Le serveur de paiement a renvoyé une réponse invalide (HTML). Vérifie la fonction polarCheckout."
-        );
-      }
-
-      if (!res.ok || !data?.url) {
-        console.error("Erreur API /polarCheckout :", data);
-        throw new Error(data?.error || "Impossible de créer le paiement Polar.");
-      }
-
-      // 👉 On ajoute les params d’embed : embed=true & embed_origin=...
-      const origin = window.location.origin;
-      const urlBase = data.url as string;
-      const sep = urlBase.includes("?") ? "&" : "?";
-      const fullEmbedUrl = `${urlBase}${sep}embed=true&embed_origin=${encodeURIComponent(origin)}`;
-
-      setEmbedUrl(fullEmbedUrl); // ouvre la popup
+      const fullUrl = `${data.url}${data.url.includes("?") ? "&" : "?"}embed=true&embed_origin=${encodeURIComponent(window.location.origin)}`;
+      setEmbedUrl(fullUrl);
     } catch (e: any) {
-      console.error("Erreur checkout Polar (iframe) :", e);
-      setBuyError(
-        e?.message || "Erreur lors de la création du paiement. Essaie à nouveau dans quelques instants."
-      );
+      setBuyError(e.message);
       setBuyLoading(null);
-      setCreditsBeforePurchase(null);
     }
   };
 
-  // 🔐 (Option A / bonus) : si un jour Polar redirige l’iframe vers ton domaine,
-  // on peut fermer via status=success. Mais actuellement l’iframe reste chez Polar,
-  // donc ça ne marche pas (cross-origin).
-  const handleIframeLoad = () => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-
-    try {
-      const win = iframe.contentWindow;
-      if (!win) return;
-
-      const href = win.location.href; // accessible seulement si même origine
-
-      if (href.includes("/app/credits") && href.includes("status=success")) {
-        triggerSuccessClose("✅ Paiement confirmé ! Tes crédits vont se mettre à jour dans quelques instants.");
-      }
-
-      if (href.includes("/app/credits") && href.includes("status=cancel")) {
-        setEmbedUrl(null);
-        setBuyLoading(null);
-        setLastPack(null);
-        setCreditsBeforePurchase(null);
-        setStatusMessage("Paiement annulé.");
-      }
-    } catch {
-      // cross-origin -> normal
-    }
-  };
-
-  // ✅ LA FERMETURE AUTO (Option B) :
-  // Dès que les crédits augmentent après l’achat, on ferme la popup.
+  // Fermeture auto quand les crédits sont reçus
   useEffect(() => {
-    if (!embedUrl) return;
-    if (creditsBeforePurchase === null) return;
-    if (loading) return;
-    if (typeof credits !== "number") return;
-
-    if (credits > creditsBeforePurchase) {
-      triggerSuccessClose("✅ Paiement confirmé ! Tes crédits ont été ajoutés.");
-    }
-  }, [credits, loading, embedUrl, creditsBeforePurchase]);
-
-  const closeModal = () => {
-    setEmbedUrl(null);
-    setBuyLoading(null);
-    setLastPack(null);
-    setCreditsBeforePurchase(null);
-  };
-
-  // Si on arrive sur /app/credits?status=success dans la page normale (sans iframe)
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const url = new URL(window.location.href);
-    const status = url.searchParams.get("status");
-
-    if (status === "success") {
-      setStatusMessage("✅ Paiement confirmé ! Tes crédits ont été pris en compte.");
+    if (embedUrl && creditsBeforePurchase !== null && credits !== null && credits > creditsBeforePurchase) {
+      setEmbedUrl(null);
+      setBuyLoading(null);
       setShowSuccessAnimation(true);
-      setTimeout(() => setShowSuccessAnimation(false), 4000);
-    } else if (status === "cancel") {
-      setStatusMessage("Paiement annulé.");
+      setTimeout(() => setShowSuccessAnimation(false), 5000);
     }
-  }, []);
+  }, [credits, embedUrl, creditsBeforePurchase]);
 
   return (
-    <div className="space-y-6">
-      {/* Animation succès flottante */}
-      {showSuccessAnimation && (
-        <div className="fixed top-4 left-1/2 z-40 -translate-x-1/2">
-          <div className="rounded-full border border-emerald-400/70 bg-emerald-500/10 px-4 py-2 shadow-lg backdrop-blur flex items-center gap-2 animate-[fadeInOut_4s_ease-in-out]">
-            <span className="text-lg">⚡</span>
-            <span className="text-[13px] text-emerald-200">Crédits ajoutés à ton compte !</span>
-          </div>
-        </div>
-      )}
+    <div className="max-w-5xl mx-auto px-4 py-8 space-y-10">
+      
+      {/* NOTIFICATION SUCCÈS */}
+      <AnimatePresence>
+        {showSuccessAnimation && (
+          <motion.div 
+            initial={{ y: -50, opacity: 0 }} 
+            animate={{ y: 0, opacity: 1 }} 
+            exit={{ y: -50, opacity: 0 }}
+            className="fixed top-6 left-1/2 -translate-x-1/2 z-50 pointer-events-none"
+          >
+            <div className="bg-emerald-600 text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-3">
+              <Sparkles className="w-5 h-5 fill-yellow-400" />
+              <span className="font-bold text-sm">Crédits ajoutés avec succès !</span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
-      {/* Titre + résumé */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-        <div>
-          <h1 className="text-lg sm:text-xl font-semibold text-[var(--ink)]">Crédits IA</h1>
-          <p className="text-[12px] text-[var(--muted)]">
-            Utilise tes crédits pour analyser ton CV, générer des lettres de motivation, des pitchs, et préparer tes
-            entretiens.
+      {/* HEADER & BALANCE */}
+      <header className="flex flex-col md:flex-row md:items-end justify-between gap-6">
+        <div className="space-y-2">
+          <h1 className="text-3xl font-bold tracking-tight">Crédits IA</h1>
+          <p className="text-gray-500 text-sm max-w-md">
+            Utilisez vos crédits pour propulser vos candidatures avec nos outils d'analyse et de génération intelligente.
           </p>
         </div>
 
-        {/* Petit récap du solde */}
-        <div className="inline-flex flex-col items-end gap-1">
-          <span className="text-[11px] text-[var(--muted)]">Solde actuel</span>
-          <div className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px] bg-[var(--bg-soft)] border border-[var(--border)]/80">
-            <span className="text-[15px]">⚡</span>
-            {loading ? (
-              <span className="text-[var(--muted)]">Chargement…</span>
-            ) : (
-              <span className="font-semibold text-[var(--ink)]">{credits} crédits</span>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {statusMessage && <p className="text-[12px] text-emerald-400">{statusMessage}</p>}
-      {error && <p className="text-[12px] text-red-400">{error}</p>}
-
-      {/* Packs de rechargement */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-          <div>
-            <h2 className="text-base font-semibold text-[var(--ink)]">Recharger mes crédits</h2>
-            <p className="text-[12px] text-[var(--muted)]">
-              Choisis un pack ci-dessous pour ajouter des crédits à ton compte. Paiement sécurisé via Polar.
-            </p>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => {
-              const el = document.getElementById("credit-packs");
-              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-            }}
-            className="btn-primary text-[12px] px-3 py-1.5"
-          >
-            Ajouter du crédit
-          </button>
-        </div>
-
-        <div id="credit-packs" className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4 mt-2">
-          {CREDIT_PACKS.map((pack) => (
-            <div
-              key={pack.key}
-              className="card-soft border border-[var(--border)]/80 rounded-2xl p-3 sm:p-4 flex flex-col justify-between"
-            >
-              <div className="space-y-1">
-                <div className="flex items-center justify-between gap-2">
-                  <h3 className="text-[13px] font-semibold text-[var(--ink)]">{pack.label}</h3>
-                  <span className="inline-flex items-center rounded-full px-2 py-[2px] text-[11px] bg-[var(--bg)] border border-[var(--border)]/80">
-                    ⚡ {pack.credits} crédits
-                  </span>
-                </div>
-                <p className="text-[12px] text-[var(--muted)]">{pack.desc}</p>
-              </div>
-
-              <div className="mt-3 flex flex-col gap-1">
-                <button
-                  type="button"
-                  onClick={() => handleBuy(pack.key)}
-                  disabled={buyLoading === pack.key}
-                  className="btn-primary w-full text-[12px] flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
-                >
-                  {buyLoading === pack.key ? (
-                    <>
-                      <span className="loader" />
-                      <span>Ouverture du paiement…</span>
-                    </>
-                  ) : (
-                    <>
-                      <span>Recharger</span>
-                      <span className="text-[13px]">→</span>
-                    </>
-                  )}
-                </button>
-                <span className="text-[10px] text-[var(--muted)] text-center">
-                  Paiement unique, pas d’abonnement.
-                </span>
+        <div className="relative group">
+          <div className="absolute -inset-0.5 bg-gradient-to-r from-blue-500 to-indigo-600 rounded-2xl blur opacity-20 group-hover:opacity-40 transition"></div>
+          <div className="relative bg-[var(--bg)] border border-[var(--border)] p-4 rounded-2xl flex items-center gap-4 min-w-[200px]">
+            <div className="w-12 h-12 rounded-xl bg-blue-500/10 flex items-center justify-center text-blue-600">
+              <Zap className="w-6 h-6 fill-blue-600" />
+            </div>
+            <div>
+              <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Solde Actuel</div>
+              <div className="text-2xl font-black text-[var(--ink)]">
+                {loading ? "..." : credits} <span className="text-xs font-medium text-gray-400">⚡</span>
               </div>
             </div>
+          </div>
+        </div>
+      </header>
+
+      {/* PACKS SECTION */}
+      <section className="space-y-6">
+        <div className="flex items-center gap-2">
+          <CreditCard className="w-5 h-5 text-blue-500" />
+          <h2 className="text-lg font-bold">Rechargement sécurisé</h2>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {CREDIT_PACKS.map((pack) => (
+            <motion.div
+              key={pack.key}
+              whileHover={{ y: -5 }}
+              className={`relative bg-[var(--bg)] border border-[var(--border)] rounded-3xl p-6 flex flex-col justify-between shadow-sm transition-all ${pack.popular ? 'ring-2 ring-blue-500/50' : ''}`}
+            >
+              {pack.popular && (
+                <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-blue-600 text-white text-[10px] font-black px-3 py-1 rounded-full uppercase tracking-tighter">
+                  Le plus populaire
+                </div>
+              )}
+
+              <div className="space-y-4">
+                <div className={`w-12 h-12 rounded-2xl bg-gradient-to-br ${pack.color} flex items-center justify-center text-white shadow-lg`}>
+                  <Zap className="w-6 h-6 fill-current" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold">{pack.label}</h3>
+                  <p className="text-xs text-gray-500 mt-1 leading-relaxed">{pack.desc}</p>
+                </div>
+                <div className="flex items-baseline gap-1 pt-2">
+                  <span className="text-3xl font-black">{pack.price}</span>
+                  <span className="text-xs text-gray-400">pour {pack.credits} crédits</span>
+                </div>
+              </div>
+
+              <button
+                onClick={() => handleBuy(pack.key)}
+                disabled={!!buyLoading}
+                className={`mt-8 w-full py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${
+                  pack.popular 
+                    ? 'bg-blue-600 text-white hover:bg-blue-700 shadow-lg shadow-blue-500/20' 
+                    : 'bg-gray-100 text-gray-800 hover:bg-gray-200'
+                } disabled:opacity-50`}
+              >
+                {buyLoading === pack.key ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <>Recharger <ArrowRight className="w-4 h-4" /></>
+                )}
+              </button>
+            </motion.div>
           ))}
         </div>
-
-        {buyError && <p className="text-[12px] text-red-400">{buyError}</p>}
+        
+        <div className="flex flex-col md:flex-row items-center justify-center gap-6 text-[10px] text-gray-400 uppercase font-bold tracking-widest pt-4">
+          <div className="flex items-center gap-2"><ShieldCheck className="w-4 h-4 text-emerald-500" /> Transaction SSL 256-bit</div>
+          <div className="flex items-center gap-2"><CreditCard className="w-4 h-4 text-emerald-500" /> Propulsé par Stripe & Polar</div>
+          <div className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-500" /> Aucun abonnement</div>
+        </div>
       </section>
 
-      {/* Explication d’usage */}
-      <section className="text-[11px] text-[var(--muted)] space-y-1">
-        <p>1 crédit ≈ 1 action IA (analyse CV, génération de lettre, pitch, Q&A entretien…).</p>
-        <p>
-          Ton solde est mis à jour automatiquement après chaque achat dès que le paiement est confirmé (via le webhook
-          Polar).
+      {/* HISTORIQUE */}
+      <section className="bg-[var(--bg-soft)] rounded-3xl border border-[var(--border)] overflow-hidden">
+        <div className="p-6 border-b border-[var(--border)] flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <History className="w-5 h-5 text-gray-400" />
+            <h2 className="text-sm font-bold uppercase tracking-wider text-gray-500">Historique des transactions</h2>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-gray-50/50 text-gray-400 text-[10px] font-black uppercase tracking-widest">
+              <tr>
+                <th className="px-6 py-4">Date & Heure</th>
+                <th className="px-6 py-4">Pack</th>
+                <th className="px-6 py-4">Crédits</th>
+                <th className="px-6 py-4">Montant</th>
+                <th className="px-6 py-4">Statut</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[var(--border)]">
+              {rechargesLoading ? (
+                <tr><td colSpan={5} className="px-6 py-10 text-center text-gray-400">Chargement de l'historique...</td></tr>
+              ) : recharges.length === 0 ? (
+                <tr><td colSpan={5} className="px-6 py-10 text-center text-gray-400">Aucune transaction trouvée.</td></tr>
+              ) : (
+                recharges.map((r) => (
+                  <tr key={r.id} className="hover:bg-white/50 transition-colors">
+                    <td className="px-6 py-4 text-gray-600 flex items-center gap-2">
+                      <Clock className="w-3.5 h-3.5 opacity-40" />
+                      {r.createdAt ? new Date(r.createdAt).toLocaleString("fr-FR", { dateStyle: 'short', timeStyle: 'short' }) : '—'}
+                    </td>
+                    <td className="px-6 py-4 font-semibold">Pack {r.creditsAdded}</td>
+                    <td className="px-6 py-4"><span className="text-emerald-600 font-bold">+{r.creditsAdded} ⚡</span></td>
+                    <td className="px-6 py-4 font-medium">{(Number(r.amount) / 100).toFixed(2)} {String(r.currency).toUpperCase()}</td>
+                    <td className="px-6 py-4">
+                      <span className={`px-2 py-1 rounded-full text-[10px] font-bold uppercase ${
+                        r.status === 'success' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
+                      }`}>
+                        {r.status || 'pending'}
+                      </span>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      {/* INFOS FOOTER */}
+      <div className="flex items-start gap-3 p-4 bg-blue-50 rounded-2xl border border-blue-100 text-blue-700 text-xs">
+        <Info className="w-4 h-4 mt-0.5 flex-shrink-0" />
+        <p className="leading-relaxed">
+          <strong>Comment ça marche ?</strong> Un crédit correspond à une action IA majeure (Analyse CV, lettre de motivation, etc.). Vos crédits n'expirent jamais. En cas de problème lors du paiement, contactez le support.
         </p>
-      </section>
+      </div>
 
-      {/* ✅ Historique des recharges */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3">
-        <div>
-          <h2 className="text-base font-semibold text-[var(--ink)]">Historique des recharges</h2>
-          <p className="text-[12px] text-[var(--muted)]">
-            Liste des rechargements crédités sur ton compte (webhook Polar).
-          </p>
-        </div>
-
-        {rechargesError && <p className="text-[12px] text-red-400">{rechargesError}</p>}
-
-        {rechargesLoading ? (
-          <p className="text-[12px] text-[var(--muted)]">Chargement…</p>
-        ) : recharges.length === 0 ? (
-          <p className="text-[12px] text-[var(--muted)]">Aucune recharge pour le moment.</p>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-[12px]">
-              <thead className="text-[var(--muted)]">
-                <tr className="text-left">
-                  <th className="py-2 pr-4">Date</th>
-                  <th className="py-2 pr-4">Crédits</th>
-                  <th className="py-2 pr-4">Montant</th>
-                  <th className="py-2 pr-4">Statut</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recharges.map((r) => {
-                  const d = r.createdAt ? new Date(r.createdAt) : null;
-                  const amount = typeof r.amount === "number" ? (r.amount / 100).toFixed(2) : null;
-                  const cur = r.currency ? String(r.currency).toUpperCase() : "";
-                  return (
-                    <tr key={r.id} className="border-t border-[var(--border)]/80">
-                      <td className="py-2 pr-4">{d ? d.toLocaleString("fr-FR") : "—"}</td>
-                      <td className="py-2 pr-4">
-                        {typeof r.creditsAdded === "number" ? `+${r.creditsAdded}` : "—"}
-                      </td>
-                      <td className="py-2 pr-4">{amount ? `${amount} ${cur}` : "—"}</td>
-                      <td className="py-2 pr-4">{r.status || "—"}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
-
-      {/* 🔥 POPUP CHECKOUT POLAR EN IFRAME */}
-      {embedUrl && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div className="relative w-full max-w-lg h-[520px] sm:h-[580px] bg-[var(--bg)] border border-[var(--border)]/80 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
-            <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)]/70 bg-[var(--bg-soft)]/80">
-              <div className="flex flex-col">
-                <span className="text-[12px] font-semibold text-[var(--ink)]">Paiement sécurisé</span>
-                <span className="text-[11px] text-[var(--muted)]">Transaction gérée par Polar (Stripe)</span>
+      {/* IFRAME MODAL (Paiement) */}
+      <AnimatePresence>
+        {embedUrl && (
+          <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[60] flex items-center justify-center p-4 sm:p-6 bg-black/80 backdrop-blur-md"
+          >
+            <motion.div 
+              initial={{ scale: 0.9, y: 20 }} 
+              animate={{ scale: 1, y: 0 }}
+              className="relative w-full max-w-xl bg-white rounded-3xl shadow-2xl overflow-hidden flex flex-col h-[650px] max-h-full"
+            >
+              <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center text-white">
+                    <ShieldCheck className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold">Paiement Sécurisé</h3>
+                    <p className="text-[10px] text-gray-400 uppercase tracking-tighter">Propulsé par Polar & Stripe</p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => { setEmbedUrl(null); setBuyLoading(null); }}
+                  className="p-2 hover:bg-gray-100 rounded-full transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={closeModal}
-                className="text-[11px] rounded-full border border-[var(--border)] px-2 py-1 hover:bg-[var(--bg)]"
-              >
-                ✕
-              </button>
-            </div>
 
-            <iframe
-              ref={iframeRef}
-              src={embedUrl}
-              onLoad={handleIframeLoad}
-              className="flex-1 w-full border-0"
-              title="Paiement Polar"
-              allow="payment *; publickey-credentials-get *"
-            />
-          </div>
-        </div>
-      )}
+              <iframe
+                ref={iframeRef}
+                src={embedUrl}
+                className="w-full flex-1 border-0"
+                title="Polar Checkout"
+                allow="payment *; publickey-credentials-get *"
+              />
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
+
+const X = ({ className }: { className?: string }) => (
+  <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+  </svg>
+);

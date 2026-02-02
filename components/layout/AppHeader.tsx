@@ -1,84 +1,81 @@
-// components/layout/AppHeader.tsx
 "use client";
 
-import Link from "next/link";
-import { ThemeLangSwitcher } from "@/components/ui/ThemeLangSwitcher";
-import { useTranslation } from "react-i18next";
+import { ReactNode } from "react";
+import { Menu, Bell, Search, Command } from "lucide-react";
 
-type AppHeaderProps = {
-  userEmail?: string | null;
-  onOpenSidebar?: () => void; // mobile
-  onLogout?: () => void;
-  sidebarOpen?: boolean;
-};
+interface AppHeaderProps {
+  title: string;
+  description?: string;
+  creditsBadge?: ReactNode;
+  userBadge?: ReactNode; // Le bouton avatar/profil
+  onToggleSidebar: () => void;
+}
 
 export function AppHeader({
-  userEmail,
-  onOpenSidebar,
-  onLogout,
-  sidebarOpen = false,
+  title,
+  description,
+  creditsBadge,
+  userBadge,
+  onToggleSidebar,
 }: AppHeaderProps) {
-  const { t } = useTranslation("common");
-
   return (
-    <header className="sticky top-0 z-30 border-b border-[var(--border)]/70 bg-[var(--bg)]/70 backdrop-blur">
-      <div className="mx-auto max-w-6xl px-3 sm:px-4 py-3 flex items-center justify-between gap-3">
-        {/* gauche : menu mobile + brand */}
-        <div className="flex items-center gap-2">
+    <header className="sticky top-0 z-30 w-full border-b border-[var(--border)]/50 bg-[var(--bg)]/80 backdrop-blur-xl transition-all">
+      <div className="flex h-16 items-center justify-between px-4 sm:px-6 lg:px-8">
+        
+        {/* GAUCHE : Toggle Mobile + Titre */}
+        <div className="flex items-center gap-4">
           <button
             type="button"
-            aria-label="Ouvrir la navigation"
-            onClick={onOpenSidebar}
-            className="md:hidden rounded-full p-2 bg-[var(--bg-soft)] border border-[var(--border)]/80 shadow-sm focus:outline-none focus:ring-2 focus:ring-[var(--brand)]/60"
+            onClick={onToggleSidebar}
+            className="md:hidden -ml-2 p-2 rounded-lg text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)] transition-colors"
           >
-            <div className={`menu-icon1 ${sidebarOpen ? "is-open" : ""}`}>
-              <div className="menu-icon1_line-top" />
-              <div className="menu-icon1_line-middle">
-                <div className="menu-icon1_line-middle-inner" />
-              </div>
-              <div className="menu-icon1_line-bottom" />
-            </div>
+            <Menu className="h-5 w-5" />
           </button>
 
-          <Link href="/app" className="flex items-center gap-2">
-            <div className="w-9 h-9 rounded-2xl bg-[var(--brand)]/10 border border-[var(--brand)]/40 flex items-center justify-center text-lg">
-              ⚡
-            </div>
-            <div className="flex flex-col leading-tight">
-              <span className="text-xs font-semibold">
-                {t("header.title")}
+          <div className="flex flex-col">
+            <h1 className="text-sm font-semibold text-[var(--ink)] tracking-tight">
+              {title}
+            </h1>
+            {description && (
+              <span className="text-[10px] text-[var(--muted)] hidden sm:block">
+                {description}
               </span>
-              <span className="text-[10px] text-[var(--muted)]">
-                {t("header.space", { defaultValue: "Espace candidat" })}
-              </span>
-            </div>
-          </Link>
+            )}
+          </div>
         </div>
 
-        {/* droite : langues + thème + email + logout */}
-        <div className="flex items-center gap-3">
-          <ThemeLangSwitcher />
+        {/* CENTRE : Barre de recherche fake (Optionnel pour effet "App") */}
+        <div className="hidden md:flex items-center justify-center flex-1 max-w-md mx-4">
+          <button className="w-full flex items-center justify-between px-3 py-1.5 rounded-lg border border-[var(--border)] bg-[var(--bg-soft)]/50 text-[var(--muted)] text-xs hover:border-[var(--border)]/80 hover:bg-[var(--bg-soft)] transition-all group">
+            <div className="flex items-center gap-2">
+              <Search className="h-3.5 w-3.5 group-hover:text-[var(--ink)]" />
+              <span>Rechercher...</span>
+            </div>
+            <div className="flex items-center gap-1 opacity-50">
+              <Command className="h-3 w-3" />
+              <span>K</span>
+            </div>
+          </button>
+        </div>
 
-          {/* Email utilisateur */}
-          {userEmail && (
-            <span className="hidden sm:inline text-[11px] text-[var(--muted)]">
-              {t("header.connected", { defaultValue: "Connecté·e :" })}{" "}
-              <span className="font-medium text-[var(--ink)]">
-                {userEmail}
-              </span>
-            </span>
-          )}
+        {/* DROITE : Actions */}
+        <div className="flex items-center gap-3 sm:gap-4">
+          {/* Credits Badge */}
+          <div className="hidden sm:block">
+            {creditsBadge}
+          </div>
 
-          {/* Logout */}
-          {onLogout && (
-            <button
-              type="button"
-              onClick={onLogout}
-              className="text-[11px] rounded-full border border-[var(--border)] px-3 py-1 bg-[var(--bg-soft)] hover:border-red-500 hover:text-red-300 transition-colors"
-            >
-              {t("header.logout")}
-            </button>
-          )}
+          {/* Notifications */}
+          <button className="relative p-2 rounded-full text-[var(--muted)] hover:bg-[var(--bg-soft)] hover:text-[var(--ink)] transition-colors">
+            <Bell className="h-4 w-4" />
+            <span className="absolute top-2 right-2 h-2 w-2 rounded-full bg-red-500 border-2 border-[var(--bg)]" />
+          </button>
+
+          {/* Séparateur */}
+          <div className="h-6 w-px bg-[var(--border)]" />
+
+          {/* User Menu Trigger */}
+          {userBadge}
         </div>
       </div>
     </header>

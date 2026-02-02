@@ -1,0 +1,54 @@
+{
+  "landing": {
+    "brand": "SmartApply",
+    "nav": { "features": "Funciones", "process": "Cómo funciona", "pricing": "Precios", "login": "Iniciar sesión", "tryFree": "Probar gratis" },
+    "hero": {
+      "badge": "Nuevo: Análisis de CV con IA v2",
+      "titleLine1": "Consigue el trabajo",
+      "titleGradient": "sin la carga.",
+      "subtitle": "El asistente de IA que escribe cartas, prepara tu pitch y optimiza tu CV en segundos. Tú te concentras en la entrevista; nosotros hacemos el resto.",
+      "ctaPrimary": "Probar gratis",
+      "ctaSecondary": "Generar un CV ATS"
+    },
+    "mock": {
+      "dashboard": "Panel", "cvs": "Mis CVs", "apps": "Candidaturas", "letters": "Cartas IA", "stats": "Estadísticas",
+      "proMode": "Modo Pro", "hello": "Hola, Thomas 👋", "subtitle": "Tienes 2 acciones sugeridas hoy.",
+      "assistantActive": "Asistente Activo", "readyToApply": "¿Listo para postular?", "placeholder": "Pega una URL o descripción del puesto...",
+      "match": "92% Match", "generatingPitch": "Generando pitch...", "sent": "Enviado"
+    },
+    "features": {
+      "title": "Una suite completa para candidatos",
+      "subtitle": "Todo lo que necesitas para pasar de “Candidato” a “Contratado”, en una interfaz fluida.",
+      "f1": { "title": "Generador de cartas con IA", "desc": "Pega la oferta: la IA extrae palabras clave y redacta una carta única alineada con tu perfil." },
+      "f2": { "title": "Pitch de entrevista", "desc": "No te bloquees. Obtén un guion personalizado para brillar en entrevistas." },
+      "f3": { "title": "Seguimiento de candidaturas", "desc": "Tablero tipo Kanban para seguir cada candidatura: Enviado, Entrevista, Oferta." },
+      "f4": { "title": "Analizador de CV", "desc": "Sube tu PDF. La IA extrae habilidades y experiencia para reutilizarlas inteligentemente." }
+    },
+    "process": {
+      "title": "¿Cómo funciona?",
+      "s1": { "title": "Importa tu perfil", "desc": "Sube tu CV actual. Analizamos tu trayectoria, habilidades y logros." },
+      "s2": { "title": "Elige una oferta", "desc": "Pega la descripción del puesto. La IA identifica lo más importante." },
+      "s3": { "title": "Genera y postula", "desc": "Obtén al instante carta, pitch y consejos. Personaliza, exporta y envía." }
+    },
+    "pricing": {
+      "title": "Invierte en tu futuro",
+      "subtitle": "Sin suscripción oculta. Paga solo por lo que usas.",
+      "popular": "Popular",
+      "choose": "Elegir",
+      "p1": { "title": "Inicio", "price": "Gratis", "desc": "Para probar la IA", "f1": "Análisis básico del CV", "f2": "1 carta de motivación", "f3": "Acceso al tracker" },
+      "p2": { "title": "Boost", "price": "€9.99", "desc": "Para búsqueda activa", "f1": "Análisis completo del CV", "f2": "15 cartas", "f3": "5 pitches", "f4": "Soporte prioritario" },
+      "p3": { "title": "Carrera", "price": "€19.99", "desc": "El arsenal completo", "f1": "Créditos ilimitados (30 días)", "f2": "Optimización de CV con IA", "f3": "Cartas ilimitadas", "f4": "Coaching de entrevista con IA" }
+    },
+    "faq": {
+      "title": "Preguntas frecuentes",
+      "q1": "¿La IA reemplaza mi trabajo?",
+      "a1": "No, lo acelera. Tú controlas el resultado final.",
+      "q2": "¿Mis datos están seguros?",
+      "a2": "Sí. No vendemos tus datos. Solo se usan para generar tus documentos.",
+      "q3": "¿Puedo cancelar cuando quiera?",
+      "a3": "¡No hay nada que cancelar! Funcionamos por packs de créditos, sin suscripción recurrente."
+    },
+    "cta": { "title": "¿Listo para tu próximo puesto?", "subtitle": "Únete a miles de candidatos que redujeron el estrés y aumentaron entrevistas.", "button": "Probar gratis" },
+    "footer": { "brand": "SmartApply AI", "rights": "SmartApply. Todos los derechos reservados." }
+  }
+}

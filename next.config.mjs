@@ -2,28 +2,24 @@
 const nextConfig = {
   reactStrictMode: true,
 
-  // 🔴 IMPORTANT : active le mode export statique
-  // => `next build` va générer un dossier `out/`
+  // Export statique (Firebase Hosting)
   output: "export",
 
-  // 🔴 IMPORTANT pour un hébergement statique (Firebase Hosting)
-  // Pas d'image optimizer côté serveur
-  images: {
-    unoptimized: true,
-  },
+  images: { unoptimized: true },
 
-  // Tu l'avais déjà pour pdfjs
   transpilePackages: ["pdfjs-dist"],
 
-  webpack: (config, { dev, isServer }) => {
-    // Workaround qui était déjà dans ton projet
-    if (dev && !isServer) {
-      config.devtool = "source-map"; // ou "cheap-module-source-map"
-    }
-    return config;
+  // DEV uniquement : proxy /api/* vers Cloud Functions
+  async rewrites() {
+    if (process.env.NODE_ENV !== "development") return [];
+    return [
+      {
+        source: "/api/:path*",
+        destination:
+          "https://europe-west1-assistant-ia-v4.cloudfunctions.net/:path*",
+      },
+    ];
   },
-
-  experimental: {},
 };
 
 export default nextConfig;

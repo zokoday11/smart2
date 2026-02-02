@@ -1,0 +1,54 @@
+{
+  "landing": {
+    "brand": "SmartApply",
+    "nav": { "features": "Features", "process": "So funktioniert’s", "pricing": "Preise", "login": "Anmelden", "tryFree": "Kostenlos testen" },
+    "hero": {
+      "badge": "Neu: KI-Lebenslaufanalyse v2",
+      "titleLine1": "Hol dir den Job",
+      "titleGradient": "ohne Stress.",
+      "subtitle": "Der KI-Assistent, der Anschreiben schreibt, deinen Pitch vorbereitet und deinen Lebenslauf in Sekunden optimiert. Du konzentrierst dich aufs Interview – wir machen den Rest.",
+      "ctaPrimary": "Kostenlos testen",
+      "ctaSecondary": "ATS-Lebenslauf erstellen"
+    },
+    "mock": {
+      "dashboard": "Dashboard", "cvs": "Meine CVs", "apps": "Bewerbungen", "letters": "KI-Anschreiben", "stats": "Statistiken",
+      "proMode": "Pro-Modus", "hello": "Hallo, Thomas 👋", "subtitle": "Du hast heute 2 vorgeschlagene Aktionen.",
+      "assistantActive": "Assistent aktiv", "readyToApply": "Bereit zu bewerben?", "placeholder": "Job-URL oder Beschreibung einfügen...",
+      "match": "92% Match", "generatingPitch": "Pitch wird erstellt...", "sent": "Gesendet"
+    },
+    "features": {
+      "title": "Eine komplette Suite für Bewerber",
+      "subtitle": "Alles, was du brauchst, um von „Bewerber“ zu „Eingestellt“ zu werden – in einer flüssigen Oberfläche.",
+      "f1": { "title": "KI-Anschreiben-Generator", "desc": "Job einfügen – die KI extrahiert Keywords und erstellt ein einzigartiges Anschreiben passend zu deinem Profil." },
+      "f2": { "title": "Interview-Pitch", "desc": "Nie mehr blockieren. Hol dir ein maßgeschneidertes Script, um im Interview zu glänzen." },
+      "f3": { "title": "Bewerbungs-Tracker", "desc": "Kanban-Board zum Verfolgen: Gesendet, Interview, Angebot." },
+      "f4": { "title": "Lebenslauf-Analyzer", "desc": "PDF hochladen. Die KI extrahiert Skills & Erfahrung zur smarten Wiederverwendung." }
+    },
+    "process": {
+      "title": "So funktioniert’s",
+      "s1": { "title": "Profil importieren", "desc": "Lade deinen aktuellen Lebenslauf hoch. Wir analysieren deinen Werdegang, Skills und Erfolge." },
+      "s2": { "title": "Stelle wählen", "desc": "Füge die Stellenbeschreibung ein. Die KI erkennt die wichtigsten Anforderungen." },
+      "s3": { "title": "Generieren & bewerben", "desc": "Sofort Anschreiben, Pitch und Tipps erhalten. Anpassen, exportieren, senden." }
+    },
+    "pricing": {
+      "title": "Investiere in deine Zukunft",
+      "subtitle": "Kein verstecktes Abo. Bezahle nur, was du nutzt.",
+      "popular": "Beliebt",
+      "choose": "Auswählen",
+      "p1": { "title": "Start", "price": "Gratis", "desc": "Zum Testen der KI", "f1": "Basis-CV-Analyse", "f2": "1 Anschreiben", "f3": "Tracker-Zugang" },
+      "p2": { "title": "Boost", "price": "€9.99", "desc": "Für aktive Jobsuche", "f1": "Komplette CV-Analyse", "f2": "15 Anschreiben", "f3": "5 Interview-Pitches", "f4": "Priority Support" },
+      "p3": { "title": "Karriere", "price": "€19.99", "desc": "Das volle Arsenal", "f1": "Unlimitierte Credits (30 Tage)", "f2": "KI-CV-Optimierung", "f3": "Unlimitierte Anschreiben", "f4": "KI-Interview-Coaching" }
+    },
+    "faq": {
+      "title": "FAQ",
+      "q1": "Ersetzt KI meine Arbeit?",
+      "a1": "Nein, sie beschleunigt sie. Du behältst die Kontrolle über das Endergebnis.",
+      "q2": "Sind meine Daten sicher?",
+      "a2": "Ja. Wir verkaufen keine Daten. Sie werden nur zur Dokumentenerstellung genutzt.",
+      "q3": "Kann ich jederzeit kündigen?",
+      "a3": "Es gibt nichts zu kündigen! Wir arbeiten mit Credit-Packs, ohne Abo."
+    },
+    "cta": { "title": "Bereit für deinen nächsten Job?", "subtitle": "Schließe dich tausenden Kandidaten an, die Stress reduziert und mehr Interviews bekommen haben.", "button": "Kostenlos testen" },
+    "footer": { "brand": "SmartApply AI", "rights": "SmartApply. Alle Rechte vorbehalten." }
+  }
+}

@@ -2,9 +2,9 @@
 "use client";
 
 import { logUsage } from "@/lib/logUsage";
-import { useEffect, useMemo, useRef, useState, FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type { ReactNode } from "react";
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
 import { auth, db } from "@/lib/firebase";
 import { onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, collection, addDoc, serverTimestamp } from "firebase/firestore";
@@ -21,7 +21,26 @@ import type { CvDocModel } from "@/lib/pdf/templates/cvAts";
 import { buildCvPdf, getCvTemplates, type CvTemplateId } from "@/lib/pdf/templates/cvTemplates";
 import { buildLmStyledPdf, type LmModel } from "@/lib/pdf/templates/letter";
 
-// --- TYPES ---
+import {
+  PenTool,
+  Sparkles,
+  FileText,
+  Briefcase,
+  Send,
+  Copy,
+  RotateCcw,
+  CheckCircle2,
+  AlertCircle,
+  ArrowRight,
+  Download,
+  Mail,
+  MessageSquareText,
+  Loader2,
+} from "lucide-react";
+
+// =============================
+// TYPES
+// =============================
 type CvSkillsSection = { title: string; items: string[] };
 type CvSkills = { sections: CvSkillsSection[]; tools: string[] };
 
@@ -41,6 +60,10 @@ type CvEducation = {
 };
 
 type CvProfile = {
+  // meta
+  title?: string;
+
+  // ident
   fullName: string;
   email: string;
   phone: string;
@@ -72,9 +95,11 @@ type CvProfile = {
 };
 
 type Lang = "fr" | "en";
+type ViewMode = "cv_lm" | "pitch" | "mail";
+type GenerationKind = "cv" | "cv_lm" | "lm" | "pitch";
 
 // =============================
-// ✅ Helpers (texte & PDF)
+// Helpers (texte & model)
 // =============================
 function safeText(v: any) {
   return String(v ?? "").replace(/\u00A0/g, " ").trim();
@@ -99,6 +124,11 @@ function buildContactLine(p: CvProfile) {
   return parts.filter(Boolean).join(" | ");
 }
 
+function normalizeHex(v: string) {
+  const s = safeText(v).trim();
+  return /^#[0-9a-f]{6}$/i.test(s) ? s : "#3b82f6";
+}
+
 function categorizeSkills(profile: CvProfile) {
   const cloud: string[] = [];
   const sec: string[] = [];
@@ -111,26 +141,13 @@ function categorizeSkills(profile: CvProfile) {
   for (const s of sections) {
     const title = (s?.title || "").toLowerCase();
     const items = (s?.items || []).filter(Boolean);
-
     const pushAll = (arr: string[], vals: string[]) => vals.forEach((x) => arr.push(x));
 
-    if (title.includes("cloud") || title.includes("azure") || title.includes("aws") || title.includes("gcp")) {
-      pushAll(cloud, items);
-    } else if (title.includes("sécu") || title.includes("secu") || title.includes("security") || title.includes("cyber")) {
-      pushAll(sec, items);
-    } else if (
-      title.includes("réseau") ||
-      title.includes("reseau") ||
-      title.includes("system") ||
-      title.includes("système") ||
-      title.includes("sys")
-    ) {
-      pushAll(sys, items);
-    } else if (title.includes("autom") || title.includes("devops") || title.includes("ia") || title.includes("api")) {
-      pushAll(auto, items);
-    } else {
-      pushAll(tools, items);
-    }
+    if (title.match(/cloud|azure|aws|gcp/)) pushAll(cloud, items);
+    else if (title.match(/sécu|secu|security|cyber/)) pushAll(sec, items);
+    else if (title.match(/réseau|reseau|system|système|sys/)) pushAll(sys, items);
+    else if (title.match(/autom|devops|ia|api/)) pushAll(auto, items);
+    else pushAll(tools, items);
   }
 
   const extraTools = Array.isArray(profile.skills?.tools) ? profile.skills.tools : [];
@@ -190,7 +207,7 @@ function profileToCvDocModel(profile: CvProfile, params: { targetJob: string; co
 }
 
 // =============================
-// ✅ “CERVEAU” LM : prompt strict + sanitize
+// LM prompt strict + sanitize
 // =============================
 function buildProfileContext(profile: CvProfile) {
   const fullName = safeText(profile.fullName);
@@ -418,7 +435,12 @@ function buildLmModel(profile: CvProfile, lang: Lang, companyNameInput: string, 
   if (profile.linkedin) contactLines.push(lang === "fr" ? `LinkedIn : ${safeText(profile.linkedin)}` : `LinkedIn: ${safeText(profile.linkedin)}`);
 
   const city = safeText(profile.city) || "Paris";
-  const dateStr = lang === "fr" ? new Date().toLocaleDateString("fr-FR") : new Date().toLocaleDateString("en-GB");
+
+  // ✅ date stable + timezone Europe/Paris
+  const dateStr =
+    lang === "fr"
+      ? new Intl.DateTimeFormat("fr-FR", { timeZone: "Europe/Paris" }).format(new Date())
+      : new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Paris" }).format(new Date());
 
   const subject = lang === "fr" ? `Objet : Candidature – ${jobTitle || "poste"}` : `Subject: Application – ${jobTitle || "role"}`;
   const salutation = lang === "fr" ? "Madame, Monsieur," : "Dear Hiring Manager,";
@@ -445,7 +467,7 @@ function buildLmModel(profile: CvProfile, lang: Lang, companyNameInput: string, 
 }
 
 // =============================
-// ✅ Edition CV (draft)
+// CV editor helpers
 // =============================
 type CvSectionKey = "profile" | "xp" | "education" | "skills" | "certs" | "languages" | "hobbies";
 
@@ -466,15 +488,8 @@ const splitList = (s: string) =>
     .filter(Boolean);
 
 const joinList = (arr: string[]) => (Array.isArray(arr) ? arr.filter(Boolean).join(", ") : "");
-
-const textToLines = (t: string) =>
-  String(t || "")
-    .split(/\r?\n/g)
-    .map((x) => x.trim())
-    .filter(Boolean);
-
+const textToLines = (t: string) => String(t || "").split(/\r?\n/g).map((x) => x.trim()).filter(Boolean);
 const linesToText = (lines: string[]) => (Array.isArray(lines) ? lines.filter(Boolean).join("\n") : "");
-
 const bulletsToText = (bullets: string[]) => linesToText(Array.isArray(bullets) ? bullets : []);
 const textToBullets = (t: string) => textToLines(t);
 
@@ -490,7 +505,7 @@ function emptySkillsLike(base: any) {
 }
 
 // =============================
-// ✅ Full screen modal
+// Full screen modal
 // =============================
 function useLockBodyScroll(locked: boolean) {
   useEffect(() => {
@@ -532,16 +547,16 @@ function FullScreenModal({
   return (
     <div className="fixed inset-0 z-[80]" role="dialog" aria-modal="true">
       <div className="absolute inset-0 bg-black/60" onClick={onClose} />
-      <div className="absolute inset-0 p-2 sm:p-4">
+      <div className="absolute inset-0 p-2 sm:p-3">
         <div className="h-full w-full rounded-2xl border border-[var(--border)] bg-[var(--bg)] shadow-xl overflow-hidden flex flex-col">
-          <div className="p-3 sm:p-4 border-b border-[var(--border)] bg-[var(--bg-soft)] flex items-center justify-between gap-2">
-            <div>
-              <p className="text-[13px] font-semibold text-[var(--ink)]">{title}</p>
+          <div className="p-2.5 sm:p-3 border-b border-[var(--border)] bg-[var(--bg-soft)] flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-[12px] font-semibold text-[var(--ink)] truncate">{title}</p>
               <p className="text-[10px] text-[var(--muted)]">ESC pour fermer</p>
             </div>
             <div className="flex items-center gap-2">
               {actions}
-              <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={onClose}>
+              <button type="button" className="btn-secondary !py-1.5 !px-3 text-[12px]" onClick={onClose}>
                 Fermer
               </button>
             </div>
@@ -555,7 +570,7 @@ function FullScreenModal({
 }
 
 // =============================
-// ✅ PDF VIEWER (sans toolbar Chrome) via PDF.js CDN
+// PDF VIEWER via PDF.js CDN
 // =============================
 let __pdfjsReady = false;
 let __pdfjs: any = null;
@@ -566,14 +581,10 @@ async function ensurePdfJs() {
   if (__pdfjsLoading) return __pdfjsLoading;
 
   __pdfjsLoading = (async () => {
-    if (typeof window === "undefined") {
-      throw new Error("PDF.js doit être chargé côté client.");
-    }
-
+    if (typeof window === "undefined") throw new Error("PDF.js doit être chargé côté client.");
     const PDFJS_VERSION = "4.0.379";
     const pdfjs: any = await import(/* webpackIgnore: true */ `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.mjs`);
     pdfjs.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
-
     __pdfjs = pdfjs;
     __pdfjsReady = true;
     return pdfjs;
@@ -586,10 +597,14 @@ function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; class
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
+  // ✅ avoid leaks / overlapping renders
+  const loadingTaskRef = useRef<any>(null);
+  const renderTaskRef = useRef<any>(null);
+
   const [pdf, setPdf] = useState<any>(null);
   const [numPages, setNumPages] = useState(1);
   const [page, setPage] = useState(1);
-  const [scale, setScale] = useState(1.1);
+  const [scale, setScale] = useState(1.05);
   const [rendering, setRendering] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -602,13 +617,35 @@ function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; class
       setNumPages(1);
       setPage(1);
 
+      // cleanup previous tasks / doc
+      try {
+        renderTaskRef.current?.cancel?.();
+      } catch {}
+      renderTaskRef.current = null;
+
+      try {
+        loadingTaskRef.current?.destroy?.();
+      } catch {}
+      loadingTaskRef.current = null;
+
+      try {
+        await pdf?.destroy?.();
+      } catch {}
+
       if (!fileUrl) return;
 
       try {
         const pdfjs = await ensurePdfJs();
         const task = (pdfjs as any).getDocument({ url: fileUrl });
+        loadingTaskRef.current = task;
+
         const doc = await task.promise;
-        if (cancelled) return;
+        if (cancelled) {
+          try {
+            await doc?.destroy?.();
+          } catch {}
+          return;
+        }
 
         setPdf(doc);
         setNumPages(doc.numPages || 1);
@@ -621,6 +658,7 @@ function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; class
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileUrl]);
 
   useEffect(() => {
@@ -628,6 +666,13 @@ function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; class
 
     (async () => {
       if (!pdf || !canvasRef.current) return;
+
+      // cancel previous render if any
+      try {
+        renderTaskRef.current?.cancel?.();
+      } catch {}
+      renderTaskRef.current = null;
+
       setRendering(true);
 
       try {
@@ -649,6 +694,8 @@ function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; class
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
         const renderTask = p.render({ canvasContext: ctx, viewport });
+        renderTaskRef.current = renderTask;
+
         await renderTask.promise;
 
         if (!cancelled) setErr(null);
@@ -673,7 +720,7 @@ function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; class
       const p = await pdf.getPage(page);
       const viewport1 = p.getViewport({ scale: 1 });
       const pad = 24;
-      const w = Math.max(320, wrapRef.current.clientWidth - pad);
+      const w = Math.max(280, wrapRef.current.clientWidth - pad);
       const next = w / viewport1.width;
       setScale(Math.max(0.4, Math.min(2.2, next)));
     } catch {
@@ -683,12 +730,12 @@ function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; class
 
   return (
     <div className={["h-full min-h-0 flex flex-col", className || ""].join(" ")}>
-      <div className="px-3 py-2 border-b border-[var(--border)] bg-[var(--bg-soft)] flex flex-wrap items-center justify-between gap-2">
+      <div className="px-2.5 py-2 border-b border-[var(--border)] bg-[var(--bg-soft)] flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-[11px] text-[var(--muted)]">
           <span className="inline-flex items-center gap-1">
             <span className="font-medium text-[var(--ink)]">Page</span>
             <input
-              className="input !py-1 !px-2 !text-[11px] w-[58px] bg-[var(--bg)]"
+              className="input !py-1 !px-2 !text-[11px] w-[56px] bg-[var(--bg)]"
               value={String(page)}
               onChange={(e) => {
                 const n = Number(e.target.value || "1");
@@ -708,25 +755,25 @@ function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; class
         </div>
 
         <div className="flex items-center gap-2">
-          <button type="button" className="btn-secondary !py-1.5 !px-3 text-[11px]" onClick={() => canPrev && setPage((p) => p - 1)} disabled={!canPrev}>
+          <button type="button" className="btn-secondary !py-1 !px-2.5 text-[11px]" onClick={() => canPrev && setPage((p) => p - 1)} disabled={!canPrev}>
             ←
           </button>
-          <button type="button" className="btn-secondary !py-1.5 !px-3 text-[11px]" onClick={() => canNext && setPage((p) => p + 1)} disabled={!canNext}>
+          <button type="button" className="btn-secondary !py-1 !px-2.5 text-[11px]" onClick={() => canNext && setPage((p) => p + 1)} disabled={!canNext}>
             →
           </button>
 
           <span className="w-[1px] h-5 bg-[var(--border)] mx-1" />
 
-          <button type="button" className="btn-secondary !py-1.5 !px-3 text-[11px]" onClick={() => setScale((s) => Math.max(0.4, Number((s - 0.1).toFixed(2))))}>
+          <button type="button" className="btn-secondary !py-1 !px-2.5 text-[11px]" onClick={() => setScale((s) => Math.max(0.4, Number((s - 0.1).toFixed(2))))}>
             -
           </button>
-          <span className="text-[11px] text-[var(--muted)] w-[54px] text-center">{Math.round(scale * 100)}%</span>
-          <button type="button" className="btn-secondary !py-1.5 !px-3 text-[11px]" onClick={() => setScale((s) => Math.min(2.2, Number((s + 0.1).toFixed(2))))}>
+          <span className="text-[11px] text-[var(--muted)] w-[52px] text-center">{Math.round(scale * 100)}%</span>
+          <button type="button" className="btn-secondary !py-1 !px-2.5 text-[11px]" onClick={() => setScale((s) => Math.min(2.2, Number((s + 0.1).toFixed(2))))}>
             +
           </button>
 
-          <button type="button" className="btn-secondary !py-1.5 !px-3 text-[11px]" onClick={fitWidth}>
-            Ajuster largeur
+          <button type="button" className="btn-secondary !py-1 !px-2.5 text-[11px]" onClick={fitWidth}>
+            Ajuster
           </button>
         </div>
       </div>
@@ -737,7 +784,7 @@ function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; class
         ) : !fileUrl ? (
           <div className="h-full flex items-center justify-center text-[11px] text-[var(--muted)]">Aucun PDF à afficher.</div>
         ) : (
-          <div className="p-3 flex justify-center">
+          <div className="p-2.5 flex justify-center">
             <canvas ref={canvasRef} className="shadow-sm border border-black/10 rounded-lg bg-white" />
           </div>
         )}
@@ -747,79 +794,115 @@ function PdfCanvasViewer({ fileUrl, className }: { fileUrl: string | null; class
 }
 
 // =============================
+// UI bits (compact)
+// =============================
+function CyberCard({ className = "", children }: { className?: string; children: ReactNode }) {
+  return <div className={["bg-slate-900/60 border border-white/5 rounded-2xl p-4 backdrop-blur-md shadow-xl", className].join(" ")}>{children}</div>;
+}
+
+function CyberSectionTitle({ icon, title, subtitle }: { icon?: ReactNode; title: string; subtitle?: string }) {
+  return (
+    <div className="mb-3">
+      <h3 className="text-[11px] font-bold text-white uppercase tracking-widest flex items-center gap-2">
+        {icon}
+        {title}
+      </h3>
+      {subtitle ? <p className="text-[11px] text-slate-500 mt-1">{subtitle}</p> : null}
+    </div>
+  );
+}
+
+function CyberInput({ label, value, onChange, placeholder, area = false, rows = 4, type = "text" }: any) {
+  return (
+    <div className="space-y-1.5">
+      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">{label}</label>
+      {area ? (
+        <textarea
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          rows={rows}
+          className="w-full bg-slate-950/50 border border-white/10 rounded-xl px-3.5 py-2.5 text-xs text-slate-300 focus:border-blue-500/50 outline-none transition-all resize-none custom-scrollbar placeholder:text-slate-700"
+        />
+      ) : (
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          type={type}
+          className="w-full bg-slate-950/50 border border-white/10 rounded-xl px-3.5 py-2.5 text-xs text-slate-300 focus:border-blue-500/50 outline-none transition-all placeholder:text-slate-700"
+        />
+      )}
+    </div>
+  );
+}
+
+function CyberPillTabs<T extends string>({
+  value,
+  onChange,
+  items,
+}: {
+  value: T;
+  onChange: (v: T) => void;
+  items: Array<{ key: T; label: string; icon?: ReactNode }>;
+}) {
+  return (
+    <div className="flex bg-slate-950 rounded-xl p-1 border border-white/10">
+      {items.map((it) => {
+        const active = value === it.key;
+        return (
+          <button
+            key={it.key}
+            type="button"
+            onClick={() => onChange(it.key)}
+            className={[
+              "flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-[10px] font-bold transition-all",
+              active ? "bg-white text-slate-900" : "text-slate-500 hover:text-white hover:bg-white/5",
+            ].join(" ")}
+          >
+            {it.icon}
+            <span>{it.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function CyberCallout({ kind, children }: { kind: "error" | "success" | "info"; children: ReactNode }) {
+  const styles =
+    kind === "success"
+      ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-200"
+      : kind === "error"
+        ? "bg-red-500/10 border-red-500/20 text-red-200"
+        : "bg-white/5 border-white/10 text-slate-300";
+
+  const Icon = kind === "success" ? CheckCircle2 : kind === "error" ? AlertCircle : MessageSquareText;
+
+  return (
+    <div className={["p-3 rounded-xl border flex items-start gap-3", styles].join(" ")}>
+      <Icon className="h-4 w-4 mt-0.5 opacity-90" />
+      <div className="text-xs leading-relaxed">{children}</div>
+    </div>
+  );
+}
+
+// =============================
 // PAGE
 // =============================
 export default function AssistanceCandidaturePage() {
-  // --- PROFIL ---
+  // --- profil ---
   const [userId, setUserId] = useState<string | null>(null);
-  const [userEmail, setUserEmail] = useState<string | null>(null);
   const [profile, setProfile] = useState<CvProfile | null>(null);
   const [loadingProfile, setLoadingProfile] = useState(true);
 
   const [globalLoadingMessage, setGlobalLoadingMessage] = useState<string | null>(null);
 
-  useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (user) => {
-      if (!user) {
-        setUserId(null);
-        setUserEmail(null);
-        setProfile(null);
-        setLoadingProfile(false);
-        return;
-      }
+  // ✅ Tabs
+  const [viewMode, setViewMode] = useState<ViewMode>("cv_lm");
 
-      setUserId(user.uid);
-      setUserEmail(user.email ?? null);
-
-      try {
-        const ref = doc(db, "profiles", user.uid);
-        const snap = await getDoc(ref);
-
-        if (snap.exists()) {
-          const data = snap.data() as any;
-
-          const loadedProfile: CvProfile = {
-            fullName: data.fullName || "",
-            email: data.email || "",
-            phone: data.phone || "",
-            linkedin: data.linkedin || "",
-            profileSummary: data.profileSummary || "",
-            city: data.city || "",
-            address: data.address || "",
-            contractType: data.contractType || data.contractTypeStandard || "",
-            contractTypeStandard: data.contractTypeStandard || "",
-            contractTypeFull: data.contractTypeFull || "",
-            primaryDomain: data.primaryDomain || "",
-            secondaryDomains: Array.isArray(data.secondaryDomains) ? data.secondaryDomains : [],
-            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
-            drivingLicense: data.drivingLicense || "",
-            vehicle: data.vehicle || "",
-            skills: {
-              sections: Array.isArray(data.skills?.sections) ? data.skills.sections : [],
-              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
-            },
-            experiences: Array.isArray(data.experiences) ? data.experiences : [],
-            education: Array.isArray(data.education) ? data.education : [],
-            educationShort: Array.isArray(data.educationShort) ? data.educationShort : [],
-            certs: data.certs || "",
-            langLine: data.langLine || "",
-            hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
-            updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : undefined,
-          };
-
-          setProfile(loadedProfile);
-        } else {
-          setProfile(null);
-        }
-      } catch (e) {
-        console.error("Erreur chargement profil Firestore (assistance):", e);
-      } finally {
-        setLoadingProfile(false);
-      }
-    });
-
-    return () => unsub();
-  }, []);
+  // ✅ Mobile: switch between CONFIG / PREVIEW to keep “one-screen”
+  const [mobilePane, setMobilePane] = useState<"config" | "preview">("config");
 
   // --- CV ---
   const [cvTargetJob, setCvTargetJob] = useState("");
@@ -831,23 +914,17 @@ export default function AssistanceCandidaturePage() {
   const [cvStatus, setCvStatus] = useState<string | null>(null);
   const [cvError, setCvError] = useState<string | null>(null);
 
-  // ✅ Couleur PDF (CV + LM)
-  const [pdfBrand, setPdfBrand] = useState("#ef4444");
-
-  // ✅ Description de l’offre + switch IA CV
+  const [pdfBrand, setPdfBrand] = useState("#3b82f6");
   const [cvOfferDescription, setCvOfferDescription] = useState("");
   const [cvUseAiOptimizeOnDownload, setCvUseAiOptimizeOnDownload] = useState(true);
 
-  // Templates
   const [templatesModalOpen, setTemplatesModalOpen] = useState(false);
   const [templateSearch, setTemplateSearch] = useState("");
 
-  // Draft + sections
   const [cvSections, setCvSections] = useState<Record<CvSectionKey, boolean>>(DEFAULT_CV_SECTIONS);
   const [cvDraft, setCvDraft] = useState<CvDocModel | null>(null);
   const [cvDraftDirty, setCvDraftDirty] = useState(false);
 
-  // Preview blobs (no auto download)
   const [cvLastBlob, setCvLastBlob] = useState<Blob | null>(null);
   const [cvPreviewUrl, setCvPreviewUrl] = useState<string | null>(null);
 
@@ -857,8 +934,6 @@ export default function AssistanceCandidaturePage() {
   // Fullscreen modals
   const [cvEditorOpen, setCvEditorOpen] = useState(false);
   const [cvLmViewerOpen, setCvLmViewerOpen] = useState(false);
-
-  // ✅ Mobile CV editor view (edit / preview)
   const [cvMobileView, setCvMobileView] = useState<"edit" | "preview">("edit");
 
   // --- LM ---
@@ -897,18 +972,87 @@ export default function AssistanceCandidaturePage() {
   const [cvAutoCreate, setCvAutoCreate] = useState(true);
 
   // =============================
-  // ✅ Derived
+  // Load profile
   // =============================
-  const visibilityLabel = userId ? "Associé à ton compte" : "Invité";
-  const profileName = profile?.fullName || userEmail || "Profil non détecté";
-  const miniHeadline =
-    profile?.profileSummary?.split(".")[0] || profile?.contractType || "Analyse ton CV PDF dans « CV IA » pour activer l’assistant.";
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        setUserId(null);
+        setProfile(null);
+        setLoadingProfile(false);
+        return;
+      }
 
-  const targetedJob = jobTitle || cvTargetJob || "Poste cible non renseigné";
-  const targetedCompany = companyName || "Entreprise non renseignée";
+      setUserId(user.uid);
+
+      try {
+        const ref = doc(db, "profiles", user.uid);
+        const snap = await getDoc(ref);
+
+        if (snap.exists()) {
+          const data = snap.data() as any;
+
+          const loadedProfile: CvProfile = {
+            title: data.title || "",
+            fullName: data.fullName || "",
+            email: data.email || "",
+            phone: data.phone || "",
+            linkedin: data.linkedin || "",
+            profileSummary: data.profileSummary || "",
+            city: data.city || "",
+            address: data.address || "",
+            contractType: data.contractType || data.contractTypeStandard || "",
+            contractTypeStandard: data.contractTypeStandard || "",
+            contractTypeFull: data.contractTypeFull || "",
+            primaryDomain: data.primaryDomain || "",
+            secondaryDomains: Array.isArray(data.secondaryDomains) ? data.secondaryDomains : [],
+            softSkills: Array.isArray(data.softSkills) ? data.softSkills : [],
+            drivingLicense: data.drivingLicense || "",
+            vehicle: data.vehicle || "",
+            skills: {
+              sections: Array.isArray(data.skills?.sections) ? data.skills.sections : [],
+              tools: Array.isArray(data.skills?.tools) ? data.skills.tools : [],
+            },
+            experiences: Array.isArray(data.experiences) ? data.experiences : [],
+            education: Array.isArray(data.education) ? data.education : [],
+            educationShort: Array.isArray(data.educationShort) ? data.educationShort : [],
+            certs: data.certs || "",
+            langLine: data.langLine || "",
+            hobbies: Array.isArray(data.hobbies) ? data.hobbies : [],
+            updatedAt: typeof data.updatedAt === "number" ? data.updatedAt : undefined,
+          };
+
+          setProfile(loadedProfile);
+
+          // prefill titles
+          const detectedTitle = safeText(data.title);
+          if (detectedTitle) {
+            setCvTargetJob((v) => v || detectedTitle);
+            setJobTitle((v) => v || detectedTitle);
+          }
+        } else {
+          setProfile(null);
+        }
+      } catch (e) {
+        console.error("Erreur chargement profil Firestore:", e);
+      } finally {
+        setLoadingProfile(false);
+      }
+    });
+
+    return () => unsub();
+  }, []);
+
+  // =============================
+  // Derived
+  // =============================
+  const miniHeadline = profile?.profileSummary?.split(".")[0] || profile?.contractType || "Analyse ton CV PDF dans « CV IA » pour activer l’assistant.";
+
+  const targetedJob = jobTitle || cvTargetJob || "Poste cible";
+  const targetedCompany = companyName || "Entreprise";
 
   const cvTemplates = useMemo(() => getCvTemplates(), []);
-  const colors = useMemo(() => makePdfColors(pdfBrand), [pdfBrand]);
+  const colors = useMemo(() => makePdfColors(normalizeHex(pdfBrand)), [pdfBrand]);
 
   const baseCvModel = useMemo(() => {
     if (!profile) return null;
@@ -946,63 +1090,7 @@ export default function AssistanceCandidaturePage() {
   }, [cvTemplates, templateSearch]);
 
   // =============================
-  // ✅ LocalStorage draft
-  // =============================
-  const cvStorageKey = useMemo(() => {
-    if (!userId) return null;
-    return `cvDraft:${userId}:${cvTemplate}:${cvLang}`;
-  }, [userId, cvTemplate, cvLang]);
-
-  const saveCvDraft = () => {
-    if (!cvStorageKey || !cvDraft) return;
-    const payload = { cvDraft, cvSections, pdfBrand };
-    localStorage.setItem(cvStorageKey, JSON.stringify(payload));
-  };
-
-  const loadCvDraft = () => {
-    if (!cvStorageKey) return;
-    const raw = localStorage.getItem(cvStorageKey);
-    if (!raw) return;
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed?.cvDraft) {
-        setCvDraft(parsed.cvDraft);
-        setCvDraftDirty(true);
-      }
-      if (parsed?.cvSections) setCvSections(parsed.cvSections);
-      if (parsed?.pdfBrand) setPdfBrand(parsed.pdfBrand);
-    } catch {
-      // ignore
-    }
-  };
-
-  const clearCvDraft = () => {
-    if (!cvStorageKey) return;
-    localStorage.removeItem(cvStorageKey);
-  };
-
-  useEffect(() => {
-    if (!cvStorageKey) return;
-    if (!profile) return;
-    if (cvDraftDirty) return;
-    const raw = localStorage.getItem(cvStorageKey);
-    if (!raw) return;
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed?.cvDraft) {
-        setCvDraft(parsed.cvDraft);
-        setCvDraftDirty(true);
-      }
-      if (parsed?.cvSections) setCvSections(parsed.cvSections);
-      if (parsed?.pdfBrand) setPdfBrand(parsed.pdfBrand);
-    } catch {
-      // ignore
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cvStorageKey, profile]);
-
-  // =============================
-  // ✅ Build final model
+  // Build final CV model
   // =============================
   const buildFinalCvModel = () => {
     const m = (cvDraft || baseCvModel) as CvDocModel;
@@ -1019,10 +1107,8 @@ export default function AssistanceCandidaturePage() {
   };
 
   // =============================
-  // ✅ Firestore: create application (on DOWNLOAD only)
+  // Firestore: auto create
   // =============================
-  type GenerationKind = "cv" | "cv_lm" | "lm" | "pitch";
-
   const autoCreateApplication = async (kind: GenerationKind) => {
     if (!cvAutoCreate) return;
     if (!userId || !profile) return;
@@ -1046,12 +1132,12 @@ export default function AssistanceCandidaturePage() {
         langPitch: pitchLang,
       });
     } catch (e) {
-      console.error("Erreur création entrée suivi de candidature :", e);
+      console.error("Erreur création entrée suivi candidature:", e);
     }
   };
 
   // =============================
-  // ✅ PREVIEW CV (NO DOWNLOAD)
+  // CV preview (no download)
   // =============================
   const prepareCvPreview = async (): Promise<Blob | null> => {
     if (!profile || !baseCvModel) {
@@ -1062,21 +1148,20 @@ export default function AssistanceCandidaturePage() {
     setCvError(null);
     setCvStatus(null);
     setCvLoading(true);
-    setGlobalLoadingMessage("Préparation aperçu CV (1 page)…");
+    setGlobalLoadingMessage("Aperçu CV…");
 
     try {
       const cvModel = buildFinalCvModel();
       const { blob, bestScale } = await fitOnePage((scale) => buildCvPdf(cvTemplate, cvModel, cvLang, colors, "auto", scale));
 
       setCvLastBlob(blob);
-
       const nextUrl = URL.createObjectURL(blob);
       setCvPreviewUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return nextUrl;
       });
 
-      setCvStatus(`Aperçu CV prêt ✅ (scale=${bestScale.toFixed(2)})`);
+      setCvStatus(`Aperçu prêt ✅ (scale=${bestScale.toFixed(2)})`);
       return blob;
     } catch (err: any) {
       console.error("Erreur preview CV:", err);
@@ -1088,21 +1173,22 @@ export default function AssistanceCandidaturePage() {
     }
   };
 
-  // ✅ Download CV (USER CLICK ONLY) + IA option (Cloud Function)
+  // =============================
+  // Download CV (click)
+  // =============================
   const downloadCv = async () => {
     if (!profile || !baseCvModel) {
       setCvError("Aucun profil CV IA détecté. Va d'abord dans l'onglet CV IA.");
       return;
     }
 
-    // ✅ si IA activée + offre fournie → Cloud Function (CV adapté)
     if (cvUseAiOptimizeOnDownload && cvOfferDescription.trim()) {
       try {
         const user = auth.currentUser;
         if (!user) throw new Error("Connecte-toi pour télécharger un CV adapté.");
 
         setCvError(null);
-        setGlobalLoadingMessage("Adaptation du CV à l’offre (IA)…");
+        setGlobalLoadingMessage("CV adapté à l’offre (IA)…");
         const idToken = await user.getIdToken();
         const recaptchaToken = await getRecaptchaToken("generate_cv_pdf");
 
@@ -1137,7 +1223,6 @@ export default function AssistanceCandidaturePage() {
       }
     }
 
-    // ✅ sinon : téléchargement du PDF local (preview)
     const blob = cvLastBlob ?? (await prepareCvPreview());
     if (!blob) return;
 
@@ -1156,13 +1241,11 @@ export default function AssistanceCandidaturePage() {
   };
 
   // =============================
-  // ✅ Generate letter text (AI) (Cloud Functions)
+  // Letter text (AI)
   // =============================
   const generateCoverLetterText = async (lang: Lang): Promise<string> => {
     if (!profile) throw new Error("Profil manquant.");
-    if (!jobTitle && !jobDescription) {
-      throw new Error("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
-    }
+    if (!jobTitle && !jobDescription) throw new Error("Ajoute au moins l'intitulé du poste ou un extrait de la description.");
 
     const user = auth.currentUser;
     if (!user) throw new Error("Vous devez être connecté pour générer une lettre.");
@@ -1199,7 +1282,7 @@ export default function AssistanceCandidaturePage() {
   };
 
   // =============================
-  // ✅ PREVIEW LM (NO DOWNLOAD)
+  // LM preview (no download)
   // =============================
   const prepareLmPreview = async (opts?: { ensureText?: boolean }): Promise<Blob | null> => {
     if (!profile) {
@@ -1208,15 +1291,14 @@ export default function AssistanceCandidaturePage() {
     }
 
     setLmPdfError(null);
-    setLmLoading(false);
     setLmPdfLoading(true);
-    setGlobalLoadingMessage("Préparation aperçu LM (1 page)…");
+    setGlobalLoadingMessage("Aperçu LM…");
 
     try {
       let cover = letterBody?.trim();
 
       if (opts?.ensureText && !cover) {
-        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
+        setGlobalLoadingMessage("Texte lettre (IA)…");
         cover = await generateCoverLetterText(lmLang);
         setLetterBody(cover);
       }
@@ -1224,7 +1306,6 @@ export default function AssistanceCandidaturePage() {
       if (!cover) throw new Error("Texte de lettre vide. Génère ou colle un texte.");
 
       const lmModel: LmModel = buildLmModel(profile, lmLang, companyName, jobTitle, cover);
-
       const { blob } = await fitOnePage((scale) => buildLmStyledPdf(lmModel, colors as any, scale), {
         min: 0.85,
         max: 1.6,
@@ -1250,7 +1331,7 @@ export default function AssistanceCandidaturePage() {
     }
   };
 
-  // ✅ Download LM (USER CLICK ONLY)
+  // Download LM
   const downloadLm = async () => {
     const blob = lmLastBlob ?? (await prepareLmPreview({ ensureText: true }));
     if (!blob) return;
@@ -1270,7 +1351,7 @@ export default function AssistanceCandidaturePage() {
   };
 
   // =============================
-  // ✅ PREVIEW CV+LM merged (NO DOWNLOAD)
+  // CV+LM preview + download
   // =============================
   const prepareCvLmPreview = async (): Promise<Blob | null> => {
     if (!profile || !baseCvModel) {
@@ -1281,17 +1362,15 @@ export default function AssistanceCandidaturePage() {
     setCvError(null);
     setCvStatus(null);
     setCvLoading(true);
-    setGlobalLoadingMessage("Préparation aperçu CV + LM (2 pages)…");
+    setGlobalLoadingMessage("Aperçu CV+LM…");
 
     try {
-      // CV
       const cvModel = buildFinalCvModel();
       const cvFit = await fitOnePage((scale) => buildCvPdf(cvTemplate, cvModel, cvLang, colors, "auto", scale));
 
-      // LM (ensure text)
       let cover = letterBody?.trim();
       if (!cover) {
-        setGlobalLoadingMessage("Génération du texte de la lettre (IA)…");
+        setGlobalLoadingMessage("Texte lettre (IA)…");
         cover = await generateCoverLetterText(lmLang);
         setLetterBody(cover);
       }
@@ -1303,7 +1382,6 @@ export default function AssistanceCandidaturePage() {
         initial: 1.0,
       });
 
-      // merge
       const merged = await mergePdfBlobs([cvFit.blob, lmFit.blob]);
       setCvLmLastBlob(merged);
 
@@ -1325,7 +1403,6 @@ export default function AssistanceCandidaturePage() {
     }
   };
 
-  // ✅ Download CV+LM (USER CLICK ONLY)
   const downloadCvLm = async () => {
     const blob = cvLmLastBlob ?? (await prepareCvLmPreview());
     if (!blob) return;
@@ -1345,7 +1422,7 @@ export default function AssistanceCandidaturePage() {
   };
 
   // =============================
-  // ✅ CV editor: debounce auto preview
+  // Debounced auto preview in editors
   // =============================
   const cvPreviewTimer = useRef<number | null>(null);
   useEffect(() => {
@@ -1355,7 +1432,7 @@ export default function AssistanceCandidaturePage() {
     if (cvPreviewTimer.current) window.clearTimeout(cvPreviewTimer.current);
     cvPreviewTimer.current = window.setTimeout(() => {
       prepareCvPreview();
-    }, 450);
+    }, 420);
 
     return () => {
       if (cvPreviewTimer.current) window.clearTimeout(cvPreviewTimer.current);
@@ -1363,9 +1440,6 @@ export default function AssistanceCandidaturePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cvEditorOpen, cvDraft, cvSections, cvTemplate, cvLang, colors]);
 
-  // =============================
-  // ✅ LM editor: debounce auto preview
-  // =============================
   const lmPreviewTimer = useRef<number | null>(null);
   useEffect(() => {
     if (!lmEditorOpen) return;
@@ -1374,7 +1448,7 @@ export default function AssistanceCandidaturePage() {
     if (lmPreviewTimer.current) window.clearTimeout(lmPreviewTimer.current);
     lmPreviewTimer.current = window.setTimeout(() => {
       prepareLmPreview({ ensureText: false });
-    }, 450);
+    }, 420);
 
     return () => {
       if (lmPreviewTimer.current) window.clearTimeout(lmPreviewTimer.current);
@@ -1383,7 +1457,7 @@ export default function AssistanceCandidaturePage() {
   }, [lmEditorOpen, letterBody, lmLang, colors, companyName, jobTitle]);
 
   // =============================
-  // ✅ Generate LM text (button)
+  // Generate LM (button)
   // =============================
   const handleGenerateLetter = async (e?: FormEvent) => {
     if (e) e.preventDefault();
@@ -1400,7 +1474,7 @@ export default function AssistanceCandidaturePage() {
     setLmPdfError(null);
     setPitchError(null);
     setLmLoading(true);
-    setGlobalLoadingMessage("L’IA rédige ta lettre de motivation…");
+    setGlobalLoadingMessage("Lettre (IA)…");
 
     try {
       const coverLetterBody = await generateCoverLetterText(lmLang);
@@ -1417,7 +1491,7 @@ export default function AssistanceCandidaturePage() {
   };
 
   // =============================
-  // ✅ Pitch (Cloud Functions)
+  // Pitch
   // =============================
   const handleGeneratePitch = async () => {
     if (!profile) {
@@ -1431,7 +1505,7 @@ export default function AssistanceCandidaturePage() {
     setPitchError(null);
     setPitchLoading(true);
     setPitchCopied(false);
-    setGlobalLoadingMessage("L’IA prépare ton pitch d’ascenseur…");
+    setGlobalLoadingMessage("Pitch (IA)…");
 
     try {
       const user = auth.currentUser;
@@ -1476,14 +1550,14 @@ export default function AssistanceCandidaturePage() {
     try {
       await navigator.clipboard.writeText(pitchText);
       setPitchCopied(true);
-      setTimeout(() => setPitchCopied(false), 1500);
+      setTimeout(() => setPitchCopied(false), 1200);
     } catch (e) {
       console.error("Erreur copie pitch:", e);
     }
   };
 
   // =============================
-  // ✅ Mail (plus propre + ton au choix)
+  // Mail
   // =============================
   const buildEmailContent = () => {
     const name = profile?.fullName || "";
@@ -1547,539 +1621,730 @@ ${name || "—"}
     try {
       await navigator.clipboard.writeText(text);
       setEmailCopied(true);
-      setTimeout(() => setEmailCopied(false), 1500);
+      setTimeout(() => setEmailCopied(false), 1200);
     } catch (e) {
       console.error("Erreur copie email:", e);
     }
   };
 
   // =============================
-  // UI
+  // LocalStorage CV draft (optionnel)
   // =============================
+  const cvStorageKey = useMemo(() => {
+    if (!userId) return null;
+    return `cvDraft:${userId}:${cvTemplate}:${cvLang}`;
+  }, [userId, cvTemplate, cvLang]);
+
+  const saveCvDraft = () => {
+    if (!cvStorageKey || !cvDraft) return;
+    const payload = { cvDraft, cvSections, pdfBrand };
+    localStorage.setItem(cvStorageKey, JSON.stringify(payload));
+  };
+  const loadCvDraft = () => {
+    if (!cvStorageKey) return;
+    const raw = localStorage.getItem(cvStorageKey);
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed?.cvDraft) {
+        setCvDraft(parsed.cvDraft);
+        setCvDraftDirty(true);
+      }
+      if (parsed?.cvSections) setCvSections(parsed.cvSections);
+      if (parsed?.pdfBrand) setPdfBrand(parsed.pdfBrand);
+    } catch {
+      // ignore
+    }
+  };
+  const clearCvDraft = () => {
+    if (!cvStorageKey) return;
+    localStorage.removeItem(cvStorageKey);
+  };
+
+  // =============================
+  // RENDER
+  // =============================
+  if (loadingProfile) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-[#020617] text-slate-200">
+        <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
+      </div>
+    );
+  }
+
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.25 }}
-      className="max-w-3xl mx-auto px-3 sm:px-4 py-5 sm:py-6 space-y-4"
-    >
-      {/* Bandeau global */}
-      {globalLoadingMessage && (
-        <div className="mb-2 rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-1.5 text-[11px] flex items-center gap-2 text-[var(--muted)]">
-          <span className="inline-flex w-3 h-3 rounded-full border-2 border-[var(--brand)] border-t-transparent animate-spin" />
-          <span>{globalLoadingMessage}</span>
-        </div>
-      )}
+    <div className="h-screen overflow-hidden bg-[#020617] text-slate-200 font-sans selection:bg-blue-500/30 p-3 lg:p-4">
+      {/* Minimal CSS (keeps file standalone even if your global classes are missing) */}
+      <style jsx global>{`
+        :root {
+          --bg: #0b1220;
+          --bg-soft: rgba(15, 23, 42, 0.72);
+          --ink: #e5e7eb;
+          --muted: rgba(148, 163, 184, 0.9);
+          --border: rgba(148, 163, 184, 0.18);
+          --brand: #3b82f6;
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 10px;
+          height: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: rgba(255, 255, 255, 0.08);
+          border-radius: 999px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: rgba(255, 255, 255, 0.02);
+        }
+        .input {
+          border: 1px solid var(--border);
+          background: rgba(2, 6, 23, 0.6);
+          color: var(--ink);
+          border-radius: 12px;
+          padding: 10px 12px;
+          font-size: 12px;
+          outline: none;
+        }
+        .input:focus {
+          border-color: rgba(59, 130, 246, 0.55);
+        }
+        .textarea {
+          resize: none;
+        }
+        .btn-primary {
+          border-radius: 12px;
+          background: var(--brand);
+          color: white;
+          border: 1px solid rgba(59, 130, 246, 0.5);
+          padding: 10px 12px;
+          font-weight: 800;
+          font-size: 12px;
+        }
+        .btn-primary:hover {
+          filter: brightness(1.08);
+        }
+        .btn-secondary {
+          border-radius: 12px;
+          background: rgba(255, 255, 255, 0.04);
+          color: var(--ink);
+          border: 1px solid var(--border);
+          padding: 10px 12px;
+          font-weight: 800;
+          font-size: 12px;
+        }
+        .btn-secondary:hover {
+          background: rgba(255, 255, 255, 0.07);
+        }
+      `}</style>
 
-      {/* HEADER */}
-      <section className="space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="badge-muted flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-            <span className="text-[11px] uppercase tracking-wider text-[var(--muted)]">Assistant de candidature IA</span>
-          </p>
-          <div className="flex flex-wrap gap-2 text-[11px]">
-            <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
-              Profil IA :{" "}
-              <span className="ml-1 font-medium">{loadingProfile ? "Chargement…" : profile ? "Détecté ✅" : "Non détecté"}</span>
-            </span>
-            <span className="inline-flex items-center rounded-full border border-[var(--border)] px-2 py-[2px]">
-              Visibilité : <span className="ml-1 font-medium">{visibilityLabel}</span>
-            </span>
-          </div>
-        </div>
-
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="space-y-1">
-            <h1 className="text-lg sm:text-xl font-semibold">Prépare ta candidature avec ton CV IA</h1>
-            <p className="text-[12px] text-[var(--muted)] max-w-xl">
-              Prévisualise et édite avant de télécharger : <strong>CV</strong>, <strong>lettre</strong>, <strong>pitch</strong>,{" "}
-              <strong>mail</strong>. <span className="font-medium">Aucun téléchargement automatique.</span>
-            </p>
-          </div>
-
-          <div className="w-full sm:w-[220px] rounded-2xl border border-[var(--border)] bg-[var(--bg-soft)] px-3 py-2.5 text-[11px]">
-            <p className="text-[var(--muted)] mb-1">Résumé du profil</p>
-            <p className="font-semibold text-[var(--ink)] leading-tight">{profileName}</p>
-            <p className="mt-0.5 text-[var(--muted)] line-clamp-2">{miniHeadline}</p>
-          </div>
-        </div>
-      </section>
-
-      {/* ÉTAPE 1 : CV */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-              Étape 1
-            </span>
-            <div>
-              <h2 className="text-base sm:text-lg font-semibold text-[var(--ink)]">CV IA – Aperçu + Édition + Téléchargement</h2>
-              <p className="text-[11px] text-[var(--muted)]">Le PDF s’affiche sans toolbar Chrome (viewer interne).</p>
+      <div className="max-w-7xl mx-auto h-full min-h-0 grid lg:grid-cols-[360px,1fr] gap-4">
+        {/* LEFT / CONFIG */}
+        <motion.aside initial={{ opacity: 0, x: -14 }} animate={{ opacity: 1, x: 0 }} className="flex flex-col gap-3 min-h-0">
+          {/* Compact header card */}
+          <CyberCard className="bg-slate-900/75 p-4">
+            <div className="flex items-center gap-3">
+              <div className="h-9 w-9 rounded-lg bg-blue-600 flex items-center justify-center shadow-lg shadow-blue-900/30">
+                <PenTool className="text-white h-4 w-4" />
+              </div>
+              <div className="min-w-0">
+                <h1 className="text-[16px] font-bold text-white tracking-tight leading-tight truncate">Assistant Candidature</h1>
+                <p className="text-[9px] font-mono text-blue-400 uppercase tracking-widest">CV • LM • Pitch • Mail</p>
+              </div>
             </div>
-          </div>
-        </div>
 
-        <div className="space-y-3 text-[13px]">
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Titre / objectif du CV</label>
-            <input
-              id="cvTargetJob"
-              type="text"
-              className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-              placeholder="Ex : Ingénieur Cybersécurité"
-              value={cvTargetJob}
-              onChange={(e) => setCvTargetJob(e.target.value)}
-            />
-          </div>
-
-          {/* ✅ Offre + switch IA CV */}
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Description de l’offre (pour adapter le CV au poste)</label>
-            <textarea
-              rows={4}
-              className="input textarea w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-              placeholder="Colle ici 5–20 lignes: missions, outils, contexte…"
-              value={cvOfferDescription}
-              onChange={(e) => setCvOfferDescription(e.target.value)}
-            />
-            <label className="mt-2 flex items-center gap-2 cursor-pointer text-[12px]">
-              <input
-                type="checkbox"
-                className="toggle-checkbox"
-                checked={cvUseAiOptimizeOnDownload}
-                onChange={(e) => setCvUseAiOptimizeOnDownload(e.target.checked)}
-              />
-              <span className="text-[var(--muted)]">
-                Adapter le CV via IA <strong>au téléchargement</strong> (consomme des crédits).
-              </span>
-            </label>
-          </div>
-
-          {/* Templates top3 + modal */}
-          <div className="space-y-2">
-            <div className="flex items-end justify-between gap-2">
-              <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Modèle (top 3)</label>
-                <p className="text-[10px] text-[var(--muted)]">
-                  Clique un modèle. Pour tous les modèles → <span className="font-medium">Plus</span>.
+            <div className="mt-3 grid grid-cols-1 gap-2">
+              <div className="rounded-xl border border-white/10 bg-slate-950/40 px-3 py-2">
+                <p className="text-[9px] text-slate-500 uppercase tracking-widest font-bold">Cible</p>
+                <p className="text-[12px] text-slate-200 mt-1 truncate">
+                  🎯 <span className="font-semibold">{targetedJob}</span>
                 </p>
+                <p className="text-[12px] text-slate-200 truncate">
+                  🏢 <span className="font-semibold">{targetedCompany}</span>
+                </p>
+                {miniHeadline ? <p className="mt-2 text-[11px] text-slate-500 line-clamp-2">{miniHeadline}</p> : null}
               </div>
 
-              <button type="button" onClick={() => setTemplatesModalOpen(true)} className="btn-secondary !py-1.5 !px-3 text-[11px]">
-                + Plus
-              </button>
-            </div>
+              {globalLoadingMessage ? (
+                <div className="rounded-xl border border-white/10 bg-slate-950/40 px-3 py-2 flex items-center gap-2">
+                  <span className="inline-flex w-3.5 h-3.5 rounded-full border-2 border-blue-500/30 border-t-blue-400 animate-spin" />
+                  <p className="text-[11px] text-slate-300 font-mono truncate">{globalLoadingMessage}</p>
+                </div>
+              ) : null}
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              {top3Templates.map((t) => {
-                const active = t.id === cvTemplate;
-                return (
-                  <button
-                    key={t.id}
-                    type="button"
-                    onClick={() => setCvTemplate(t.id)}
-                    className={`text-left rounded-2xl border p-2 bg-[var(--bg-soft)] transition ${
-                      active ? "border-[var(--brand)] ring-2 ring-[var(--brand)]/20" : "border-[var(--border)] hover:border-[var(--brand)]/50"
-                    }`}
-                  >
-                    <img
-                      src={t.previewSrc}
-                      alt={t.label}
-                      className="w-full h-[150px] object-cover rounded-xl border border-[var(--border)] bg-white"
-                      loading="lazy"
-                    />
-                    <div className="mt-2">
-                      <p className="text-[12px] font-semibold text-[var(--ink)] flex items-center justify-between gap-2">
-                        <span>{t.label}</span>
-                        {active && (
-                          <span className="text-[10px] px-2 py-[2px] rounded-full bg-[var(--brand)]/10 text-[var(--brand)] border border-[var(--brand)]/20">
-                            Sélectionné
-                          </span>
-                        )}
-                      </p>
-                      <p className="text-[10px] text-[var(--muted)] line-clamp-2">{t.description}</p>
+              {!profile ? (
+                <CyberCallout kind="info">
+                  Aucun profil CV IA détecté. Passe d’abord par <span className="font-semibold">CV IA</span> pour charger ton profil.
+                </CyberCallout>
+              ) : null}
+            </div>
+          </CyberCard>
+
+          {/* Mobile pane switch (one-screen) */}
+          <div className="lg:hidden">
+            <CyberPillTabs
+              value={mobilePane}
+              onChange={setMobilePane}
+              items={[
+                { key: "config", label: "Config", icon: <Briefcase className="h-4 w-4" /> },
+                { key: "preview", label: "Aperçu", icon: <FileText className="h-4 w-4" /> },
+              ]}
+            />
+          </div>
+
+          {/* Tabs */}
+          <CyberCard className="p-3">
+            <CyberPillTabs
+              value={viewMode}
+              onChange={(v) => {
+                setViewMode(v);
+                setMobilePane("config");
+              }}
+              items={[
+                { key: "cv_lm", label: "CV + LM", icon: <FileText className="h-4 w-4" /> },
+                { key: "pitch", label: "PITCH", icon: <Sparkles className="h-4 w-4" /> },
+                { key: "mail", label: "MAIL", icon: <Mail className="h-4 w-4" /> },
+              ]}
+            />
+          </CyberCard>
+
+          {/* Forms (scroll INSIDE) */}
+          <CyberCard className={["flex-1 min-h-0 overflow-y-auto custom-scrollbar", mobilePane === "preview" ? "hidden lg:block" : ""].join(" ")}>
+            <AnimatePresence mode="wait" initial={false}>
+              {viewMode === "cv_lm" && (
+                <motion.div
+                  key="cv_lm"
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -6 }}
+                  transition={{ duration: 0.16 }}
+                  className="space-y-5"
+                >
+                  {/* CV CONFIG */}
+                  <div>
+                    <CyberSectionTitle icon={<Briefcase className="h-4 w-4 text-emerald-400" />} title="CV" subtitle="Aperçu interne + éditeur." />
+                    <div className="space-y-3">
+                      <CyberInput label="Titre / objectif" value={cvTargetJob} onChange={setCvTargetJob} placeholder="Ex: Ingénieur Cybersécurité" />
+
+                      <CyberInput
+                        label="Offre (option IA au téléchargement)"
+                        value={cvOfferDescription}
+                        onChange={setCvOfferDescription}
+                        placeholder="Colle 5–20 lignes (missions, outils, contexte)…"
+                        area
+                        rows={4}
+                      />
+
+                      <label className="flex items-center gap-2 text-xs text-slate-400 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={cvUseAiOptimizeOnDownload}
+                          onChange={(e) => setCvUseAiOptimizeOnDownload(e.target.checked)}
+                          className="accent-blue-500"
+                        />
+                        Adapter via IA au téléchargement
+                      </label>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Langue</label>
+                          <select
+                            className="w-full mt-1 bg-slate-950/50 border border-white/10 rounded-xl px-3 py-2 text-xs text-slate-200 focus:border-blue-500/50 outline-none"
+                            value={cvLang}
+                            onChange={(e) => setCvLang(e.target.value as Lang)}
+                          >
+                            <option value="fr">FR</option>
+                            <option value="en">EN</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Contrat</label>
+                          <select
+                            className="w-full mt-1 bg-slate-950/50 border border-white/10 rounded-xl px-3 py-2 text-xs text-slate-200 focus:border-blue-500/50 outline-none"
+                            value={cvContract}
+                            onChange={(e) => setCvContract(e.target.value)}
+                          >
+                            <option value="CDI">CDI</option>
+                            <option value="CDD">CDD</option>
+                            <option value="Alternance">Alternance</option>
+                            <option value="Stage">Stage</option>
+                            <option value="Freelance">Freelance</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Couleur PDF</label>
+                        <div className="flex items-center gap-2 mt-1">
+                          <input type="color" value={normalizeHex(pdfBrand)} onChange={(e) => setPdfBrand(e.target.value)} className="h-9 w-11 rounded-xl border border-white/10 bg-slate-950/50" />
+                          <input value={pdfBrand} onChange={(e) => setPdfBrand(e.target.value)} className="flex-1 input" placeholder="#3b82f6" />
+                        </div>
+                      </div>
+
+                      <label className="flex items-center gap-2 text-xs text-slate-400 cursor-pointer">
+                        <input type="checkbox" checked={cvAutoCreate} onChange={(e) => setCvAutoCreate(e.target.checked)} className="accent-blue-500" />
+                        Créer une entrée “Suivi 📌” au téléchargement
+                      </label>
+
+                      {/* Templates compact */}
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/30 p-3 space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Modèles</p>
+                          <button
+                            type="button"
+                            onClick={() => setTemplatesModalOpen(true)}
+                            className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-bold text-slate-200 transition"
+                          >
+                            + Plus
+                          </button>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2">
+                          {top3Templates.map((t) => {
+                            const active = t.id === cvTemplate;
+                            return (
+                              <button
+                                key={t.id}
+                                type="button"
+                                onClick={() => setCvTemplate(t.id)}
+                                className={[
+                                  "rounded-xl border overflow-hidden transition text-left bg-slate-950/40",
+                                  active ? "border-blue-500/60 ring-2 ring-blue-500/20" : "border-white/10 hover:border-white/20",
+                                ].join(" ")}
+                              >
+                                <img src={t.previewSrc} alt={t.label} className="w-full h-[70px] object-cover bg-white" loading="lazy" />
+                                <div className="p-2">
+                                  <p className="text-[10px] font-bold text-slate-200 truncate">{t.label}</p>
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await prepareCvPreview();
+                            setCvMobileView("edit");
+                            setCvEditorOpen(true);
+                          }}
+                          disabled={cvLoading || !profile}
+                          className="h-10 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-extrabold shadow-lg shadow-blue-900/30 flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <PenTool className="h-4 w-4" />
+                          Éditer
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await prepareCvLmPreview();
+                            setCvLmViewerOpen(true);
+                          }}
+                          disabled={cvLoading || !profile}
+                          className="h-10 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 font-extrabold flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <FileText className="h-4 w-4" />
+                          2p
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={downloadCv}
+                          disabled={cvLoading || !profile}
+                          className="h-10 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 font-extrabold flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <Download className="h-4 w-4" />
+                          CV
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={downloadCvLm}
+                          disabled={cvLoading || !profile}
+                          className="h-10 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-extrabold shadow-lg shadow-blue-900/30 flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <Download className="h-4 w-4" />
+                          CV+LM
+                        </button>
+                      </div>
+
+                      {cvError ? <CyberCallout kind="error">{cvError}</CyberCallout> : null}
+                      {cvStatus ? <CyberCallout kind="success">{cvStatus}</CyberCallout> : null}
                     </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+                  </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Langue</label>
-              <select
-                id="cvLang"
-                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
-                value={cvLang}
-                onChange={(e) => setCvLang(e.target.value as Lang)}
+                  <div className="h-px bg-white/5" />
+
+                  {/* LM CONFIG */}
+                  <div>
+                    <CyberSectionTitle icon={<FileText className="h-4 w-4 text-blue-400" />} title="Lettre (IA)" subtitle="Génère → édite → PDF." />
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Langue</span>
+                        <div className="flex bg-slate-950 rounded-lg p-1 border border-white/10">
+                          <button
+                            type="button"
+                            onClick={() => setLmLang("fr")}
+                            className={[
+                              "px-3 py-1 rounded-md text-[10px] font-bold transition-all",
+                              lmLang === "fr" ? "bg-white text-slate-900" : "text-slate-500 hover:text-white",
+                            ].join(" ")}
+                          >
+                            FR
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setLmLang("en")}
+                            className={[
+                              "px-3 py-1 rounded-md text-[10px] font-bold transition-all",
+                              lmLang === "en" ? "bg-white text-slate-900" : "text-slate-500 hover:text-white",
+                            ].join(" ")}
+                          >
+                            EN
+                          </button>
+                        </div>
+                      </div>
+
+                      <CyberInput label="Entreprise" value={companyName} onChange={setCompanyName} placeholder="Ex: Thales, Doctolib…" />
+                      <CyberInput label="Poste" value={jobTitle} onChange={setJobTitle} placeholder="Ex: Ingénieur Réseaux & Sécurité" />
+                      <CyberInput label="Offre (optionnel)" value={jobDescription} onChange={setJobDescription} placeholder="Missions / outils / contexte…" area rows={4} />
+                      <CyberInput label="Lien (optionnel)" value={jobLink} onChange={setJobLink} placeholder="https://" type="url" />
+
+                      <button
+                        type="button"
+                        onClick={() => handleGenerateLetter()}
+                        disabled={lmLoading || !profile}
+                        className="w-full h-11 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-extrabold shadow-lg shadow-blue-900/30 flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {lmLoading ? <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                        {lmLoading ? "GÉNÉRATION..." : "GÉNÉRER"}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          setLmEditorOpen(true);
+                          await prepareLmPreview({ ensureText: true });
+                        }}
+                        disabled={lmPdfLoading || !profile}
+                        className="w-full h-10 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 font-extrabold flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <PenTool className="h-4 w-4" />
+                        Éditeur LM
+                      </button>
+
+                      {lmError ? <CyberCallout kind="error">{lmError}</CyberCallout> : null}
+                      {lmPdfError ? <CyberCallout kind="error">{lmPdfError}</CyberCallout> : null}
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+
+              {viewMode === "pitch" && (
+                <motion.div
+                  key="pitch"
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -6 }}
+                  transition={{ duration: 0.16 }}
+                  className="space-y-4"
+                >
+                  <CyberSectionTitle icon={<Sparkles className="h-4 w-4 text-blue-400" />} title="Pitch" subtitle="2–4 phrases, prêt entretien." />
+
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Langue</span>
+                    <div className="flex bg-slate-950 rounded-lg p-1 border border-white/10">
+                      <button
+                        type="button"
+                        onClick={() => setPitchLang("fr")}
+                        className={[
+                          "px-3 py-1 rounded-md text-[10px] font-bold transition-all",
+                          pitchLang === "fr" ? "bg-white text-slate-900" : "text-slate-500 hover:text-white",
+                        ].join(" ")}
+                      >
+                        FR
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPitchLang("en")}
+                        className={[
+                          "px-3 py-1 rounded-md text-[10px] font-bold transition-all",
+                          pitchLang === "en" ? "bg-white text-slate-900" : "text-slate-500 hover:text-white",
+                        ].join(" ")}
+                      >
+                        EN
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={handleGeneratePitch}
+                      disabled={pitchLoading || !profile}
+                      className="h-10 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-extrabold shadow-lg shadow-blue-900/30 flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {pitchLoading ? <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                      Générer
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleCopyPitch}
+                      disabled={!pitchText}
+                      className="h-10 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 font-extrabold flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Copy className="h-4 w-4" />
+                      {pitchCopied ? "Copié" : "Copier"}
+                    </button>
+                  </div>
+
+                  {pitchError ? <CyberCallout kind="error">{pitchError}</CyberCallout> : null}
+                </motion.div>
+              )}
+
+              {viewMode === "mail" && (
+                <motion.div
+                  key="mail"
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -6 }}
+                  transition={{ duration: 0.16 }}
+                  className="space-y-4"
+                >
+                  <CyberSectionTitle icon={<Mail className="h-4 w-4 text-blue-400" />} title="Mail" subtitle="Objet + corps à copier." />
+
+                  <CyberInput label="Entreprise" value={companyName} onChange={setCompanyName} placeholder="Ex: IMOGATE" />
+                  <CyberInput label="Poste" value={jobTitle} onChange={setJobTitle} placeholder="Ex: Ingénieur Réseaux & Sécurité" />
+                  <CyberInput label="Recruteur (optionnel)" value={recruiterName} onChange={setRecruiterName} placeholder="Ex: Mme Dupont" />
+
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">Ton</label>
+                    <select
+                      className="w-full mt-1 bg-slate-950/50 border border-white/10 rounded-xl px-3 py-2 text-xs text-slate-200 focus:border-blue-500/50 outline-none"
+                      value={emailTone}
+                      onChange={(e) => setEmailTone(e.target.value as any)}
+                    >
+                      <option value="standard">Standard</option>
+                      <option value="pro">Très pro</option>
+                      <option value="court">Court</option>
+                    </select>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={(e: any) => handleGenerateEmail(e)}
+                      className="h-10 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-extrabold shadow-lg shadow-blue-900/30 flex items-center justify-center gap-2 transition-all"
+                    >
+                      <Send className="h-4 w-4" />
+                      Générer
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={copyEmailAll}
+                      disabled={!subjectPreview || !emailPreview}
+                      className="h-10 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 font-extrabold flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Copy className="h-4 w-4" />
+                      {emailCopied ? "Copié" : "Copier"}
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </CyberCard>
+        </motion.aside>
+
+        {/* RIGHT / PREVIEW */}
+        <motion.main
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.05 }}
+          className={[
+            "bg-slate-900/30 rounded-3xl border border-white/5 p-3 lg:p-4 relative overflow-hidden flex flex-col min-h-0",
+            mobilePane === "config" ? "hidden lg:flex" : "",
+          ].join(" ")}
+        >
+          <AnimatePresence mode="wait" initial={false}>
+            {viewMode === "cv_lm" && (
+              <motion.div
+                key="out_cv_lm"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.16 }}
+                className="flex flex-col h-full min-h-0 gap-3"
               >
-                <option value="fr">Français</option>
-                <option value="en">English</option>
-              </select>
-            </div>
+                <div className="flex items-center justify-between bg-slate-950/70 p-2.5 rounded-2xl border border-white/10">
+                  <div className="flex items-center gap-2 px-2 min-w-0">
+                    <div className="h-2 w-2 rounded-full bg-blue-500 shadow-[0_0_10px_rgba(59,130,246,0.5)]" />
+                    <span className="text-[11px] font-bold text-slate-300 uppercase tracking-wider truncate">Aperçu PDF</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={prepareCvPreview}
+                      disabled={cvLoading || !profile}
+                      className="p-2 rounded-lg hover:bg-white/5 text-slate-400 hover:text-white transition-colors disabled:opacity-50"
+                      title="Régénérer aperçu CV"
+                    >
+                      <RotateCcw className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={downloadCvLm}
+                      disabled={cvLoading || !profile}
+                      className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-[11px] font-bold text-white shadow-lg transition-colors disabled:opacity-50"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      CV+LM
+                    </button>
+                  </div>
+                </div>
 
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Contrat visé</label>
-              <select
-                id="cvContract"
-                className="select-brand w-full text-[var(--ink)] bg-[var(--bg-soft)]"
-                value={cvContract}
-                onChange={(e) => setCvContract(e.target.value)}
+                {globalLoadingMessage ? (
+                  <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-4">
+                    <div className="relative">
+                      <div className="h-20 w-20 rounded-full border-4 border-blue-500/20 border-t-blue-500 animate-spin" />
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <Sparkles className="h-7 w-7 text-blue-400 animate-pulse" />
+                      </div>
+                    </div>
+                    <div className="text-center space-y-1">
+                      <h2 className="text-[16px] font-bold text-white tracking-tight">{globalLoadingMessage}</h2>
+                      <p className="text-[12px] text-slate-500">Préparation…</p>
+                    </div>
+                  </div>
+                ) : cvLmPreviewUrl || cvPreviewUrl ? (
+                  <div className="flex-1 min-h-0 rounded-2xl overflow-hidden border border-white/10 bg-white">
+                    <PdfCanvasViewer fileUrl={cvLmPreviewUrl || cvPreviewUrl} className="h-full" />
+                  </div>
+                ) : (
+                  <div className="flex-1 min-h-0 flex flex-col items-center justify-center text-center opacity-50">
+                    <ArrowRight className="h-12 w-12 text-slate-600 mb-3" />
+                    <h3 className="text-[16px] font-bold text-white">Génère un aperçu</h3>
+                    <p className="text-[12px] text-slate-400 max-w-md mx-auto mt-1">Prépare un aperçu (CV ou CV+LM). Tu verras le rendu ici, sans toolbar Chrome.</p>
+                  </div>
+                )}
+              </motion.div>
+            )}
+
+            {viewMode === "pitch" && (
+              <motion.div
+                key="out_pitch"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.16 }}
+                className="flex flex-col h-full min-h-0 gap-3"
               >
-                <option value="CDI">CDI</option>
-                <option value="CDD">CDD</option>
-                <option value="Alternance">Alternance</option>
-                <option value="Stage">Stage</option>
-                <option value="Freelance">Freelance</option>
-              </select>
-            </div>
-          </div>
-
-          {/* Couleur */}
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Couleur PDF (CV + LM)</label>
-            <div className="flex items-center gap-2">
-              <input
-                type="color"
-                value={pdfBrand}
-                onChange={(e) => setPdfBrand(e.target.value)}
-                className="h-9 w-12 rounded-lg border border-[var(--border)] bg-[var(--bg-soft)]"
-                aria-label="Couleur du PDF"
-              />
-              <input
-                type="text"
-                value={pdfBrand}
-                onChange={(e) => setPdfBrand(e.target.value)}
-                className="input flex-1 text-[var(--ink)] bg-[var(--bg)]"
-                placeholder="#ef4444"
-              />
-            </div>
-          </div>
-
-          <div className="pt-1">
-            <label className="flex items-center gap-2 cursor-pointer text-[12px]">
-              <input
-                id="autoCreateSwitch"
-                type="checkbox"
-                className="toggle-checkbox"
-                checked={cvAutoCreate}
-                onChange={(e) => setCvAutoCreate(e.target.checked)}
-              />
-              <span className="text-[var(--muted)]">
-                Créer automatiquement une entrée dans le <strong>Suivi 📌</strong> lors des <strong>téléchargements</strong>.
-              </span>
-            </label>
-          </div>
-        </div>
-
-        <div className="flex flex-col sm:flex-row gap-2 pt-2">
-          <button
-            type="button"
-            onClick={async () => {
-              await prepareCvPreview();
-              setCvMobileView("edit");
-              setCvEditorOpen(true);
-            }}
-            disabled={cvLoading || !profile}
-            className="btn-primary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            {cvLoading ? "Préparation..." : "Ouvrir l’éditeur CV (plein écran)"}
-          </button>
-
-          <button
-            type="button"
-            onClick={async () => {
-              await prepareCvLmPreview();
-              setCvLmViewerOpen(true);
-            }}
-            disabled={cvLoading || !profile}
-            className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            {cvLoading ? "Préparation..." : "Préparer aperçu CV + LM (2 pages)"}
-          </button>
-        </div>
-
-        <div className="mt-2 p-2.5 rounded-md border border-dashed border-[var(--border)]/70 text-[11px] text-[var(--muted)]">
-          {cvStatus ? <p className="text-center text-emerald-400 text-[12px]">{cvStatus}</p> : <p className="text-center">Prépare un aperçu, vérifie dans l’éditeur, puis télécharge.</p>}
-          {cvError && <p className="mt-1 text-center text-red-400 text-[12px]">{cvError}</p>}
-
-          {cvPreviewUrl && (
-            <div className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--bg)] overflow-hidden">
-              <div className="flex flex-wrap items-center justify-between gap-2 p-2 border-b border-[var(--border)] bg-[var(--bg-soft)]">
-                <p className="text-[11px] text-[var(--muted)]">Aperçu CV prêt (sans toolbar Chrome)</p>
-                <div className="flex gap-2">
-                  <button type="button" className="btn-secondary !py-1 !px-3 text-[11px]" onClick={() => (setCvMobileView("edit"), setCvEditorOpen(true))}>
-                    Ouvrir l’éditeur
-                  </button>
-                  <button type="button" className="btn-primary !py-1 !px-3 text-[11px]" onClick={downloadCv}>
-                    Télécharger
+                <div className="flex items-center justify-between bg-slate-950/70 p-2.5 rounded-2xl border border-white/10">
+                  <div className="flex items-center gap-2 px-2">
+                    <div className="h-2 w-2 rounded-full bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)]" />
+                    <span className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">Pitch</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleCopyPitch}
+                    disabled={!pitchText}
+                    className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-[11px] font-bold text-slate-200 transition-colors disabled:opacity-50"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    {pitchCopied ? "Copié" : "Copier"}
                   </button>
                 </div>
-              </div>
-              <div className="p-3 text-[11px] text-[var(--muted)]">Ouvre l’éditeur pour modifier et vérifier avant téléchargement.</div>
-            </div>
-          )}
 
-          {cvLmPreviewUrl && (
-            <div className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--bg)] overflow-hidden">
-              <div className="flex flex-wrap items-center justify-between gap-2 p-2 border-b border-[var(--border)] bg-[var(--bg-soft)]">
-                <p className="text-[11px] text-[var(--muted)]">Aperçu CV + LM prêt (2 pages)</p>
-                <div className="flex gap-2">
-                  <button type="button" className="btn-secondary !py-1 !px-3 text-[11px]" onClick={() => setCvLmViewerOpen(true)}>
-                    Ouvrir l’aperçu
-                  </button>
-                  <button type="button" className="btn-primary !py-1 !px-3 text-[11px]" onClick={downloadCvLm}>
-                    Télécharger
+                <div className="flex-1 min-h-0 bg-slate-950 border border-white/10 rounded-2xl p-4 text-[13px] leading-relaxed text-slate-300 custom-scrollbar overflow-auto">
+                  {pitchLoading ? (
+                    <div className="h-full flex items-center justify-center gap-3 text-slate-400">
+                      <span className="h-4 w-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                      Génération…
+                    </div>
+                  ) : pitchText ? (
+                    <pre className="whitespace-pre-wrap font-sans">{pitchText}</pre>
+                  ) : (
+                    <div className="h-full flex items-center justify-center text-slate-500">Génère un pitch pour l’afficher ici.</div>
+                  )}
+                </div>
+              </motion.div>
+            )}
+
+            {viewMode === "mail" && (
+              <motion.div
+                key="out_mail"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.16 }}
+                className="flex flex-col h-full min-h-0 gap-3"
+              >
+                <div className="flex items-center justify-between bg-slate-950/70 p-2.5 rounded-2xl border border-white/10">
+                  <div className="flex items-center gap-2 px-2">
+                    <div className="h-2 w-2 rounded-full bg-blue-500 shadow-[0_0_10px_rgba(59,130,246,0.5)]" />
+                    <span className="text-[11px] font-bold text-slate-300 uppercase tracking-wider">Mail</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={copyEmailAll}
+                    disabled={!subjectPreview || !emailPreview}
+                    className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-[11px] font-bold text-white shadow-lg transition-colors disabled:opacity-50"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    {emailCopied ? "Copié" : "Copier"}
                   </button>
                 </div>
-              </div>
-              <div className="p-3 text-[11px] text-[var(--muted)]">Vérifie le PDF 2 pages avant de télécharger.</div>
-            </div>
-          )}
-        </div>
-      </section>
 
-      {/* ÉTAPE 2 : LM */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
-          <span>
-            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
-          </span>
-          <span>
-            🏢 <span className="font-medium text-[var(--ink)]">{targetedCompany}</span>
-          </span>
-        </div>
+                <div className="grid lg:grid-cols-2 gap-3 flex-1 min-h-0">
+                  <div className="bg-slate-950 border border-white/10 rounded-2xl p-4 overflow-auto custom-scrollbar">
+                    <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Objet</p>
+                    <div className="mt-2 text-[13px] text-slate-200 whitespace-pre-line">{subjectPreview || "Génère un mail pour voir l’objet."}</div>
+                  </div>
 
-        <form onSubmit={handleGenerateLetter} className="space-y-3">
-          <div className="flex items-start justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-                Étape 2
-              </span>
-              <div>
-                <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Lettre de motivation IA</h3>
-                <p className="text-[11px] text-[var(--muted)]">Génère → édite → prévisualise → télécharge (thème = CV).</p>
-              </div>
-            </div>
-            <select
-              id="lmLang"
-              className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]"
-              value={lmLang}
-              onChange={(e) => setLmLang(e.target.value as Lang)}
-            >
-              <option value="fr">FR</option>
-              <option value="en">EN</option>
-            </select>
-          </div>
+                  <div className="bg-slate-950 border border-white/10 rounded-2xl p-4 overflow-auto custom-scrollbar">
+                    <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Corps</p>
+                    <div className="mt-2 text-[13px] text-slate-200 whitespace-pre-line">{emailPreview || "Génère un mail pour voir le corps."}</div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </motion.main>
+      </div>
 
-          <div className="space-y-3 text-[13px]">
-            <div className="grid sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l'entreprise</label>
-                <input
-                  id="companyName"
-                  type="text"
-                  className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                  placeholder="Ex : IMOGATE"
-                  value={companyName}
-                  onChange={(e) => setCompanyName(e.target.value)}
-                />
-              </div>
-              <div>
-                <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
-                <input
-                  id="jobTitle"
-                  type="text"
-                  className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                  placeholder="Ex : Ingénieur Réseaux & Sécurité"
-                  value={jobTitle}
-                  onChange={(e) => setJobTitle(e.target.value)}
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Extraits de l'offre (optionnel)</label>
-              <textarea
-                id="jobDescription"
-                rows={3}
-                className="input textarea w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                placeholder="Colle quelques missions / outils / contexte."
-                value={jobDescription}
-                onChange={(e) => setJobDescription(e.target.value)}
-              />
-            </div>
-
-            <div>
-              <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Lien de l'offre (optionnel)</label>
-              <input
-                id="jobLink"
-                type="url"
-                className="input w-full text-[var(--ink)] bg-[var(--bg)] placeholder:text-[var(--muted)]"
-                placeholder="https://"
-                value={jobLink}
-                onChange={(e) => setJobLink(e.target.value)}
-              />
-            </div>
-
-            {lmError && <p className="text-[11px] text-red-400">{lmError}</p>}
-            {lmPdfError && <p className="text-[11px] text-red-400">{lmPdfError}</p>}
-
-            <div className="flex flex-col sm:flex-row gap-2 pt-1">
-              <button type="submit" disabled={lmLoading || !profile} className="btn-primary flex-1 disabled:opacity-60 disabled:cursor-not-allowed">
-                {lmLoading ? "Génération..." : "Générer la lettre (IA) + ouvrir éditeur"}
-              </button>
-
-              <button
-                type="button"
-                onClick={async () => {
-                  setLmEditorOpen(true);
-                  await prepareLmPreview({ ensureText: true });
-                }}
-                disabled={lmPdfLoading || !profile}
-                className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                {lmPdfLoading ? "Préparation..." : "Ouvrir éditeur LM (aperçu)"}
-              </button>
-            </div>
-          </div>
-        </form>
-      </section>
-
-      {/* ÉTAPE 3 : PITCH */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-3">
-        <div className="rounded-md bg-[var(--bg-soft)] border border-dashed border-[var(--border)]/70 px-3 py-2 text-[11px] text-[var(--muted)] flex flex-wrap gap-2 justify-between">
-          <span>
-            🎯 Poste ciblé : <span className="font-medium text-[var(--ink)]">{targetedJob}</span>
-          </span>
-          <span>🧩 Utilise ce pitch pour mails, LinkedIn et entretiens.</span>
-        </div>
-
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-              Étape 3
-            </span>
-            <div>
-              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Pitch d'ascenseur</h3>
-              <p className="text-[11px] text-[var(--muted)]">Résumé percutant de 2–4 phrases.</p>
-            </div>
-          </div>
-          <select className="select-brand w-[105px] text-[12px] text-[var(--ink)] bg-[var(--bg-soft)]" value={pitchLang} onChange={(e) => setPitchLang(e.target.value as Lang)}>
-            <option value="fr">FR</option>
-            <option value="en">EN</option>
-          </select>
-        </div>
-
-        {pitchError && <p className="text-[11px] text-red-400">{pitchError}</p>}
-
-        <div className="flex flex-col sm:flex-row gap-2 pt-1">
-          <button type="button" onClick={handleGeneratePitch} disabled={pitchLoading || !profile} className="btn-primary flex-1 disabled:opacity-60 disabled:cursor-not-allowed">
-            {pitchLoading ? "Génération..." : "Générer le pitch"}
-          </button>
-          <button type="button" onClick={handleCopyPitch} disabled={!pitchText} className="btn-secondary flex-1 disabled:opacity-60 disabled:cursor-not-allowed">
-            {pitchCopied ? "Copié ✅" : "Copier"}
-          </button>
-        </div>
-
-        <div className="mt-2 p-3 card-soft rounded-md text-[13px] text-[var(--ink)] whitespace-pre-line">
-          {pitchText ? <p>{pitchText}</p> : <p className="text-center text-[11px] text-[var(--muted)]">Après génération, ton pitch apparaîtra ici.</p>}
-        </div>
-      </section>
-
-      {/* ÉTAPE 4 : MAIL */}
-      <section className="glass border border-[var(--border)]/80 rounded-2xl p-4 sm:p-5 space-y-4">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center justify-center text-[10px] px-2 py-[2px] rounded-full bg-[var(--bg-soft)] border border-[var(--border)]/80 text-[var(--muted)]">
-              Étape 4
-            </span>
-            <div>
-              <h3 className="text-base sm:text-lg font-semibold text-[var(--brand)]">Mail de candidature</h3>
-              <p className="text-[11px] text-[var(--muted)]">Objet + corps à copier, propre (ton au choix).</p>
-            </div>
-          </div>
-        </div>
-
-        <form onSubmit={handleGenerateEmail} className="grid md:grid-cols-2 gap-4 text-sm mt-1">
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom de l'entreprise</label>
-            <input className="input w-full" value={companyName} onChange={(e) => setCompanyName(e.target.value)} placeholder="Ex : IMOGATE" />
-          </div>
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Intitulé du poste</label>
-            <input className="input w-full" value={jobTitle} onChange={(e) => setJobTitle(e.target.value)} placeholder="Ex : Ingénieur Réseaux & Sécurité" />
-          </div>
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom du recruteur (optionnel)</label>
-            <input className="input w-full" value={recruiterName} onChange={(e) => setRecruiterName(e.target.value)} placeholder="Ex : Mme Dupont" />
-          </div>
-          <div>
-            <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Ton</label>
-            <select className="select-brand w-full bg-[var(--bg-soft)]" value={emailTone} onChange={(e) => setEmailTone(e.target.value as any)}>
-              <option value="standard">Standard</option>
-              <option value="pro">Très pro</option>
-              <option value="court">Court</option>
-            </select>
-          </div>
-
-          <div className="md:col-span-2 flex justify-end gap-2">
-            <button type="submit" className="btn-primary min-w-[180px]">
-              Générer
-            </button>
-            <button type="button" className="btn-secondary min-w-[180px]" onClick={copyEmailAll} disabled={!subjectPreview || !emailPreview}>
-              {emailCopied ? "Copié ✅" : "Copier objet + mail"}
-            </button>
-          </div>
-        </form>
-
-        <div className="grid md:grid-cols-2 gap-4 mt-3 text-sm">
-          <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
-            <h4 className="font-semibold text-sm mb-2">Objet</h4>
-            <div className="text-xs text-[var(--muted)] whitespace-pre-line">{subjectPreview || "L'objet généré apparaîtra ici."}</div>
-          </div>
-          <div className="card-soft rounded-xl p-4 border border-[var(--border-soft)]">
-            <h4 className="font-semibold text-sm mb-2">Corps du mail</h4>
-            <div className="text-xs text-[var(--muted)] whitespace-pre-line max-h-64 overflow-auto">{emailPreview || "Le texte du mail apparaîtra ici après génération."}</div>
-          </div>
-        </div>
-      </section>
-
-      {/* =============== MODAL CV FULLSCREEN (RESPONSIVE) =============== */}
+      {/* ===========================
+          MODALS
+          =========================== */}
       <FullScreenModal
         open={cvEditorOpen}
         title="Éditeur CV — plein écran"
         onClose={() => setCvEditorOpen(false)}
         actions={
           <>
-            <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={loadCvDraft} disabled={!userId}>
+            <button type="button" className="btn-secondary !py-1.5 !px-3 text-[12px]" onClick={loadCvDraft} disabled={!userId}>
               Charger
             </button>
-            <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={saveCvDraft} disabled={!userId || !cvDraft}>
+            <button type="button" className="btn-secondary !py-1.5 !px-3 text-[12px]" onClick={saveCvDraft} disabled={!userId || !cvDraft}>
               Enregistrer
             </button>
-            <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={clearCvDraft} disabled={!userId}>
+            <button type="button" className="btn-secondary !py-1.5 !px-3 text-[12px]" onClick={clearCvDraft} disabled={!userId}>
               Oublier
             </button>
-            <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={prepareCvPreview} disabled={cvLoading}>
-              Régénérer aperçu
+            <button type="button" className="btn-secondary !py-1.5 !px-3 text-[12px]" onClick={prepareCvPreview} disabled={cvLoading}>
+              Régénérer
             </button>
-            <button type="button" className="btn-primary !py-2 !px-3 text-[12px]" onClick={downloadCv}>
+            <button type="button" className="btn-primary !py-1.5 !px-3 text-[12px]" onClick={downloadCv}>
               Télécharger
             </button>
           </>
         }
       >
         <div className="h-full min-h-0">
-          {/* ✅ Mobile switch (edit / preview) */}
           <div className="lg:hidden p-2 border-b border-[var(--border)] bg-[var(--bg-soft)] flex gap-2">
-            <button
-              type="button"
-              className={`btn-secondary flex-1 !py-2 ${cvMobileView === "edit" ? "!border-[var(--brand)]" : ""}`}
-              onClick={() => setCvMobileView("edit")}
-            >
+            <button type="button" className={`btn-secondary flex-1 !py-2 ${cvMobileView === "edit" ? "!border-[var(--brand)]" : ""}`} onClick={() => setCvMobileView("edit")}>
               Éditer
             </button>
             <button
@@ -2091,39 +2356,14 @@ ${name || "—"}
             </button>
           </div>
 
-          {/* Desktop split / Mobile one view */}
           <div className="h-[calc(100%-48px)] lg:h-full grid grid-cols-1 lg:grid-cols-2 min-h-0">
-            {/* LEFT: editor */}
-            <div className={`${cvMobileView === "preview" ? "hidden" : ""} lg:block min-h-0 overflow-auto p-3 sm:p-4 border-b lg:border-b-0 lg:border-r border-[var(--border)]`}>
-              {/* ✅ Mobile actions bar (requested) */}
-              <div className="lg:hidden sticky top-0 z-10 -mx-3 sm:-mx-4 px-3 sm:px-4 py-2 border-b border-[var(--border)] bg-[var(--bg-soft)]">
-                <div className="grid grid-cols-2 gap-2">
-                  <button type="button" className="btn-secondary !py-2 text-[12px]" onClick={loadCvDraft} disabled={!userId}>
-                    Charger
-                  </button>
-                  <button type="button" className="btn-secondary !py-2 text-[12px]" onClick={saveCvDraft} disabled={!userId || !cvDraft}>
-                    Enregistrer
-                  </button>
-                  <button type="button" className="btn-secondary !py-2 text-[12px]" onClick={clearCvDraft} disabled={!userId}>
-                    Oublier
-                  </button>
-                  <button type="button" className="btn-secondary !py-2 text-[12px]" onClick={prepareCvPreview} disabled={cvLoading}>
-                    Régénérer aperçu
-                  </button>
-                  <button type="button" className="btn-primary !py-2 text-[12px]" onClick={downloadCv}>
-                    Télécharger
-                  </button>
-                  <button type="button" className="btn-secondary !py-2 text-[12px]" onClick={() => setCvEditorOpen(false)}>
-                    Fermer
-                  </button>
-                </div>
-              </div>
-
+            <div
+              className={`${cvMobileView === "preview" ? "hidden" : ""} lg:block min-h-0 overflow-auto p-3 sm:p-4 border-b lg:border-b-0 lg:border-r border-[var(--border)] custom-scrollbar`}
+            >
               {!cvDraft ? (
                 <p className="text-[11px] text-[var(--muted)]">Charge ton profil CV IA pour éditer.</p>
               ) : (
                 <div className="space-y-3">
-                  {/* Sections */}
                   <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-soft)] p-3">
                     <p className="text-[11px] font-medium text-[var(--muted)] mb-2">Sections à afficher</p>
                     <div className="grid grid-cols-2 gap-2 text-[11px] text-[var(--muted)]">
@@ -2146,7 +2386,6 @@ ${name || "—"}
                     </div>
                   </div>
 
-                  {/* Quick fields */}
                   <div className="grid sm:grid-cols-2 gap-3">
                     <div>
                       <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Nom</label>
@@ -2225,7 +2464,6 @@ ${name || "—"}
                     </div>
                   </div>
 
-                  {/* Skills */}
                   <div className="grid sm:grid-cols-2 gap-3">
                     <div>
                       <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Compétences – tools (virgules)</label>
@@ -2264,7 +2502,6 @@ ${name || "—"}
                     </div>
                   </div>
 
-                  {/* Education */}
                   <div>
                     <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Formation (1 ligne = 1 entrée)</label>
                     <textarea
@@ -2304,7 +2541,8 @@ ${name || "—"}
                       {(((cvDraft as any).xp || []) as any[]).map((x, idx) => (
                         <details key={idx} className="rounded-xl border border-[var(--border)] bg-[var(--bg)] p-2">
                           <summary className="cursor-pointer text-[12px] font-semibold text-[var(--ink)]">
-                            {(x.role || "Rôle")} — {(x.company || "Entreprise")} <span className="text-[10px] text-[var(--muted)]">#{idx + 1}</span>
+                            {(x.role || "Rôle")} — {(x.company || "Entreprise")}{" "}
+                            <span className="text-[10px] text-[var(--muted)]">#{idx + 1}</span>
                           </summary>
 
                           <div className="mt-2 space-y-2">
@@ -2442,7 +2680,6 @@ ${name || "—"}
                     </div>
                   </div>
 
-                  {/* Hobbies */}
                   <div>
                     <label className="block text-[11px] font-medium text-[var(--muted)] mb-1">Hobbies (virgules)</label>
                     <input
@@ -2456,7 +2693,6 @@ ${name || "—"}
                     />
                   </div>
 
-                  {/* Reset */}
                   <button
                     type="button"
                     className="btn-secondary w-full"
@@ -2473,7 +2709,6 @@ ${name || "—"}
               )}
             </div>
 
-            {/* RIGHT: preview */}
             <div className={`${cvMobileView === "edit" ? "hidden" : ""} lg:block min-h-0 bg-white border-t lg:border-t-0 lg:border-l border-[var(--border)]`}>
               <PdfCanvasViewer fileUrl={cvPreviewUrl} />
             </div>
@@ -2481,27 +2716,25 @@ ${name || "—"}
         </div>
       </FullScreenModal>
 
-      {/* =============== MODAL LM FULLSCREEN =============== */}
       <FullScreenModal
         open={lmEditorOpen}
         title="Éditeur Lettre de motivation — plein écran"
         onClose={() => setLmEditorOpen(false)}
         actions={
           <>
-            <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={() => prepareLmPreview({ ensureText: true })} disabled={lmPdfLoading}>
-              Régénérer aperçu
+            <button type="button" className="btn-secondary !py-1.5 !px-3 text-[12px]" onClick={() => prepareLmPreview({ ensureText: true })} disabled={lmPdfLoading}>
+              Régénérer
             </button>
-            <button type="button" className="btn-primary !py-2 !px-3 text-[12px]" onClick={downloadLm}>
+            <button type="button" className="btn-primary !py-1.5 !px-3 text-[12px]" onClick={downloadLm}>
               Télécharger
             </button>
           </>
         }
       >
         <div className="h-full grid grid-cols-1 lg:grid-cols-2 min-h-0">
-          <div className="min-h-0 overflow-auto p-3 sm:p-4 border-b lg:border-b-0 lg:border-r border-[var(--border)]">
+          <div className="min-h-0 overflow-auto p-3 sm:p-4 border-b lg:border-b-0 lg:border-r border-[var(--border)] custom-scrollbar">
             <div className="space-y-2">
-              <p className="text-[11px] text-[var(--muted)]">Édite le texte → l’aperçu se met à jour automatiquement (debounce).</p>
-
+              <p className="text-[11px] text-[var(--muted)]">Édite le texte → l’aperçu se met à jour automatiquement.</p>
               <label className="block text-[11px] font-medium text-[var(--muted)]">Texte (corps uniquement)</label>
               <textarea
                 rows={18}
@@ -2510,9 +2743,7 @@ ${name || "—"}
                 onChange={(e) => setLetterBody(e.target.value)}
                 placeholder="Colle / modifie ici…"
               />
-
               {lmPdfError && <p className="text-[11px] text-red-400">{lmPdfError}</p>}
-
               <div className="grid grid-cols-2 gap-2">
                 <button type="button" className="btn-secondary" onClick={() => prepareLmPreview({ ensureText: false })} disabled={lmPdfLoading}>
                   Régénérer
@@ -2530,17 +2761,16 @@ ${name || "—"}
         </div>
       </FullScreenModal>
 
-      {/* =============== MODAL CV+LM VIEWER =============== */}
       <FullScreenModal
         open={cvLmViewerOpen}
         title="Aperçu CV + LM — plein écran (2 pages)"
         onClose={() => setCvLmViewerOpen(false)}
         actions={
           <>
-            <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={prepareCvLmPreview} disabled={cvLoading}>
-              Régénérer aperçu
+            <button type="button" className="btn-secondary !py-1.5 !px-3 text-[12px]" onClick={prepareCvLmPreview} disabled={cvLoading}>
+              Régénérer
             </button>
-            <button type="button" className="btn-primary !py-2 !px-3 text-[12px]" onClick={downloadCvLm}>
+            <button type="button" className="btn-primary !py-1.5 !px-3 text-[12px]" onClick={downloadCvLm}>
               Télécharger
             </button>
           </>
@@ -2551,7 +2781,7 @@ ${name || "—"}
         </div>
       </FullScreenModal>
 
-      {/* Modal templates */}
+      {/* Templates modal */}
       {templatesModalOpen && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-3" aria-modal="true" role="dialog">
           <div className="absolute inset-0 bg-black/60" onClick={() => setTemplatesModalOpen(false)} />
@@ -2567,14 +2797,19 @@ ${name || "—"}
                 <p className="text-[10px] text-[var(--muted)]">Recherche + sélection instantanée</p>
               </div>
               <div className="flex items-center gap-2">
-                <input value={templateSearch} onChange={(e) => setTemplateSearch(e.target.value)} className="input !py-2 !text-[12px] w-[220px]" placeholder="Rechercher (ex: pro, ats, tech)" />
+                <input
+                  value={templateSearch}
+                  onChange={(e) => setTemplateSearch(e.target.value)}
+                  className="input !py-2 !text-[12px] w-[220px]"
+                  placeholder="Rechercher (ex: pro, ats, tech)"
+                />
                 <button type="button" className="btn-secondary !py-2 !px-3 text-[12px]" onClick={() => setTemplatesModalOpen(false)}>
                   Fermer
                 </button>
               </div>
             </div>
 
-            <div className="p-3 sm:p-4 max-h-[70vh] overflow-auto">
+            <div className="p-3 sm:p-4 max-h-[70vh] overflow-auto custom-scrollbar">
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                 {filteredTemplates.map((t) => {
                   const active = t.id === cvTemplate;
@@ -2591,7 +2826,7 @@ ${name || "—"}
                         active ? "border-[var(--brand)] ring-2 ring-[var(--brand)]/20" : "border-[var(--border)] hover:border-[var(--brand)]/50"
                       }`}
                     >
-                      <img src={t.previewSrc} alt={t.label} className="w-full h-[150px] object-cover rounded-xl border border-[var(--border)] bg-white" loading="lazy" />
+                      <img src={t.previewSrc} alt={t.label} className="w-full h-[140px] object-cover rounded-xl border border-[var(--border)] bg-white" loading="lazy" />
                       <div className="mt-2">
                         <p className="text-[12px] font-semibold text-[var(--ink)] flex items-center justify-between gap-2">
                           <span>{t.label}</span>
@@ -2613,6 +2848,6 @@ ${name || "—"}
           </motion.div>
         </div>
       )}
-    </motion.div>
+    </div>
   );
 }

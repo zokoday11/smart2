@@ -1,673 +1,652 @@
 "use client";
 
 import Link from "next/link";
-import { motion } from "framer-motion";
-import { useRef, useState, UIEvent, useEffect } from "react";
+import { motion, useScroll, useTransform } from "framer-motion";
+import { useRef, useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { onAuthStateChanged, type User } from "firebase/auth";
 import { auth } from "@/lib/firebase";
+import {
+  ArrowRight,
+  CheckCircle2,
+  Sparkles,
+  Zap,
+  FileText,
+  Mic,
+  BarChart3,
+  ShieldCheck,
+  ChevronDown,
+  Search,
+  Bell,
+  MoreHorizontal,
+  Briefcase,
+  PenTool,
+  LayoutDashboard,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { ThemeLangSwitcher } from "@/components/ui/ThemeLangSwitcher";
 
+// --- ANIMATION HELPERS ---
 const fadeUp = (delay = 0) => ({
   initial: { opacity: 0, y: 20 },
   whileInView: { opacity: 1, y: 0 },
-  transition: { duration: 0.4, delay },
-  viewport: { once: false, amount: 0.4 },
+  viewport: { once: true, margin: "-50px" },
+  transition: { duration: 0.5, delay, ease: "easeOut" },
 });
 
-const SECTION_IDS: string[] = ["hero", "features", "how", "pricing", "stack", "faq"];
-
 export default function LandingPage() {
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [activeSection, setActiveSection] = useState<string>("hero");
+  const { t } = useTranslation("common");
 
-  // 🔐 état d'auth Firebase
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [navigating, setNavigating] = useState(false);
   const router = useRouter();
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Parallax Hero
+  const { scrollY } = useScroll();
+  const heroY = useTransform(scrollY, [0, 500], [0, 150]);
+  const heroOpacity = useTransform(scrollY, [0, 400], [1, 0]);
 
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (user) => {
-      setCurrentUser(user);
-    });
+    const unsub = onAuthStateChanged(auth, (user) => setCurrentUser(user));
     return () => unsub();
   }, []);
 
-  /**
-   * ✅ Debug reCAPTCHA (facultatif)
-   * Si tu as bien mis le Script enterprise.js dans app/layout.tsx,
-   * tu dois voir window.grecaptcha après quelques ms.
-   */
-  useEffect(() => {
-    const t = window.setTimeout(() => {
-      const g = (window as any).grecaptcha;
-      // console.log("[recaptcha] loaded?", !!g, "enterprise?", !!g?.enterprise);
-    }, 1200);
-    return () => window.clearTimeout(t);
-  }, []);
-
-  const handleSmartLoginClick = () => {
+  const handleSmartLogin = () => {
     if (navigating) return;
     setNavigating(true);
-    if (currentUser) router.push("/app");
-    else router.push("/login");
+    router.push(currentUser ? "/app" : "/login");
   };
 
-  const handleScroll = (e: UIEvent<HTMLDivElement>) => {
-    const el = e.currentTarget;
-    const maxScroll = el.scrollHeight - el.clientHeight;
-
-    if (maxScroll <= 0) setProgress(0);
-    else setProgress((el.scrollTop / maxScroll) * 100);
-
-    const containerRect = el.getBoundingClientRect();
-    let closestId: string = activeSection;
-    let minDelta = Infinity;
-
-    SECTION_IDS.forEach((id) => {
-      const sec = document.getElementById(id) as HTMLElement | null;
-      if (!sec) return;
-      const rect = sec.getBoundingClientRect();
-      const delta = Math.abs(rect.top - containerRect.top);
-      if (delta < minDelta) {
-        minDelta = delta;
-        closestId = id;
-      }
-    });
-
-    if (closestId !== activeSection) setActiveSection(closestId);
+  const scrollTo = (id: string) => {
+    document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });
   };
-
-  const baseNavLink =
-    "relative inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full transition-colors";
-
-  const scrollToSection =
-    (id: string) => (e: React.MouseEvent<HTMLAnchorElement>) => {
-      e.preventDefault();
-      const sec = document.getElementById(id);
-      if (sec) sec.scrollIntoView({ behavior: "smooth", block: "start" });
-    };
 
   return (
-    <div className="min-h-screen bg-[var(--bg)] text-[var(--ink)] flex flex-col overflow-x-hidden">
-      {/* NAVBAR FIXE */}
-      <header className="fixed top-0 left-0 right-0 z-40 bg-[var(--bg)]/90 backdrop-blur-xl">
-        <div className="max-w-6xl mx-auto px-4 sm:px-8 h-14 flex items-center justify-between">
-          {/* Logo + titre */}
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-2xl bg-gradient-to-br from-[var(--brand)] to-[var(--brandDark)] shadow-lg shadow-[var(--brand)]/30 flex items-center justify-center text-[11px] font-semibold">
-              AI
+    <div
+      ref={scrollRef}
+      className="min-h-screen bg-[var(--bg)] text-[var(--ink)] selection:bg-[var(--brand)]/30 selection:text-[var(--ink)] overflow-x-hidden transition-colors duration-300"
+    >
+      {/* --- NAVBAR --- */}
+      <nav className="fixed top-0 inset-x-0 z-50 h-16 border-b border-[var(--border)] bg-[var(--bg)]/80 backdrop-blur-md transition-colors duration-300">
+        <div className="max-w-7xl mx-auto px-4 h-full flex items-center justify-between">
+          <div
+            className="flex items-center gap-2 cursor-pointer"
+            onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+          >
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
+              <Zap className="w-4 h-4 text-white fill-white" />
             </div>
-            <div className="flex flex-col leading-tight">
-              <span className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)]">
-                Assistant candidatures
-              </span>
-              <span className="text-xs font-medium">Smart CV · LM · Pitch</span>
-            </div>
+            <span className="font-bold tracking-tight text-[var(--ink)]">{t("landing.brand")}</span>
           </div>
 
-          {/* Liens + CTA */}
-          <nav className="hidden sm:flex items-center gap-4 text-[11px]">
-            <a
-              href="#hero"
-              onClick={scrollToSection("hero")}
-              className={
-                activeSection === "hero"
-                  ? `${baseNavLink} bg-[var(--bg-soft)] text-[var(--ink)]`
-                  : `${baseNavLink} text-[var(--muted)] hover:text-[var(--ink)]`
-              }
-            >
-              {activeSection === "hero" && (
-                <span className="inline-flex w-1.5 h-1.5 rounded-full bg-[var(--brand)] animate-pulse" />
-              )}
-              <span>Accueil</span>
-            </a>
-
-            <a
-              href="#features"
-              onClick={scrollToSection("features")}
-              className={
-                activeSection === "features"
-                  ? `${baseNavLink} bg-[var(--bg-soft)] text-[var(--ink)]`
-                  : `${baseNavLink} text-[var(--muted)] hover:text-[var(--ink)]`
-              }
-            >
-              {activeSection === "features" && (
-                <span className="inline-flex w-1.5 h-1.5 rounded-full bg-[var(--brand)] animate-pulse" />
-              )}
-              <span>Fonctionnalités</span>
-            </a>
-
-            <a
-              href="#how"
-              onClick={scrollToSection("how")}
-              className={
-                activeSection === "how"
-                  ? `${baseNavLink} bg-[var(--bg-soft)] text-[var(--ink)]`
-                  : `${baseNavLink} text-[var(--muted)] hover:text-[var(--ink)]`
-              }
-            >
-              {activeSection === "how" && (
-                <span className="inline-flex w-1.5 h-1.5 rounded-full bg-[var(--brand)] animate-pulse" />
-              )}
-              <span>Comment ça marche</span>
-            </a>
-
-            <a
-              href="#pricing"
-              onClick={scrollToSection("pricing")}
-              className={
-                activeSection === "pricing"
-                  ? `${baseNavLink} bg-[var(--bg-soft)] text-[var(--ink)]`
-                  : `${baseNavLink} text-[var(--muted)] hover:text-[var(--ink)]`
-              }
-            >
-              {activeSection === "pricing" && (
-                <span className="inline-flex w-1.5 h-1.5 rounded-full bg-[var(--brand)] animate-pulse" />
-              )}
-              <span>Tarifs</span>
-            </a>
-
-            <a
-              href="#stack"
-              onClick={scrollToSection("stack")}
-              className={
-                activeSection === "stack"
-                  ? `${baseNavLink} bg-[var(--bg-soft)] text-[var(--ink)]`
-                  : `${baseNavLink} text-[var(--muted)] hover:text-[var(--ink)]`
-              }
-            >
-              {activeSection === "stack" && (
-                <span className="inline-flex w-1.5 h-1.5 rounded-full bg-[var(--brand)] animate-pulse" />
-              )}
-              <span>Tech</span>
-            </a>
-
-            <a
-              href="#faq"
-              onClick={scrollToSection("faq")}
-              className={
-                activeSection === "faq"
-                  ? `${baseNavLink} bg-[var(--bg-soft)] text-[var(--ink)]`
-                  : `${baseNavLink} text-[var(--muted)] hover:text-[var(--ink)]`
-              }
-            >
-              {activeSection === "faq" && (
-                <span className="inline-flex w-1.5 h-1.5 rounded-full bg-[var(--brand)] animate-pulse" />
-              )}
-              <span>Questions fréquentes</span>
-            </a>
-          </nav>
-
-          <div className="flex items-center gap-2">
+          <div className="hidden md:flex items-center gap-8 text-sm font-medium text-[var(--muted)]">
             <button
-              type="button"
-              onClick={handleSmartLoginClick}
-              disabled={navigating}
-              className="hidden sm:inline-flex text-[11px] text-[var(--muted)] hover:text-[var(--ink)] disabled:opacity-50"
+              onClick={() => scrollTo("features")}
+              className="hover:text-[var(--ink)] transition-colors"
             >
-              Se connecter
+              {t("landing.nav.features")}
+            </button>
+            <button
+              onClick={() => scrollTo("process")}
+              className="hover:text-[var(--ink)] transition-colors"
+            >
+              {t("landing.nav.process")}
+            </button>
+            <button
+              onClick={() => scrollTo("pricing")}
+              className="hover:text-[var(--ink)] transition-colors"
+            >
+              {t("landing.nav.pricing")}
+            </button>
+          </div>
+
+          <div className="flex items-center gap-3">
+            {/* Switch Lang + Theme */}
+            <ThemeLangSwitcher />
+
+            <button
+              onClick={handleSmartLogin}
+              className="hidden sm:block text-sm font-medium text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+            >
+              {t("landing.nav.login")}
             </button>
 
             <Link
               href="/signup"
-              className="inline-flex items-center justify-center text-[11px] sm:text-xs px-3 sm:px-4 py-1.5 rounded-full bg-[var(--brand)] hover:bg-[var(--brandDark)] text-white shadow-lg shadow-[var(--brand)]/40 transition-colors"
+              className="group relative px-5 py-2 rounded-full bg-[var(--ink)] text-[var(--bg)] text-sm font-bold overflow-hidden transition-all hover:opacity-90"
             >
-              Essayer gratuitement
+              <span className="relative z-10 flex items-center gap-2">
+                {t("landing.nav.tryFree")}
+                <ArrowRight className="w-3 h-3 group-hover:translate-x-1 transition-transform" />
+              </span>
             </Link>
           </div>
         </div>
-      </header>
+      </nav>
 
-      {/* CONTENU */}
-      <div className="flex-1 pt-14">
-        {/* Barre de progression */}
-        <div className="hidden md:block h-[2px] w-full bg-[var(--border)]/40 sticky top-14 z-30">
-          <div
-            className="scroll-progress-bar h-full bg-[var(--brand)] transition-[width] duration-150"
-            style={{ width: `${progress}%` }}
-          />
-        </div>
+      <main className="relative pt-32 pb-16">
+        {/* --- HERO SECTION --- */}
+        <section className="relative px-4 max-w-7xl mx-auto mb-32">
+          {/* Background Glows */}
+          <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[800px] h-[500px] bg-blue-600/20 rounded-full blur-[120px] pointer-events-none opacity-50" />
 
-        <main
-          ref={scrollRef}
-          onScroll={handleScroll}
-          className="
-            snap-none 
-            md:snap-y md:snap-mandatory
-            md:h-[calc(100vh-3.5rem-2px)] md:overflow-y-scroll
-            scroll-smooth
-          "
-        >
-          {/* HERO */}
-          <section
-            id="hero"
-            className="md:snap-start md:min-h-[calc(100vh-3.5rem-2px)] flex items-center px-4 sm:px-8 py-10 md:py-0"
+          <motion.div
+            style={{ y: heroY, opacity: heroOpacity }}
+            className="relative z-10 text-center flex flex-col items-center"
           >
-            <div className="max-w-6xl mx-auto grid gap-8 md:grid-cols-[1.1fr,0.9fr] items-center">
-              <motion.div {...fadeUp(0)}>
-                <div className="inline-flex items-center gap-2 rounded-full border border-[var(--border)] bg-[var(--bg-soft)] px-2 py-1 mb-4">
-                  <span className="inline-flex h-4 w-4 rounded-full bg-emerald-400/20 border border-emerald-400/50">
-                    <span className="m-auto h-2 w-2 rounded-full bg-emerald-400" />
-                  </span>
-                  <span className="text-[11px] text-[var(--muted)]">
-                    Gagne jusqu&apos;à{" "}
-                    <span className="text-[var(--ink)] font-medium">4h par semaine</span>{" "}
-                    sur tes candidatures.
-                  </span>
-                </div>
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.1 }}
+              className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-blue-500/30 bg-blue-500/10 text-blue-400 text-xs font-medium mb-6"
+            >
+              <Sparkles className="w-3 h-3" />
+              {t("landing.hero.badge")}
+            </motion.div>
 
-                <h1 className="text-[1.9rem] sm:text-3xl md:text-[2.6rem] font-semibold leading-tight mb-3">
-                  L&apos;assistant IA pour candidater comme un pro,
-                  <span className="text-[var(--brand)]"> sans y passer tes soirées.</span>
-                </h1>
+            <motion.h1
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.2 }}
+              className="text-5xl md:text-7xl font-bold tracking-tight mb-6 max-w-4xl leading-[1.1] text-[var(--ink)]"
+            >
+              {t("landing.hero.titleLine1")} <br />
+              <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-indigo-400">
+                {t("landing.hero.titleGradient")}
+              </span>
+            </motion.h1>
 
-                <p className="text-sm sm:text-base text-[var(--muted)] max-w-xl mb-5">
-                  Importe ton CV, colle une offre d’emploi, laisse l’IA générer une lettre de motivation
-                  ciblée, un pitch oral et suis toutes tes candidatures depuis un tableau de bord unique.
-                </p>
+            <motion.p
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.3 }}
+              className="text-lg md:text-xl text-[var(--muted)] max-w-2xl mb-10 leading-relaxed"
+            >
+              {t("landing.hero.subtitle")}
+            </motion.p>
 
-                <div className="flex flex-wrap items-center gap-3 mb-4">
-                  <Link href="/signup" className="btn-primary text-xs sm:text-sm">
-                    Essayer gratuitement
-                  </Link>
-
-                  <button
-                    type="button"
-                    onClick={handleSmartLoginClick}
-                    disabled={navigating}
-                    className="btn-secondary text-xs sm:text-sm disabled:opacity-50"
-                  >
-                    Se connecter
-                  </button>
-                </div>
-
-                <p className="text-[11px] text-[var(--muted)]">
-                  Aucun CB requise • Crédits offerts à l’inscription • Pensé pour les profils tech & cybersécurité
-                </p>
-              </motion.div>
-
-              <motion.div {...fadeUp(0.1)} className="relative">
-                <div className="glass rounded-2xl p-4 text-[11px] sm:text-xs shadow-2xl shadow-black/60 border border-[var(--border)]/80">
-                  <div className="flex items-center justify-between mb-3">
-                    <div>
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--muted)]">
-                        Aperçu du dashboard
-                      </p>
-                      <p className="text-xs font-medium mt-1">
-                        CV, lettres, pitch & suivi en un coup d&apos;œil.
-                      </p>
-                    </div>
-                    <span className="px-2 py-1 rounded-full bg-emerald-400/10 text-emerald-300 border border-emerald-400/40 text-[10px]">
-                      IA activée
-                    </span>
-                  </div>
-
-                  <div className="grid gap-2 sm:grid-cols-3 mb-3">
-                    <div className="rounded-xl bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-2">
-                      <p className="text-[10px] text-[var(--muted)] mb-1">Crédits restants</p>
-                      <p className="text-lg font-semibold">124</p>
-                      <p className="text-[10px] text-[var(--muted)]">~ 30 lettres + 15 pitchs</p>
-                    </div>
-                    <div className="rounded-xl bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-2">
-                      <p className="text-[10px] text-[var(--muted)] mb-1">Candidatures envoyées</p>
-                      <p className="text-lg font-semibold">18</p>
-                      <p className="text-[10px] text-[var(--muted)]">5 en entretien 🔥</p>
-                    </div>
-                    <div className="rounded-xl bg-[var(--bg-soft)] border border-[var(--border)]/80 px-3 py-2">
-                      <p className="text-[10px] text-[var(--muted)] mb-1">Temps économisé</p>
-                      <p className="text-lg font-semibold">7h / semaine</p>
-                      <p className="text-[10px] text-[var(--muted)]">vs candidatures manuelles</p>
-                    </div>
-                  </div>
-
-                  <div className="rounded-xl bg-gradient-to-br from-[var(--bg-soft)] to-[var(--card-elevated)] border border-[var(--border)]/90 p-3 space-y-2">
-                    <div className="flex items-center justify-between text-[10px] text-[var(--muted)]">
-                      <span>Offre · Ingénieur cybersécurité</span>
-                      <span>
-                        Match profil :{" "}
-                        <span className="text-emerald-300 font-semibold">92%</span>
-                      </span>
-                    </div>
-                    <div className="h-1.5 w-full rounded-full bg-[var(--bg-soft)] overflow-hidden">
-                      <div className="h-full w-[92%] bg-gradient-to-r from-emerald-400 to-[var(--brand)]" />
-                    </div>
-                    <div className="flex flex-wrap gap-2 text-[10px]">
-                      <span className="px-2 py-1 rounded-full bg-emerald-400/10 text-emerald-200 border border-emerald-400/40">
-                        LM générée
-                      </span>
-                      <span className="px-2 py-1 rounded-full bg-[var(--brand)]/10 text-[var(--brand)] border border-[var(--brand)]/40">
-                        Pitch prêt
-                      </span>
-                      <span className="px-2 py-1 rounded-full bg-[var(--bg-soft)] text-[var(--muted)] border border-[var(--border)]/70">
-                        Suivi : En cours
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="pointer-events-none absolute -inset-10 -z-10 bg-[radial-gradient(circle_at_top,_rgba(88,166,255,0.35),_transparent_60%),radial-gradient(circle_at_bottom,_rgba(16,185,129,0.2),_transparent_55%)] opacity-80" />
-              </motion.div>
-            </div>
-          </section>
-
-          {/* FEATURES */}
-          <section
-            id="features"
-            className="md:snap-start md:min-h-[calc(100vh-3.5rem-2px)] flex items-center px-4 sm:px-8 py-10 md:py-0"
-          >
-            <div className="max-w-6xl mx-auto w-full">
-              <motion.div
-                {...fadeUp(0)}
-                className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 mb-6"
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.4 }}
+              className="flex flex-col sm:flex-row items-center gap-4 w-full sm:w-auto"
+            >
+              {/* BOUTON 1 */}
+              <Link
+                href="/signup"
+                className="w-full sm:w-auto h-12 px-8 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold transition-all shadow-lg shadow-blue-500/25 flex items-center justify-center gap-2"
               >
-                <div>
-                  <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">
-                    Pensé pour ton quotidien
-                  </p>
-                  <h2 className="text-lg sm:text-xl font-semibold">
-                    Tout ce dont tu as besoin pour candidater au calme.
-                  </h2>
-                </div>
-              </motion.div>
+                {t("landing.hero.ctaPrimary")}
+                <ArrowRight className="w-4 h-4" />
+              </Link>
 
-              <div className="grid gap-4 md:grid-cols-3">
-                {[
-                  {
-                    title: "CV IA optimisé",
-                    desc: "Importe ton CV PDF, l’IA extrait ton profil et te propose une version claire et impactante pour les recruteurs.",
-                  },
-                  {
-                    title: "Lettres ciblées",
-                    desc: "Colle une offre d’emploi, l’assistant adapte ta lettre à l’entreprise, au poste et à ton parcours.",
-                  },
-                  {
-                    title: "Pitch d’entretien",
-                    desc: "Génère un pitch oral structuré pour te présenter en 30 à 90 secondes en entretien ou en réseautage.",
-                  },
-                  {
-                    title: "Tracker de candidatures",
-                    desc: "Garde la main sur tout : qui t’a répondu, où tu en es, quelles relances tu dois faire.",
-                  },
-                  {
-                    title: "Historique IA",
-                    desc: "Retrouve facilement tes lettres, tes pitchs et les versions de ton CV, sans te perdre dans les dossiers.",
-                  },
-                  {
-                    title: "Crédits flexibles",
-                    desc: "Des packs adaptés à ton rythme : quelques candidatures ciblées ou une vraie campagne d’attaque.",
-                  },
-                ].map((f, i) => (
-                  <motion.div
-                    key={f.title}
-                    {...fadeUp(0.05 * i)}
-                    className="glass p-4 border border-[var(--border)]/80 hover:border-[var(--brand)]/60 transition-colors"
-                  >
-                    <h3 className="text-sm font-semibold mb-1">{f.title}</h3>
-                    <p className="text-[11px] sm:text-xs text-[var(--muted)]">{f.desc}</p>
-                  </motion.div>
-                ))}
-              </div>
-            </div>
-          </section>
+              {/* BOUTON 2 */}
+              <button
+                onClick={handleSmartLogin}
+                className="w-full sm:w-auto h-12 px-8 rounded-xl bg-[var(--bg-soft)] hover:opacity-95 border border-[var(--border)] text-[var(--ink)] font-medium transition-all flex items-center justify-center gap-2 group"
+              >
+                <FileText className="w-4 h-4 text-[var(--muted)] group-hover:text-[var(--ink)] transition-colors" />
+                {t("landing.hero.ctaSecondary")}
+              </button>
+            </motion.div>
 
-          {/* HOW */}
-          <section
-            id="how"
-            className="md:snap-start md:min-h-[calc(100vh-3.5rem-2px)] flex items-center px-4 sm:px-8 py-10 md:py-0"
-          >
-            <div className="max-w-6xl mx-auto grid gap-6 md:grid-cols-[1.1fr,0.9fr] items-start">
-              <motion.div {...fadeUp(0)}>
-                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">
-                  En pratique
-                </p>
-                <h2 className="text-lg sm:text-xl font-semibold mb-3">
-                  3 étapes pour transformer ton process de candidature.
-                </h2>
-                <p className="text-sm text-[var(--muted)] max-w-xl mb-4">
-                  L’objectif : que tu passes moins de temps à lutter avec tes lettres, et plus de temps à préparer tes entretiens.
-                </p>
+            {/* DASHBOARD PREVIEW MOCKUP */}
+            <motion.div
+              initial={{ opacity: 0, y: 40, rotateX: 10 }}
+              animate={{ opacity: 1, y: 0, rotateX: 0 }}
+              transition={{ delay: 0.6, duration: 0.8 }}
+              className="mt-16 w-full max-w-5xl rounded-2xl border border-[var(--border)] bg-[var(--bg-soft)] shadow-2xl overflow-hidden relative group perspective-1000"
+            >
+              <div className="absolute inset-0 bg-gradient-to-t from-[var(--bg)] via-transparent to-transparent z-20 pointer-events-none"></div>
 
-                <ol className="space-y-3 text-sm">
-                  <li className="flex gap-3">
-                    <span className="mt-0.5 h-6 w-6 rounded-full bg-[var(--brand)]/15 border border-[var(--brand)]/60 text-[10px] flex items-center justify-center">
-                      1
-                    </span>
-                    <div>
-                      <p className="font-medium mb-1">Tu importes ton CV & les offres</p>
-                      <p className="text-[12px] text-[var(--muted)]">
-                        PDF de ton CV, lien d’offre ou texte copié/collé : tout part de ton vrai parcours.
-                      </p>
+              <div className="grid grid-cols-[200px_1fr] h-[550px] opacity-90">
+                {/* Sidebar Mockup */}
+                <div className="border-r border-[var(--border)] bg-[var(--bg-soft)] p-4 flex flex-col gap-6">
+                  <div className="flex items-center gap-3 px-2">
+                    <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-indigo-500"></div>
+                    <div className="space-y-1">
+                      <div className="h-2 w-16 bg-black/20 dark:bg-white/20 rounded"></div>
+                      <div className="h-1.5 w-10 bg-black/10 dark:bg-white/10 rounded"></div>
                     </div>
-                  </li>
-                  <li className="flex gap-3">
-                    <span className="mt-0.5 h-6 w-6 rounded-full bg-[var(--brand)]/15 border border-[var(--brand)]/60 text-[10px] flex items-center justify-center">
-                      2
-                    </span>
-                    <div>
-                      <p className="font-medium mb-1">L’IA génère lettres, pitchs & matchs</p>
-                      <p className="text-[12px] text-[var(--muted)]">
-                        Tu valides, ajustes, c’est toi qui garde le contrôle du ton et des infos.
-                      </p>
-                    </div>
-                  </li>
-                  <li className="flex gap-3">
-                    <span className="mt-0.5 h-6 w-6 rounded-full bg-[var(--brand)]/15 border border-[var(--brand)]/60 text-[10px] flex items-center justify-center">
-                      3
-                    </span>
-                    <div>
-                      <p className="font-medium mb-1">Tu suis tout depuis le dashboard</p>
-                      <p className="text-[12px] text-[var(--muted)]">
-                        Tableau de bord, statut des candidatures, relances, historique : tout est centralisé.
-                      </p>
-                    </div>
-                  </li>
-                </ol>
-              </motion.div>
-
-              <motion.div {...fadeUp(0.1)} className="glass p-4 border border-[var(--border)]/80">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-2">
-                  Pour qui ?
-                </p>
-                <ul className="space-y-2 text-[12px] text-[var(--muted)]">
-                  <li>• Étudiants & juniors qui veulent des candidatures propres sans y passer leurs nuits.</li>
-                  <li>• Profils tech / cybersécurité qui veulent aller droit au but avec un ton pro.</li>
-                  <li>• Pros en reconversion ou en veille qui envoient plusieurs candidatures par semaine.</li>
-                </ul>
-                <div className="mt-4 border-t border-[var(--border)]/70 pt-3 text-[11px]">
-                  <p className="text-[var(--muted)] mb-1">Tu n’es pas obligé de tout automatiser.</p>
-                  <p>
-                    Utilise l’IA comme un accélérateur : tu gardes le contrôle, l’assistant fait le gros du texte.
-                  </p>
-                </div>
-              </motion.div>
-            </div>
-          </section>
-
-          {/* PRICING */}
-          <section
-            id="pricing"
-            className="md:snap-start md:min-h-[calc(100vh-3.5rem-2px)] flex items-center px-4 sm:px-8 py-10 md:py-0"
-          >
-            <div className="max-w-6xl mx-auto w-full">
-              <motion.div {...fadeUp(0)} className="text-center mb-8 max-w-2xl mx-auto">
-                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">Tarifs</p>
-                <h2 className="text-lg sm:text-xl font-semibold mb-2">Des crédits simples, adaptés à ton rythme.</h2>
-                <p className="text-sm text-[var(--muted)]">
-                  Commence avec les crédits gratuits. Tu ne paies que si l’outil t’aide vraiment.
-                </p>
-              </motion.div>
-
-              <div className="grid gap-4 md:grid-cols-3">
-                <motion.div {...fadeUp(0.05)} className="glass p-4 border border-[var(--border)]/90">
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">Découverte</p>
-                  <h3 className="text-sm font-semibold mb-1">Gratuit • Pour tester</h3>
-                  <p className="text-[12px] text-[var(--muted)] mb-3">Idéal pour voir si le flow te convient.</p>
-                  <p className="text-2xl font-semibold mb-3">0 €</p>
-                  <ul className="text-[11px] text-[var(--muted)] space-y-1.5 mb-4">
-                    <li>• X crédits offerts à l’inscription</li>
-                    <li>• 2 lettres de motivation IA</li>
-                    <li>• 1 pitch d’entretien</li>
-                    <li>• Accès au tracker de candidatures</li>
-                  </ul>
-                  <Link href="/signup" className="btn-secondary w-full text-center text-xs">
-                    Commencer gratuitement
-                  </Link>
-                </motion.div>
-
-                <motion.div
-                  {...fadeUp(0.1)}
-                  className="glass p-4 border border-[var(--brand)]/80 relative overflow-hidden"
-                >
-                  <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(88,166,255,0.12),_transparent_55%)] pointer-events-none" />
-                  <div className="relative">
-                    <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">Plus populaire</p>
-                    <h3 className="text-sm font-semibold mb-1">Campagne ciblée</h3>
-                    <p className="text-[12px] text-[var(--muted)] mb-3">Pour une vraie recherche active de poste.</p>
-                    <p className="text-2xl font-semibold mb-3">
-                      19 € <span className="text-[11px] text-[var(--muted)]">/ une fois</span>
-                    </p>
-                    <ul className="text-[11px] text-[var(--muted)] space-y-1.5 mb-4">
-                      <li>• Crédits pour ~25 lettres</li>
-                      <li>• Pitchs illimités pour les offres générées</li>
-                      <li>• Suivi avancé des candidatures</li>
-                      <li>• Priorité sur les améliorations de templates</li>
-                    </ul>
-                    <Link href="/app/credits" className="btn-primary w-full text-center text-xs">
-                      Acheter des crédits
-                    </Link>
                   </div>
-                </motion.div>
 
-                <motion.div {...fadeUp(0.15)} className="glass p-4 border border-[var(--border)]/90">
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-1">Intensif</p>
-                  <h3 className="text-sm font-semibold mb-1">Pro / reconversion</h3>
-                  <p className="text-[12px] text-[var(--muted)] mb-3">Pour les périodes de candidatures massives.</p>
-                  <p className="text-2xl font-semibold mb-3">
-                    39 € <span className="text-[11px] text-[var(--muted)]">/ une fois</span>
-                  </p>
-                  <ul className="text-[11px] text-[var(--muted)] space-y-1.5 mb-4">
-                    <li>• Crédits pour ~60 lettres</li>
-                    <li>• Pitchs étendus + variantes</li>
-                    <li>• Support prioritaire</li>
-                    <li>• Idéal pour changer de pays / secteur</li>
-                  </ul>
-                  <Link href="/app/credits" className="btn-secondary w-full text-center text-xs">
-                    Voir ce pack plus tard
-                  </Link>
-                </motion.div>
-              </div>
-            </div>
-          </section>
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-3 px-3 py-2 rounded-lg bg-blue-500/10 border border-blue-500/20 text-blue-500 text-xs font-medium">
+                      <LayoutDashboard className="w-3.5 h-3.5" /> {t("landing.mock.dashboard")}
+                    </div>
 
-          {/* STACK */}
-          <section
-            id="stack"
-            className="md:snap-start md:min-h-[calc(100vh-3.5rem-2px)] flex items-center px-4 sm:px-8 py-10 md:py-0"
-          >
-            <div className="max-w-6xl mx-auto grid gap-6 md:grid-cols-2">
-              <motion.div {...fadeUp(0)}>
-                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">Sous le capot</p>
-                <h2 className="text-lg sm:text-xl font-semibold mb-2">
-                  Une stack moderne, optimisée pour la vitesse.
-                </h2>
-                <p className="text-sm text-[var(--muted)] mb-3">
-                  Tu profites d’une interface fluide, sans te soucier de la technique. Mais si ça t’intéresse :
-                </p>
-                <ul className="text-[12px] text-[var(--muted)] space-y-1.5">
-                  <li>
-                    • <span className="text-[var(--ink)] font-medium">Next.js</span> pour le frontend & le routing.
-                  </li>
-                  <li>
-                    • <span className="text-[var(--ink)] font-medium">Tailwind CSS</span> pour le design dark moderne.
-                  </li>
-                  <li>
-                    • <span className="text-[var(--ink)] font-medium">Framer Motion</span> pour les animations fluides.
-                  </li>
-                  <li>
-                    • <span className="text-[var(--ink)] font-medium">Firebase</span> pour l’auth sécurisée & le stockage.
-                  </li>
-                  <li>
-                    • <span className="text-[var(--ink)] font-medium">Gemini</span> pour l’analyse de CV & la génération IA.
-                  </li>
-                </ul>
-              </motion.div>
+                    {[
+                      { icon: FileText, label: t("landing.mock.cvs") },
+                      { icon: Briefcase, label: t("landing.mock.apps") },
+                      { icon: PenTool, label: t("landing.mock.letters") },
+                      { icon: BarChart3, label: t("landing.mock.stats") },
+                    ].map((item, i) => (
+                      <div
+                        key={i}
+                        className="flex items-center gap-3 px-3 py-2 rounded-lg text-[var(--muted)] hover:bg-black/5 dark:hover:bg-white/5 transition-colors cursor-default"
+                      >
+                        <item.icon className="w-3.5 h-3.5" />
+                        <div className="h-2 w-12 bg-black/10 dark:bg-white/10 rounded"></div>
+                      </div>
+                    ))}
+                  </div>
 
-              <motion.div {...fadeUp(0.1)} className="glass p-4 border border-[var(--border)]/80 text-[11px] sm:text-xs">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--muted)] mb-2">
-                  Pourquoi c&apos;est important pour toi ?
-                </p>
-                <p className="text-[var(--muted)] mb-2">
-                  Parce que ça veut dire : moins de chargements lents, moins de bugs bizarres, et une interface qui réagit comme un vrai outil pro.
-                </p>
-                <p className="text-[var(--muted)]">
-                  Et si tu es curieux·se côté dev, la structure du projet est pensée pour être lisible, extensible, et déployable facilement sur Firebase Hosting.
-                </p>
-              </motion.div>
-            </div>
-          </section>
-
-          {/* FAQ */}
-          <section
-            id="faq"
-            className="md:snap-start md:min-h-[calc(100vh-3.5rem-2px)] flex items-center px-4 sm:px-8 pb-12 pt-10 md:py-0"
-          >
-            <div className="max-w-4xl mx-auto w-full">
-              <motion.div {...fadeUp(0)} className="text-center mb-6">
-                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-1">Questions fréquentes</p>
-                <h2 className="text-lg sm:text-xl font-semibold mb-2">Et si tu te poses encore la question…</h2>
-              </motion.div>
-
-              <div className="space-y-3 text-sm">
-                <motion.div {...fadeUp(0.05)} className="glass p-3 border border-[var(--border)]/80">
-                  <p className="font-medium mb-1">Est-ce que les textes sont vraiment uniques ?</p>
-                  <p className="text-[12px] text-[var(--muted)]">
-                    Oui, chaque génération est basée sur ton CV, l’offre collée et les paramètres que tu choisis.
-                  </p>
-                </motion.div>
-
-                <motion.div {...fadeUp(0.1)} className="glass p-3 border border-[var(--border)]/80">
-                  <p className="font-medium mb-1">Est-ce que l’outil remplace complètement mon travail ?</p>
-                  <p className="text-[12px] text-[var(--muted)]">
-                    Non. L’idée est de te donner une base solide (0→80%), puis tu ajustes les derniers 20%.
-                  </p>
-                </motion.div>
-
-                <motion.div {...fadeUp(0.15)} className="glass p-3 border border-[var(--border)]/80">
-                  <p className="font-medium mb-1">Je peux arrêter quand je veux ?</p>
-                  <p className="text-[12px] text-[var(--muted)]">
-                    Oui, les crédits ne t&apos;engagent pas dans un abonnement. Tu recharges uniquement quand tu en as besoin.
-                  </p>
-                </motion.div>
-              </div>
-
-              <motion.div {...fadeUp(0.2)} className="mt-8 glass p-5 border border-[var(--border)]/90 text-center">
-                <p className="text-[11px] uppercase tracking-[0.22em] text-[var(--muted)] mb-2">Prêt à tester ?</p>
-                <h3 className="text-base sm:text-lg font-semibold mb-2">
-                  Tu peux créer ton compte en 30 secondes et tester avec de vrais cas.
-                </h3>
-                <p className="text-[12px] text-[var(--muted)] mb-4">
-                  Tu gardes la main sur tout, l’IA est là pour accélérer ton travail, pas pour te remplacer.
-                </p>
-                <div className="flex flex-wrap gap-3 justify-center">
-                  <Link href="/signup" className="btn-primary text-xs sm:text-sm">
-                    Essayer gratuitement
-                  </Link>
-
-                  <button
-                    type="button"
-                    onClick={handleSmartLoginClick}
-                    disabled={navigating}
-                    className="btn-secondary text-xs sm:text-sm disabled:opacity-50"
-                  >
-                    J&apos;ai déjà un compte
-                  </button>
+                  <div className="mt-auto p-3 rounded-xl bg-gradient-to-br from-indigo-900/20 to-purple-900/20 border border-[var(--border)]">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Sparkles className="w-3 h-3 text-indigo-400" />
+                      <span className="text-[10px] font-bold text-indigo-300">
+                        {t("landing.mock.proMode")}
+                      </span>
+                    </div>
+                    <div className="h-1.5 w-full bg-black/10 dark:bg-white/10 rounded-full overflow-hidden">
+                      <div className="h-full w-2/3 bg-indigo-500"></div>
+                    </div>
+                  </div>
                 </div>
+
+                {/* Main Content Mockup */}
+                <div className="bg-transparent p-6 flex flex-col gap-6 relative">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="font-semibold text-lg text-[var(--ink)]">
+                        {t("landing.mock.hello")}
+                      </h3>
+                      <p className="text-[var(--muted)] text-xs">
+                        {t("landing.mock.subtitle")}
+                      </p>
+                    </div>
+                    <div className="flex gap-3">
+                      <div className="w-8 h-8 rounded-full bg-black/5 dark:bg-white/5 flex items-center justify-center border border-[var(--border)]">
+                        <Search className="w-3.5 h-3.5 text-[var(--muted)]" />
+                      </div>
+                      <div className="w-8 h-8 rounded-full bg-black/5 dark:bg-white/5 flex items-center justify-center border border-[var(--border)] relative">
+                        <Bell className="w-3.5 h-3.5 text-[var(--muted)]" />
+                        <div className="absolute top-2 right-2 w-1.5 h-1.5 bg-red-500 rounded-full border border-[var(--bg-soft)]"></div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="p-5 rounded-2xl bg-gradient-to-r from-blue-900/10 to-indigo-900/10 border border-blue-500/20 relative overflow-hidden">
+                    <div className="relative z-10 flex justify-between items-start">
+                      <div className="space-y-3">
+                        <div className="inline-flex items-center gap-2 px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-[10px] font-bold uppercase tracking-wider border border-blue-500/20">
+                          <Zap className="w-3 h-3" /> {t("landing.mock.assistantActive")}
+                        </div>
+                        <h4 className="text-xl font-bold text-[var(--ink)]">{t("landing.mock.readyToApply")}</h4>
+                        <div className="h-8 w-64 bg-[var(--bg)]/40 rounded-lg border border-[var(--border)] flex items-center px-3 text-xs text-[var(--muted)]">
+                          {t("landing.mock.placeholder")}
+                        </div>
+                      </div>
+                      <div className="w-10 h-10 rounded-full bg-blue-600 flex items-center justify-center shadow-lg shadow-blue-500/40">
+                        <ArrowRight className="w-5 h-5 text-white" />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-4">
+                    <div className="p-4 rounded-xl bg-[var(--bg-soft)] border border-[var(--border)] space-y-3">
+                      <div className="flex justify-between items-start">
+                        <div className="w-8 h-8 rounded bg-black/5 dark:bg-white/10 flex items-center justify-center">
+                          <Briefcase className="w-4 h-4 text-[var(--muted)]" />
+                        </div>
+                        <MoreHorizontal className="w-4 h-4 text-[var(--muted)]" />
+                      </div>
+                      <div>
+                        <div className="h-2 w-16 bg-black/20 dark:bg-white/20 rounded mb-1.5"></div>
+                        <div className="h-1.5 w-24 bg-black/10 dark:bg-white/10 rounded"></div>
+                      </div>
+                      <div className="pt-2 border-t border-[var(--border)] flex items-center gap-2">
+                        <div className="w-16 h-1 bg-black/10 dark:bg-white/10 rounded-full overflow-hidden">
+                          <div className="w-3/4 h-full bg-emerald-500"></div>
+                        </div>
+                        <span className="text-[10px] text-emerald-500 font-bold">
+                          {t("landing.mock.match")}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="p-4 rounded-xl bg-[var(--bg-soft)] border border-[var(--border)] space-y-3">
+                      <div className="flex justify-between items-start">
+                        <div className="w-8 h-8 rounded bg-black/5 dark:bg-white/10 flex items-center justify-center">
+                          <FileText className="w-4 h-4 text-[var(--muted)]" />
+                        </div>
+                        <div className="px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500 text-[10px] font-bold">
+                          V3
+                        </div>
+                      </div>
+                      <div>
+                        <div className="h-2 w-20 bg-black/20 dark:bg-white/20 rounded mb-1.5"></div>
+                        <div className="h-1.5 w-12 bg-black/10 dark:bg-white/10 rounded"></div>
+                      </div>
+                      <div className="pt-2 border-t border-[var(--border)] flex gap-1">
+                        {[1, 2, 3].map((i) => (
+                          <div key={i} className="h-1 w-1 rounded-full bg-[var(--muted)]"></div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="p-4 rounded-xl bg-[var(--bg-soft)] border border-[var(--border)] space-y-3">
+                      <div className="flex justify-between items-start">
+                        <div className="w-8 h-8 rounded bg-black/5 dark:bg-white/10 flex items-center justify-center">
+                          <Mic className="w-4 h-4 text-[var(--muted)]" />
+                        </div>
+                        <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></div>
+                      </div>
+                      <div className="flex items-end gap-0.5 h-8 opacity-50">
+                        {[4, 8, 6, 3, 9, 5, 7, 4, 6, 3].map((h, i) => (
+                          <div
+                            key={i}
+                            style={{ height: `${h * 10}%` }}
+                            className="w-1 bg-black/30 dark:bg-white/40 rounded-full"
+                          />
+                        ))}
+                      </div>
+                      <div className="text-[10px] text-[var(--muted)] text-center">
+                        {t("landing.mock.generatingPitch")}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex-1 rounded-xl bg-[var(--bg-soft)] border border-[var(--border)] p-4 space-y-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="h-2 w-24 bg-black/10 dark:bg-white/10 rounded"></div>
+                      <div className="h-2 w-8 bg-black/5 dark:bg-white/5 rounded"></div>
+                    </div>
+                    {[1, 2, 3].map((i) => (
+                      <div
+                        key={i}
+                        className="flex items-center gap-3 p-2 rounded hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+                      >
+                        <div className="w-8 h-8 rounded bg-blue-500/10 flex items-center justify-center text-blue-500 font-bold text-xs">
+                          G
+                        </div>
+                        <div className="space-y-1 flex-1">
+                          <div className="h-1.5 w-20 bg-black/20 dark:bg-white/20 rounded"></div>
+                          <div className="h-1 w-12 bg-black/10 dark:bg-white/10 rounded"></div>
+                        </div>
+                        <div className="px-2 py-1 rounded bg-green-500/10 text-green-600 dark:text-green-500 text-[10px]">
+                          {t("landing.mock.sent")}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        </section>
+
+        {/* --- FEATURES --- */}
+        <section id="features" className="max-w-7xl mx-auto px-4 py-24">
+          <div className="text-center mb-16">
+            <h2 className="text-3xl md:text-4xl font-bold mb-4 text-[var(--ink)]">
+              {t("landing.features.title")}
+            </h2>
+            <p className="text-[var(--muted)] max-w-2xl mx-auto">
+              {t("landing.features.subtitle")}
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {/* Feature 1 (Large) */}
+            <motion.div
+              {...fadeUp(0)}
+              whileHover={{ y: -5 }}
+              className="md:col-span-2 rounded-3xl bg-gradient-to-br from-blue-900/10 to-[var(--bg-soft)] border border-[var(--border)] p-8 relative overflow-hidden group"
+            >
+              <div className="absolute top-0 right-0 p-10 opacity-10 group-hover:opacity-20 transition-opacity">
+                <FileText className="w-64 h-64 text-blue-500" />
+              </div>
+              <div className="relative z-10">
+                <div className="w-12 h-12 rounded-xl bg-blue-600/20 flex items-center justify-center mb-4 text-blue-400">
+                  <Sparkles className="w-6 h-6" />
+                </div>
+                <h3 className="text-xl font-bold mb-2 text-[var(--ink)]">
+                  {t("landing.features.f1.title")}
+                </h3>
+                <p className="text-[var(--muted)] max-w-sm">
+                  {t("landing.features.f1.desc")}
+                </p>
+              </div>
+            </motion.div>
+
+            {/* Feature 2 */}
+            <motion.div
+              {...fadeUp(0.1)}
+              whileHover={{ y: -5 }}
+              className="rounded-3xl bg-[var(--bg-soft)] border border-[var(--border)] p-8 group"
+            >
+              <div className="w-12 h-12 rounded-xl bg-emerald-600/20 flex items-center justify-center mb-4 text-emerald-500">
+                <Mic className="w-6 h-6" />
+              </div>
+              <h3 className="text-xl font-bold mb-2 text-[var(--ink)]">{t("landing.features.f2.title")}</h3>
+              <p className="text-[var(--muted)] text-sm">{t("landing.features.f2.desc")}</p>
+            </motion.div>
+
+            {/* Feature 3 */}
+            <motion.div
+              {...fadeUp(0.15)}
+              whileHover={{ y: -5 }}
+              className="rounded-3xl bg-[var(--bg-soft)] border border-[var(--border)] p-8 group"
+            >
+              <div className="w-12 h-12 rounded-xl bg-purple-600/20 flex items-center justify-center mb-4 text-purple-500">
+                <BarChart3 className="w-6 h-6" />
+              </div>
+              <h3 className="text-xl font-bold mb-2 text-[var(--ink)]">{t("landing.features.f3.title")}</h3>
+              <p className="text-[var(--muted)] text-sm">{t("landing.features.f3.desc")}</p>
+            </motion.div>
+
+            {/* Feature 4 (Large) */}
+            <motion.div
+              {...fadeUp(0.2)}
+              whileHover={{ y: -5 }}
+              className="md:col-span-2 rounded-3xl bg-gradient-to-bl from-indigo-900/10 to-[var(--bg-soft)] border border-[var(--border)] p-8 relative overflow-hidden group"
+            >
+              <div className="absolute top-0 right-0 p-10 opacity-10 group-hover:opacity-20 transition-opacity">
+                <ShieldCheck className="w-64 h-64 text-indigo-500" />
+              </div>
+              <div className="relative z-10">
+                <div className="w-12 h-12 rounded-xl bg-indigo-600/20 flex items-center justify-center mb-4 text-indigo-500">
+                  <ShieldCheck className="w-6 h-6" />
+                </div>
+                <h3 className="text-xl font-bold mb-2 text-[var(--ink)]">{t("landing.features.f4.title")}</h3>
+                <p className="text-[var(--muted)] max-w-sm">{t("landing.features.f4.desc")}</p>
+              </div>
+            </motion.div>
+          </div>
+        </section>
+
+        {/* --- HOW IT WORKS --- */}
+        <section id="process" className="max-w-5xl mx-auto px-4 py-24">
+          <h2 className="text-3xl md:text-4xl font-bold mb-16 text-center text-[var(--ink)]">
+            {t("landing.process.title")}
+          </h2>
+
+          <div className="relative border-l border-[var(--border)] ml-6 md:ml-12 space-y-16">
+            {[
+              {
+                step: "01",
+                title: t("landing.process.s1.title"),
+                desc: t("landing.process.s1.desc"),
+              },
+              {
+                step: "02",
+                title: t("landing.process.s2.title"),
+                desc: t("landing.process.s2.desc"),
+              },
+              {
+                step: "03",
+                title: t("landing.process.s3.title"),
+                desc: t("landing.process.s3.desc"),
+              },
+            ].map((item, index) => (
+              <motion.div
+                key={index}
+                initial={{ opacity: 0, x: -20 }}
+                whileInView={{ opacity: 1, x: 0 }}
+                viewport={{ once: true, margin: "-100px" }}
+                className="relative pl-12"
+              >
+                <div className="absolute -left-[25px] top-0 w-12 h-12 rounded-full bg-[var(--bg)] border border-blue-500/50 flex items-center justify-center text-blue-500 font-bold shadow-[0_0_15px_rgba(59,130,246,0.2)]">
+                  {item.step}
+                </div>
+                <h3 className="text-2xl font-bold mb-2 text-[var(--ink)]">{item.title}</h3>
+                <p className="text-[var(--muted)] text-lg leading-relaxed max-w-xl">
+                  {item.desc}
+                </p>
               </motion.div>
-            </div>
-          </section>
-        </main>
-      </div>
+            ))}
+          </div>
+        </section>
+
+        {/* --- PRICING --- */}
+        <section
+          id="pricing"
+          className="max-w-7xl mx-auto px-4 py-24 bg-black/5 dark:bg-white/[0.02] border-y border-[var(--border)]"
+        >
+          <div className="text-center mb-16">
+            <h2 className="text-3xl md:text-4xl font-bold mb-4 text-[var(--ink)]">
+              {t("landing.pricing.title")}
+            </h2>
+            <p className="text-[var(--muted)]">{t("landing.pricing.subtitle")}</p>
+          </div>
+
+          <div className="grid md:grid-cols-3 gap-8 max-w-5xl mx-auto">
+            {[
+              {
+                title: t("landing.pricing.p1.title"),
+                price: t("landing.pricing.p1.price"),
+                desc: t("landing.pricing.p1.desc"),
+                features: [
+                  t("landing.pricing.p1.f1"),
+                  t("landing.pricing.p1.f2"),
+                  t("landing.pricing.p1.f3"),
+                ],
+              },
+              {
+                title: t("landing.pricing.p2.title"),
+                price: t("landing.pricing.p2.price"),
+                desc: t("landing.pricing.p2.desc"),
+                features: [
+                  t("landing.pricing.p2.f1"),
+                  t("landing.pricing.p2.f2"),
+                  t("landing.pricing.p2.f3"),
+                  t("landing.pricing.p2.f4"),
+                ],
+                popular: true,
+              },
+              {
+                title: t("landing.pricing.p3.title"),
+                price: t("landing.pricing.p3.price"),
+                desc: t("landing.pricing.p3.desc"),
+                features: [
+                  t("landing.pricing.p3.f1"),
+                  t("landing.pricing.p3.f2"),
+                  t("landing.pricing.p3.f3"),
+                  t("landing.pricing.p3.f4"),
+                ],
+              },
+            ].map((plan, i) => (
+              <motion.div
+                key={i}
+                whileHover={{ y: -10 }}
+                className={`relative p-8 rounded-3xl border flex flex-col ${
+                  plan.popular
+                    ? "bg-gradient-to-b from-blue-900/10 to-[var(--bg-soft)] border-blue-500/40 shadow-2xl shadow-blue-900/10"
+                    : "bg-[var(--bg-soft)] border-[var(--border)]"
+                }`}
+              >
+                {plan.popular && (
+                  <div className="absolute -top-4 left-1/2 -translate-x-1/2 px-4 py-1 bg-blue-600 text-white text-xs font-bold uppercase tracking-wider rounded-full">
+                    {t("landing.pricing.popular")}
+                  </div>
+                )}
+                <h3 className="text-lg font-medium text-[var(--muted)] mb-2">{plan.title}</h3>
+                <div className="text-4xl font-bold mb-2 text-[var(--ink)]">{plan.price}</div>
+                <p className="text-sm text-[var(--muted)] mb-8">{plan.desc}</p>
+
+                <ul className="space-y-4 mb-8 flex-1">
+                  {plan.features.map((feat, j) => (
+                    <li key={j} className="flex items-center gap-3 text-sm text-[var(--ink)]">
+                      <CheckCircle2 className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                      {feat}
+                    </li>
+                  ))}
+                </ul>
+
+                <button
+                  onClick={handleSmartLogin}
+                  className={`w-full py-3 rounded-xl font-bold transition-all ${
+                    plan.popular
+                      ? "bg-blue-600 hover:bg-blue-500 text-white"
+                      : "bg-black/5 dark:bg-white/10 hover:opacity-90 text-[var(--ink)] border border-[var(--border)]"
+                  }`}
+                >
+                  {t("landing.pricing.choose")}
+                </button>
+              </motion.div>
+            ))}
+          </div>
+        </section>
+
+        {/* --- FAQ --- */}
+        <section id="faq" className="max-w-3xl mx-auto px-4 py-24">
+          <h2 className="text-3xl font-bold mb-12 text-center text-[var(--ink)]">{t("landing.faq.title")}</h2>
+          <div className="space-y-4">
+            {[
+              { q: t("landing.faq.q1"), a: t("landing.faq.a1") },
+              { q: t("landing.faq.q2"), a: t("landing.faq.a2") },
+              { q: t("landing.faq.q3"), a: t("landing.faq.a3") },
+            ].map((item, i) => (
+              <details
+                key={i}
+                className="group bg-[var(--bg-soft)] rounded-2xl border border-[var(--border)] overflow-hidden"
+              >
+                <summary className="flex items-center justify-between p-6 cursor-pointer list-none">
+                  <span className="font-medium text-[var(--ink)]">{item.q}</span>
+                  <ChevronDown className="w-5 h-5 text-[var(--muted)] transition-transform group-open:rotate-180" />
+                </summary>
+                <div className="px-6 pb-6 text-[var(--muted)] text-sm leading-relaxed">
+                  {item.a}
+                </div>
+              </details>
+            ))}
+          </div>
+        </section>
+
+        {/* --- CTA FINAL --- */}
+        <section className="px-4 py-24 text-center">
+          <div className="max-w-4xl mx-auto bg-gradient-to-b from-blue-900/20 to-[var(--bg-soft)] border border-blue-500/20 rounded-[3rem] p-12 relative overflow-hidden">
+            <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full h-full bg-[radial-gradient(circle_at_center,_rgba(59,130,246,0.12),_transparent_70%)] pointer-events-none" />
+
+            <h2 className="text-3xl md:text-5xl font-bold mb-6 relative z-10 text-[var(--ink)]">
+              {t("landing.cta.title")}
+            </h2>
+            <p className="text-lg text-[var(--muted)] mb-10 max-w-2xl mx-auto relative z-10">
+              {t("landing.cta.subtitle")}
+            </p>
+
+            <Link
+              href="/signup"
+              className="relative z-10 px-8 py-4 bg-[var(--ink)] text-[var(--bg)] text-lg font-bold rounded-full hover:opacity-90 transition-all inline-block"
+            >
+              {t("landing.cta.button")}
+            </Link>
+          </div>
+        </section>
+      </main>
+
+      {/* --- FOOTER --- */}
+      <footer className="border-t border-[var(--border)] bg-black/5 dark:bg-black/20 text-[var(--muted)] py-12 px-4 text-center text-sm">
+        <div className="flex items-center justify-center gap-2 mb-4">
+          <Zap className="w-4 h-4" />
+          <span className="font-bold text-[var(--ink)]">{t("landing.footer.brand")}</span>
+        </div>
+        <p>
+          &copy; {new Date().getFullYear()} {t("landing.footer.rights")}
+        </p>
+      </footer>
     </div>
   );
 }

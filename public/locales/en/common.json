@@ -1,75 +1,54 @@
 {
-  "header": {
-    "title": "AI Applications Assistant",
-    "space": "Candidate area",
-    "connected": "Signed in:",
-    "logout": "Log out"
-  },
-  "nav": {
-    "profile": "AI CV Profile",
-    "coverLetter": "Application assistant",
-    "tracker": "Application tracker",
-    "interview": "Interview prep",
-    "apply": "Apply",
-    "history": "AI history",
-    "credits": "Credits",
-    "settings": "Settings"
-  },
   "landing": {
-    "badge": "AI for job applications",
-    "title": "Your AI-powered job application workspace.",
-    "subtitle": "Upload your CV, generate targeted cover letters, prepare your pitch and track your applications in one place.",
-    "ctaPrimary": "Start for free",
-    "ctaSecondary": "I already have an account"
-  },
-  "dashboard": {
-    "title": "Dashboard",
-    "welcome": "Welcome",
-    "creditsLabel": "credits",
-    "creditsLoading": "Loading…"
-  },
-  "auth": {
-    "loginTitle": "Log in",
-    "signupTitle": "Create an account",
-    "email": "Email",
-    "password": "Password",
-    "confirmPassword": "Confirm password",
-    "forgotPassword": "Forgot password?",
-    "noAccount": "Don't have an account yet?",
-    "haveAccount": "Already have an account?",
-    "createAccount": "Create account",
-    "signIn": "Log in",
-    "signOut": "Log out",
-    "continue": "Continue",
-    "back": "Back",
-    "verifyEmailTitle": "Verify your email",
-    "verifyEmailDesc": "We sent you a verification email. Click the link to activate your account.",
-    "resend": "Resend email",
-    "resendDone": "Email resent.",
-    "blockedTitle": "Account blocked",
-    "blockedDesc": "Your account has been blocked. Contact support if needed."
-  },
-  "common": {
-    "loading": "Loading…",
-    "menu": "Menu",
-    "navigation": "Navigation",
-    "save": "Save",
-    "cancel": "Cancel",
-    "close": "Close",
-    "delete": "Delete",
-    "edit": "Edit",
-    "confirm": "Confirm",
-    "yes": "Yes",
-    "no": "No",
-    "search": "Search",
-    "copy": "Copy",
-    "copied": "Copied!",
-    "error": "Something went wrong.",
-    "retry": "Retry"
-  },
-  "errors": {
-    "blocked": "Your account has been blocked. Contact support if needed.",
-    "unauthorized": "Access denied.",
-    "notFound": "Page not found."
+    "brand": "SmartApply",
+    "nav": { "features": "Features", "process": "How it works", "pricing": "Pricing", "login": "Login", "tryFree": "Try for free" },
+    "hero": {
+      "badge": "New: AI Resume Analysis v2",
+      "titleLine1": "Land the job",
+      "titleGradient": "without the hassle.",
+      "subtitle": "The AI assistant that writes cover letters, prepares your pitch, and optimizes your resume in seconds. Focus on the interview — we handle the rest.",
+      "ctaPrimary": "Try for free",
+      "ctaSecondary": "Generate an ATS Resume"
+    },
+    "mock": {
+      "dashboard": "Dashboard", "cvs": "My Resumes", "apps": "Applications", "letters": "AI Letters", "stats": "Analytics",
+      "proMode": "Pro Mode", "hello": "Hi, Thomas 👋", "subtitle": "You have 2 suggested actions today.",
+      "assistantActive": "Assistant Active", "readyToApply": "Ready to apply?", "placeholder": "Paste a job URL or description...",
+      "match": "92% Match", "generatingPitch": "Generating pitch...", "sent": "Sent"
+    },
+    "features": {
+      "title": "A complete suite for candidates",
+      "subtitle": "Everything you need to go from “Candidate” to “Hired”, all in one smooth interface.",
+      "f1": { "title": "AI Cover Letter Generator", "desc": "Paste the job post — our AI extracts keywords and writes a unique cover letter that matches your profile to the role." },
+      "f2": { "title": "Interview Pitch", "desc": "Stop freezing. Get a tailored “Tell me about yourself” script to shine in interviews." },
+      "f3": { "title": "Application Tracker", "desc": "A Kanban-style board to track each application: Sent, Interview, Offer." },
+      "f4": { "title": "Resume Analyzer", "desc": "Upload your PDF. The AI extracts your skills and experience to reuse intelligently across applications." }
+    },
+    "process": {
+      "title": "How it works",
+      "s1": { "title": "Import your profile", "desc": "Upload your current resume. We analyze your background, skills, and achievements." },
+      "s2": { "title": "Target a job", "desc": "Paste the job description you want. The AI identifies key expectations." },
+      "s3": { "title": "Generate & apply", "desc": "Instantly get a letter, a pitch, and interview tips. Customize, export, send." }
+    },
+    "pricing": {
+      "title": "Invest in your future",
+      "subtitle": "No hidden subscription. Pay for what you use.",
+      "popular": "Popular",
+      "choose": "Choose",
+      "p1": { "title": "Starter", "price": "Free", "desc": "To test the AI power", "f1": "Basic resume analysis", "f2": "1 cover letter", "f3": "Tracker access" },
+      "p2": { "title": "Boost", "price": "€9.99", "desc": "For active job hunting", "f1": "Full resume analysis", "f2": "15 cover letters", "f3": "5 interview pitches", "f4": "Priority support" },
+      "p3": { "title": "Career", "price": "€19.99", "desc": "The full arsenal", "f1": "Unlimited credits (30 days)", "f2": "AI resume optimization", "f3": "Unlimited letters", "f4": "AI interview coaching" }
+    },
+    "faq": {
+      "title": "FAQ",
+      "q1": "Does AI replace my work?",
+      "a1": "No — it accelerates it. You keep final control over everything generated.",
+      "q2": "Is my data secure?",
+      "a2": "Yes. We don’t sell your data. It’s only used to generate your documents.",
+      "q3": "Can I cancel anytime?",
+      "a3": "There’s nothing to cancel! We work with credit packs, no recurring subscription."
+    },
+    "cta": { "title": "Ready to land your next role?", "subtitle": "Join thousands of candidates who reduced stress and increased interview invites.", "button": "Try for free" },
+    "footer": { "brand": "SmartApply AI", "rights": "SmartApply. All rights reserved." }
   }
 }

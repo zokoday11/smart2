@@ -1,0 +1,54 @@
+{
+  "landing": {
+    "brand": "SmartApply",
+    "nav": { "features": "Funzionalità", "process": "Come funziona", "pricing": "Prezzi", "login": "Accedi", "tryFree": "Prova gratis" },
+    "hero": {
+      "badge": "Novità: Analisi CV con IA v2",
+      "titleLine1": "Ottieni il lavoro",
+      "titleGradient": "senza fatica.",
+      "subtitle": "L’assistente IA che scrive lettere, prepara il pitch e ottimizza il CV in pochi secondi. Tu pensa al colloquio — al resto ci pensiamo noi.",
+      "ctaPrimary": "Prova gratis",
+      "ctaSecondary": "Genera un CV ATS"
+    },
+    "mock": {
+      "dashboard": "Dashboard", "cvs": "I miei CV", "apps": "Candidature", "letters": "Lettere IA", "stats": "Statistiche",
+      "proMode": "Modalità Pro", "hello": "Ciao, Thomas 👋", "subtitle": "Hai 2 azioni suggerite oggi.",
+      "assistantActive": "Assistente attivo", "readyToApply": "Pronto a candidarti?", "placeholder": "Incolla URL o descrizione del lavoro...",
+      "match": "92% Match", "generatingPitch": "Generazione pitch...", "sent": "Inviato"
+    },
+    "features": {
+      "title": "Una suite completa per candidati",
+      "subtitle": "Tutto ciò che serve per passare da “Candidato” a “Assunto”, in un’unica interfaccia fluida.",
+      "f1": { "title": "Generatore di lettere IA", "desc": "Incolla l’offerta: l’IA estrae le keyword e scrive una lettera unica allineata al tuo profilo." },
+      "f2": { "title": "Pitch colloquio", "desc": "Niente più blocchi. Ottieni uno script su misura per brillare ai colloqui." },
+      "f3": { "title": "Tracker candidature", "desc": "Board stile Kanban per seguire: Inviata, Colloquio, Offerta." },
+      "f4": { "title": "Analizzatore CV", "desc": "Carica il PDF. L’IA estrae skill ed esperienze per riutilizzarle in modo intelligente." }
+    },
+    "process": {
+      "title": "Come funziona",
+      "s1": { "title": "Importa il profilo", "desc": "Carica il tuo CV. Analizziamo percorso, competenze e risultati." },
+      "s2": { "title": "Scegli un’offerta", "desc": "Incolla la job description. L’IA identifica i requisiti chiave." },
+      "s3": { "title": "Genera e candidati", "desc": "Lettera, pitch e consigli subito. Personalizza, esporta, invia." }
+    },
+    "pricing": {
+      "title": "Investi nel tuo futuro",
+      "subtitle": "Nessun abbonamento nascosto. Paghi ciò che usi.",
+      "popular": "Popolare",
+      "choose": "Scegli",
+      "p1": { "title": "Starter", "price": "Gratis", "desc": "Per provare l’IA", "f1": "Analisi CV base", "f2": "1 lettera", "f3": "Accesso tracker" },
+      "p2": { "title": "Boost", "price": "€9.99", "desc": "Per ricerca attiva", "f1": "Analisi CV completa", "f2": "15 lettere", "f3": "5 pitch", "f4": "Supporto prioritario" },
+      "p3": { "title": "Carriera", "price": "€19.99", "desc": "L’arsenale completo", "f1": "Crediti illimitati (30 giorni)", "f2": "Ottimizzazione CV IA", "f3": "Lettere illimitate", "f4": "Coaching colloquio IA" }
+    },
+    "faq": {
+      "title": "FAQ",
+      "q1": "L’IA sostituisce il mio lavoro?",
+      "a1": "No, lo accelera. Mantieni il controllo finale sui contenuti.",
+      "q2": "I miei dati sono al sicuro?",
+      "a2": "Sì. Non vendiamo i dati. Servono solo per generare i documenti.",
+      "q3": "Posso annullare quando voglio?",
+      "a3": "Non c’è nulla da annullare! Funzioniamo con pacchetti di crediti, senza abbonamento ricorrente."
+    },
+    "cta": { "title": "Pronto per il tuo prossimo lavoro?", "subtitle": "Unisciti a migliaia di candidati che hanno ridotto lo stress e aumentato i colloqui.", "button": "Prova gratis" },
+    "footer": { "brand": "SmartApply AI", "rights": "SmartApply. Tutti i diritti riservati." }
+  }
+}

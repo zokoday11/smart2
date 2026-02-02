@@ -1,75 +1,54 @@
 {
-  "header": {
-    "title": "Assistant Candidatures IA",
-    "space": "Espace candidat",
-    "connected": "Connecté·e :",
-    "logout": "Se déconnecter"
-  },
-  "nav": {
-    "profile": "Profil CV IA",
-    "coverLetter": "Assistant candidature",
-    "tracker": "Suivi candidatures",
-    "interview": "Préparer entretien",
-    "apply": "Postuler",
-    "history": "Historique IA",
-    "credits": "Crédits",
-    "settings": "Paramètres"
-  },
   "landing": {
-    "badge": "IA appliquée aux candidatures",
-    "title": "Ton bureau de candidature, piloté par l’IA.",
-    "subtitle": "Importe ton CV, génère des lettres ciblées, prépare ton pitch et suis tes candidatures depuis un seul espace.",
-    "ctaPrimary": "Essayer gratuitement",
-    "ctaSecondary": "J’ai déjà un compte"
-  },
-  "dashboard": {
-    "title": "Tableau de bord",
-    "welcome": "Bienvenue",
-    "creditsLabel": "crédits",
-    "creditsLoading": "Chargement…"
-  },
-  "auth": {
-    "loginTitle": "Se connecter",
-    "signupTitle": "Créer un compte",
-    "email": "Email",
-    "password": "Mot de passe",
-    "confirmPassword": "Confirmer le mot de passe",
-    "forgotPassword": "Mot de passe oublié ?",
-    "noAccount": "Pas encore de compte ?",
-    "haveAccount": "Déjà un compte ?",
-    "createAccount": "Créer un compte",
-    "signIn": "Se connecter",
-    "signOut": "Se déconnecter",
-    "continue": "Continuer",
-    "back": "Retour",
-    "verifyEmailTitle": "Vérifie ton email",
-    "verifyEmailDesc": "Un email de vérification t’a été envoyé. Clique sur le lien pour activer ton compte.",
-    "resend": "Renvoyer l’email",
-    "resendDone": "Email renvoyé.",
-    "blockedTitle": "Compte bloqué",
-    "blockedDesc": "Ton compte a été bloqué. Contacte le support si besoin."
-  },
-  "common": {
-    "loading": "Chargement…",
-    "menu": "Menu",
-    "navigation": "Navigation",
-    "save": "Enregistrer",
-    "cancel": "Annuler",
-    "close": "Fermer",
-    "delete": "Supprimer",
-    "edit": "Modifier",
-    "confirm": "Confirmer",
-    "yes": "Oui",
-    "no": "Non",
-    "search": "Rechercher",
-    "copy": "Copier",
-    "copied": "Copié !",
-    "error": "Une erreur est survenue.",
-    "retry": "Réessayer"
-  },
-  "errors": {
-    "blocked": "Ton compte a été bloqué. Contacte le support si besoin.",
-    "unauthorized": "Accès refusé.",
-    "notFound": "Page introuvable."
+    "brand": "SmartApply",
+    "nav": { "features": "Fonctionnalités", "process": "Comment ça marche", "pricing": "Tarifs", "login": "Connexion", "tryFree": "Essayer gratuitement" },
+    "hero": {
+      "badge": "Nouveau : Analyse de CV par IA v2",
+      "titleLine1": "Décrochez le job",
+      "titleGradient": "sans la corvée.",
+      "subtitle": "L'assistant IA qui rédige vos lettres, prépare vos pitchs et optimise votre CV en quelques secondes. Concentrez-vous sur l'entretien, on gère le reste.",
+      "ctaPrimary": "Essayer gratuitement",
+      "ctaSecondary": "Générer un CV ATS"
+    },
+    "mock": {
+      "dashboard": "Tableau de bord", "cvs": "Mes CVs", "apps": "Candidatures", "letters": "Lettres IA", "stats": "Statistiques",
+      "proMode": "Mode Pro", "hello": "Bonjour, Thomas 👋", "subtitle": "Vous avez 2 actions suggérées aujourd'hui.",
+      "assistantActive": "Assistant Actif", "readyToApply": "Prêt à postuler ?", "placeholder": "Collez une URL ou description de poste...",
+      "match": "92% Match", "generatingPitch": "Génération du pitch...", "sent": "Envoyé"
+    },
+    "features": {
+      "title": "Une suite complète pour candidats",
+      "subtitle": "Tout ce dont vous avez besoin pour passer du statut \"Candidat\" à \"Recruté\", centralisé dans une interface fluide.",
+      "f1": { "title": "Générateur de Lettres IA", "desc": "Collez l'offre, notre IA analyse les mots-clés et rédige une lettre de motivation unique qui matche parfaitement votre profil avec le poste." },
+      "f2": { "title": "Pitch Oral", "desc": "Ne bégayez plus. Obtenez un script de présentation \"Tell me about yourself\" sur-mesure pour briller en entretien." },
+      "f3": { "title": "Suivi Candidatures", "desc": "Un tableau de type Kanban pour suivre l'état de chaque candidature : Envoyé, Entretien, Offre." },
+      "f4": { "title": "Analyseur de CV", "desc": "Importez votre PDF. L'IA extrait vos compétences et expériences pour les réutiliser intelligemment dans chaque nouvelle candidature." }
+    },
+    "process": {
+      "title": "Comment ça marche ?",
+      "s1": { "title": "Importez votre profil", "desc": "Uploadez votre CV actuel. Notre système analyse votre parcours, vos skills et vos réalisations." },
+      "s2": { "title": "Ciblez une offre", "desc": "Copiez-collez la description du poste qui vous intéresse. L'IA identifie les points clés attendus." },
+      "s3": { "title": "Générez & Postulez", "desc": "Obtenez instantanément une lettre, un pitch et des conseils d'entretien. Personnalisez, exportez, envoyez." }
+    },
+    "pricing": {
+      "title": "Investissez dans votre avenir",
+      "subtitle": "Pas d'abonnement caché. Payez ce que vous utilisez.",
+      "popular": "Populaire",
+      "choose": "Choisir",
+      "p1": { "title": "Découverte", "price": "Gratuit", "desc": "Pour tester la puissance de l'IA", "f1": "Analyse CV basique", "f2": "1 Lettre de motivation", "f3": "Accès Tracker" },
+      "p2": { "title": "Boost", "price": "9.99€", "desc": "Pour une recherche active", "f1": "Analyse CV complète", "f2": "15 Lettres de motivation", "f3": "5 Pitchs d'entretien", "f4": "Support prioritaire" },
+      "p3": { "title": "Carrière", "price": "19.99€", "desc": "L'arsenal complet", "f1": "Crédits illimités (30 jours)", "f2": "Optimisation CV par IA", "f3": "Lettres illimitées", "f4": "Coaching entretien IA" }
+    },
+    "faq": {
+      "title": "Questions fréquentes",
+      "q1": "Est-ce que l'IA remplace mon travail ?",
+      "a1": "Non, elle l'accélère. Vous gardez le contrôle final sur tous les textes générés.",
+      "q2": "Mes données sont-elles sécurisées ?",
+      "a2": "Oui, nous ne vendons pas vos données. Elles servent uniquement à générer vos documents.",
+      "q3": "Puis-je annuler à tout moment ?",
+      "a3": "Il n'y a rien à annuler ! Nous fonctionnons par packs de crédits, sans abonnement récurrent."
+    },
+    "cta": { "title": "Prêt à décrocher votre prochain poste ?", "subtitle": "Rejoignez des milliers de candidats qui ont réduit leur stress et augmenté leurs entretiens.", "button": "Essayer gratuitement" },
+    "footer": { "brand": "SmartApply AI", "rights": "SmartApply. Tous droits réservés." }
   }
 }
