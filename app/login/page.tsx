@@ -26,7 +26,6 @@ import {
   Eye,
   EyeOff,
 } from "lucide-react";
-import { useTranslation } from "react-i18next";
 
 // --- CONFIG & HELPERS ---
 const MAX_ATTEMPTS = 5;
@@ -36,17 +35,14 @@ function isProbablyMobile() {
   if (typeof navigator === "undefined") return false;
   return /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent);
 }
-
 function isInAppBrowser() {
   if (typeof navigator === "undefined") return false;
   const ua = navigator.userAgent || "";
   return /FBAN|FBAV|Instagram|Line|LinkedInApp|Twitter|X;/i.test(ua);
 }
-
 function shouldUseRedirectFlow() {
   return isProbablyMobile() || isInAppBrowser();
 }
-
 function formatRecaptchaDetails(check: any) {
   const reason = String(check?.reason || "unknown");
   const score = typeof check?.score === "number" ? `score=${check.score.toFixed(2)}` : null;
@@ -54,14 +50,45 @@ function formatRecaptchaDetails(check: any) {
   return parts.length ? `(${parts.join(", ")})` : "";
 }
 
+const TXT = {
+  tagline: "Assistant candidatures",
+  titleNav: "Connexion",
+  back: "Retour",
+  signup: "Créer un compte",
+  badge: "Connexion",
+  title: "Se connecter",
+  subtitle: "Accède à ton espace en toute sécurité.",
+  locked: (seconds: number) => `Trop de tentatives. Réessaie dans ${seconds}s.`,
+  accountBlocked: "Ton compte est bloqué.",
+  blockedByAdmin: "Accès bloqué par un administrateur.",
+  accountCreated: "Compte créé ! Connecte-toi maintenant.",
+  welcome: (name: string) => `Bienvenue ${name ? name : ""} !`,
+  recaptchaDegraded: "Vérification anti-bot indisponible. Mode dégradé activé.",
+  recaptchaBlocked: "Vérification anti-bot impossible. Réessaie plus tard.",
+  recaptchaRefused: (details: string) => `Vérification anti-bot refusée ${details}`,
+  invalidCredentials: "Email ou mot de passe incorrect.",
+  tooManyRequests: "Trop de tentatives. Réessaie plus tard.",
+  genericError: "Erreur de connexion. Réessaie.",
+  googleError: "Connexion Google impossible. Réessaie.",
+  emailLabel: "Email",
+  emailPlaceholder: "exemple@email.com",
+  passwordLabel: "Mot de passe",
+  passwordPlaceholder: "••••••••",
+  forgot: "Mot de passe oublié ?",
+  submit: "Se connecter",
+  or: "OU",
+  google: "Continuer avec Google",
+  newHere: "Nouveau ici ?",
+  createAccount: "Créer un compte",
+};
+
 async function checkRecaptchaOrDegrade(params: {
   action: string;
   emailForLog: string;
   providerForLog: "password" | "google";
   onError: (msg: string) => void;
-  t: (k: string, opt?: any) => string;
 }) {
-  const { action, emailForLog, providerForLog, onError, t } = params;
+  const { action, emailForLog, providerForLog, onError } = params;
   const allowDegraded = shouldUseRedirectFlow();
 
   let token = "";
@@ -76,11 +103,11 @@ async function checkRecaptchaOrDegrade(params: {
     });
 
     if (allowDegraded) {
-      onError(t("auth.login.messages.recaptchaDegraded"));
+      onError(TXT.recaptchaDegraded);
       return { ok: true, degraded: true };
     }
 
-    onError(t("auth.login.messages.recaptchaBlocked"));
+    onError(TXT.recaptchaBlocked);
     return { ok: false, degraded: false };
   }
 
@@ -98,22 +125,21 @@ async function checkRecaptchaOrDegrade(params: {
       return { ok: true, degraded: true };
     }
 
-    onError(t("auth.login.messages.recaptchaRefused", { details }));
+    onError(TXT.recaptchaRefused(details));
     return { ok: false, degraded: false };
   }
 
   return { ok: true, degraded: false };
 }
 
-function mapLoginError(t: (k: string, opt?: any) => string, err: any) {
+function mapLoginError(err: any) {
   const code = err?.code;
-  if (code === "auth/wrong-password" || code === "auth/user-not-found") return t("auth.login.errors.invalidCredentials");
-  if (code === "auth/too-many-requests") return t("auth.login.errors.tooManyRequests");
-  return t("auth.login.errors.generic");
+  if (code === "auth/wrong-password" || code === "auth/user-not-found") return TXT.invalidCredentials;
+  if (code === "auth/too-many-requests") return TXT.tooManyRequests;
+  return TXT.genericError;
 }
 
 function LoginPageInner() {
-  const { t } = useTranslation(["common", "auth"]);
   const router = useRouter();
   const searchParams = useSearchParams();
   const { user, loading, blocked } = useAuth();
@@ -133,9 +159,9 @@ function LoginPageInner() {
   useEffect(() => {
     if (blocked) {
       setInfo(null);
-      setError(t("auth.login.messages.accountBlocked"));
+      setError(TXT.accountBlocked);
     }
-  }, [blocked, t]);
+  }, [blocked]);
 
   useEffect(() => {
     if (!loading && !blocked && user && !submitting) {
@@ -150,12 +176,12 @@ function LoginPageInner() {
 
     if (blockedParam === "1") {
       setInfo(null);
-      setError(t("auth.login.messages.blockedByAdmin"));
+      setError(TXT.blockedByAdmin);
     } else if (justSignedUp === "1") {
       setError(null);
-      setInfo(t("auth.login.messages.accountCreated"));
+      setInfo(TXT.accountCreated);
     }
-  }, [searchParams, t]);
+  }, [searchParams]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -211,11 +237,11 @@ function LoginPageInner() {
 
         if (snap.data()?.blocked) {
           await auth.signOut();
-          setError(t("auth.login.messages.accountBlockedShort"));
+          setError(TXT.accountBlocked);
           return;
         }
 
-        setInfo(t("auth.login.messages.welcome", { name: u.displayName || u.email || "" }));
+        setInfo(TXT.welcome(u.displayName || u.email || ""));
         const redirectTo = searchParams.get("redirect") || "/app";
         router.replace(redirectTo);
       } catch (err: any) {
@@ -240,7 +266,6 @@ function LoginPageInner() {
         emailForLog: email,
         providerForLog: "password",
         onError: (msg) => setInfo(msg),
-        t,
       });
       if (!cap.ok) return;
 
@@ -249,7 +274,7 @@ function LoginPageInner() {
 
       if (snap.data()?.blocked) {
         await auth.signOut();
-        setError(t("auth.login.messages.accountBlockedShort"));
+        setError(TXT.accountBlocked);
         return;
       }
 
@@ -276,7 +301,7 @@ function LoginPageInner() {
         return next;
       });
 
-      setError(mapLoginError(t, err));
+      setError(mapLoginError(err));
     } finally {
       setSubmitting(false);
     }
@@ -293,7 +318,7 @@ function LoginPageInner() {
         const snap = await getDoc(doc(db, "users", result.user.uid));
         if (snap.data()?.blocked) {
           await auth.signOut();
-          setError(t("auth.login.messages.accountBlockedShort"));
+          setError(TXT.accountBlocked);
           return;
         }
         const redirectTo = searchParams.get("redirect") || "/app";
@@ -307,7 +332,7 @@ function LoginPageInner() {
       }
     } catch (err: any) {
       logAuthFailed({ email, provider: "google", errorCode: err.code, errorMessage: err.message });
-      setError(t("auth.login.errors.google"));
+      setError(TXT.googleError);
     } finally {
       setSubmitting(false);
     }
@@ -323,10 +348,8 @@ function LoginPageInner() {
               IA
             </div>
             <div className="flex flex-col">
-              <span className="text-[10px] uppercase tracking-[0.18em] text-slate-400">
-                {t("common.app.tagline", "Assistant candidatures")}
-              </span>
-              <span className="text-xs font-medium text-slate-100">{t("auth.login.nav.title")}</span>
+              <span className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{TXT.tagline}</span>
+              <span className="text-xs font-medium text-slate-100">{TXT.titleNav}</span>
             </div>
           </div>
           <nav className="flex items-center gap-2 text-[11px]">
@@ -334,28 +357,30 @@ function LoginPageInner() {
               href="/"
               className="px-2 py-1 rounded-full border border-slate-700/80 hover:border-sky-500/80 text-slate-300 hover:text-sky-300 transition-colors flex items-center gap-1"
             >
-              <ArrowLeft className="w-3 h-3" /> {t("auth.login.nav.back")}
+              <ArrowLeft className="w-3 h-3" /> {TXT.back}
             </Link>
-            <Link href="/signup" className="px-3 py-1 rounded-full bg-sky-500/90 text-slate-950 font-medium hover:bg-sky-400 transition-colors">
-              {t("auth.login.nav.signup")}
+            <Link
+              href="/signup"
+              className="px-3 py-1 rounded-full bg-sky-500/90 text-slate-950 font-medium hover:bg-sky-400 transition-colors"
+            >
+              {TXT.signup}
             </Link>
           </nav>
         </div>
       </header>
 
-      {/* CONTENU */}
+      {/* CONTENT */}
       <main className="flex-1 flex items-center justify-center px-4 py-8">
         <div className="glass max-w-md w-full p-6 sm:p-7 rounded-2xl border border-slate-800 bg-slate-950/80 shadow-2xl shadow-sky-900/40">
           <div className="mb-6 text-center sm:text-left">
             <p className="inline-flex items-center gap-2 rounded-full bg-slate-900/80 border border-slate-700 px-3 py-1 mb-3">
               <LogIn className="w-3 h-3 text-sky-400" />
-              <span className="text-[10px] uppercase tracking-[0.18em] text-slate-300">{t("auth.login.badge")}</span>
+              <span className="text-[10px] uppercase tracking-[0.18em] text-slate-300">{TXT.badge}</span>
             </p>
-            <h1 className="text-xl font-bold text-slate-50 mb-1">{t("auth.login.title")}</h1>
-            <p className="text-xs text-slate-400">{t("auth.login.subtitle")}</p>
+            <h1 className="text-xl font-bold text-slate-50 mb-1">{TXT.title}</h1>
+            <p className="text-xs text-slate-400">{TXT.subtitle}</p>
           </div>
 
-          {/* MESSAGES */}
           {info && (
             <div className="mb-4 p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-200 text-xs flex gap-2 items-start">
               <CheckCircle2 className="w-4 h-4 flex-shrink-0 mt-0.5" /> <span>{info}</span>
@@ -369,13 +394,13 @@ function LoginPageInner() {
           {isLocked && (
             <div className="mb-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-200 text-xs flex gap-2 items-start">
               <Lock className="w-4 h-4 flex-shrink-0 mt-0.5" />
-              <span>{t("auth.login.messages.locked", { seconds: lockRemaining })}</span>
+              <span>{TXT.locked(lockRemaining)}</span>
             </div>
           )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-slate-300 ml-1">{t("auth.login.form.email.label")}</label>
+              <label className="text-xs font-medium text-slate-300 ml-1">{TXT.emailLabel}</label>
               <div className="relative">
                 <Mail className="absolute left-3 top-2.5 w-4 h-4 text-slate-500" />
                 <input
@@ -384,7 +409,7 @@ function LoginPageInner() {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   className="w-full bg-[#0A0A0B] border border-white/10 rounded-xl pl-10 pr-3 py-2 text-xs text-white placeholder:text-slate-600 focus:border-sky-500 focus:ring-1 focus:ring-sky-500 outline-none transition-all"
-                  placeholder={t("auth.login.form.email.placeholder")}
+                  placeholder={TXT.emailPlaceholder}
                   disabled={submitting || isLocked}
                 />
               </div>
@@ -392,9 +417,9 @@ function LoginPageInner() {
 
             <div className="space-y-1.5">
               <div className="flex justify-between items-center ml-1">
-                <label className="text-xs font-medium text-slate-300">{t("auth.login.form.password.label")}</label>
+                <label className="text-xs font-medium text-slate-300">{TXT.passwordLabel}</label>
                 <Link href="/forgot-password" className="text-[10px] text-blue-400 hover:text-blue-300 transition-colors">
-                  {t("auth.login.form.password.forgot")}
+                  {TXT.forgot}
                 </Link>
               </div>
               <div className="relative">
@@ -405,10 +430,14 @@ function LoginPageInner() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   className="w-full bg-[#0A0A0B] border border-white/10 rounded-xl pl-10 pr-10 py-2 text-xs text-white placeholder:text-slate-600 focus:border-sky-500 focus:ring-1 focus:ring-sky-500 outline-none transition-all"
-                  placeholder={t("auth.login.form.password.placeholder")}
+                  placeholder={TXT.passwordPlaceholder}
                   disabled={submitting || isLocked}
                 />
-                <button type="button" onClick={() => setShowPwd(!showPwd)} className="absolute right-3 top-2.5 text-slate-500 hover:text-white transition-colors">
+                <button
+                  type="button"
+                  onClick={() => setShowPwd(!showPwd)}
+                  className="absolute right-3 top-2.5 text-slate-500 hover:text-white transition-colors"
+                >
                   {showPwd ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
               </div>
@@ -419,13 +448,13 @@ function LoginPageInner() {
               disabled={submitting || isLocked}
               className="w-full h-11 rounded-xl bg-sky-500 hover:bg-sky-400 text-white font-semibold text-sm transition-all shadow-lg shadow-sky-500/20 disabled:opacity-50 flex items-center justify-center gap-2 mt-2"
             >
-              {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : t("auth.login.form.submit")}
+              {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : TXT.submit}
             </button>
           </form>
 
           <div className="flex items-center gap-3 my-5">
             <div className="h-px flex-1 bg-slate-800" />
-            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">{t("auth.login.or")}</span>
+            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">{TXT.or}</span>
             <div className="h-px flex-1 bg-slate-800" />
           </div>
 
@@ -440,13 +469,13 @@ function LoginPageInner() {
               <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.84z" fill="#FBBC05" />
               <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335" />
             </svg>
-            {t("auth.login.google")}
+            {TXT.google}
           </button>
 
           <p className="mt-6 text-center text-xs text-slate-500">
-            {t("auth.login.footer.newHere")}{" "}
+            {TXT.newHere}{" "}
             <Link href="/signup" className="text-sky-400 hover:text-sky-300 font-semibold underline decoration-sky-500/30">
-              {t("auth.login.footer.createAccount")}
+              {TXT.createAccount}
             </Link>
           </p>
         </div>
@@ -457,7 +486,13 @@ function LoginPageInner() {
 
 export default function LoginPage() {
   return (
-    <Suspense fallback={<div className="min-h-screen bg-[#0A0A0B] flex items-center justify-center"><Loader2 className="w-6 h-6 text-slate-500 animate-spin" /></div>}>
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-[#0A0A0B] flex items-center justify-center">
+          <Loader2 className="w-6 h-6 text-slate-500 animate-spin" />
+        </div>
+      }
+    >
       <LoginPageInner />
     </Suspense>
   );

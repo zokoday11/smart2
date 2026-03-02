@@ -12,7 +12,6 @@ import {
   where,
 } from "firebase/firestore";
 import { AnimatePresence, motion } from "framer-motion";
-import { useTranslation } from "react-i18next";
 import {
   LayoutDashboard,
   Target,
@@ -32,7 +31,6 @@ import {
   Search,
   Command,
   Bell,
-  Globe,
   Briefcase,
   ExternalLink,
 } from "lucide-react";
@@ -45,7 +43,6 @@ import { signOut } from "firebase/auth";
  * ✅ AMÉLIORATIONS:
  * - Mode Jour/Nuit robuste (class + localStorage + meta theme-color)
  * - Barre de recherche dispo mobile (bouton + overlay)
- * - Langues étendues + menu propre (FR/EN/ES/DE/IT/PT)
  * - Notifications “réelles” côté UI (badge + panel) avec contenu basé sur candidatures
  * - Nav responsive + accessibilité + fermeture via ESC + click outside
  */
@@ -60,17 +57,6 @@ const NAV_LINKS = [
   { href: "/app/history", key: "history", label: "Historique", icon: History },
   { href: "/app/credits", key: "credits", label: "Crédits & Plan", icon: Zap },
 ] as const;
-
-type AppLang = "fr" | "en" | "es" | "de" | "it" | "pt";
-
-const LANGUAGES: Array<{ code: AppLang; label: string; flag: string }> = [
-  { code: "fr", label: "Français", flag: "🇫🇷" },
-  { code: "en", label: "English", flag: "🇺🇸" },
-  { code: "es", label: "Español", flag: "🇪🇸" },
-  { code: "de", label: "Deutsch", flag: "🇩🇪" },
-  { code: "it", label: "Italiano", flag: "🇮🇹" },
-  { code: "pt", label: "Português", flag: "🇵🇹" },
-];
 
 // --- TYPES ---
 type ApplicationLite = {
@@ -146,14 +132,12 @@ function AppHeader({
   onToggleSidebar,
   handleLogout,
 }: AppHeaderProps) {
-  const { i18n } = useTranslation();
   const router = useRouter();
 
   // Theme
   const [theme, setTheme] = useState<ThemeMode>("dark");
 
   // Menus
-  const [showLangMenu, setShowLangMenu] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showNotifs, setShowNotifs] = useState(false);
 
@@ -163,7 +147,6 @@ function AppHeader({
   const [searchOpenMobile, setSearchOpenMobile] = useState(false);
 
   // Refs
-  const langRef = useRef<HTMLDivElement>(null);
   const userRef = useRef<HTMLDivElement>(null);
   const notifRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLDivElement>(null);
@@ -182,16 +165,10 @@ function AppHeader({
     localStorage.setItem(THEME_KEY, next);
   };
 
-  const changeLang = (code: AppLang) => {
-    i18n.changeLanguage(code);
-    setShowLangMenu(false);
-  };
-
   // Close on outside click
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
       const t = e.target as Node;
-      if (langRef.current && !langRef.current.contains(t)) setShowLangMenu(false);
       if (userRef.current && !userRef.current.contains(t)) setShowUserMenu(false);
       if (notifRef.current && !notifRef.current.contains(t)) setShowNotifs(false);
       if (searchRef.current && !searchRef.current.contains(t)) setSearchOpenDesktop(false);
@@ -204,7 +181,6 @@ function AppHeader({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        setShowLangMenu(false);
         setShowUserMenu(false);
         setShowNotifs(false);
         setSearchOpenDesktop(false);
@@ -270,7 +246,6 @@ function AppHeader({
       });
     }
 
-    // Suggestion / reminder
     items.push({
       id: "tip-1",
       title: "Astuce : optimise ton CV pour une offre",
@@ -351,8 +326,6 @@ function AppHeader({
     </div>
   );
 
-  // CSS vars for both themes (keeps your page standalone)
-  // You can move this to globals later.
   const ThemeVars = (
     <style jsx global>{`
       :root {
@@ -414,11 +387,16 @@ function AppHeader({
           </div>
 
           {/* CENTER (Desktop search) */}
-          <div className="hidden md:flex items-center justify-center flex-1 max-w-md mx-4 relative" ref={searchRef}>
+          <div
+            className="hidden md:flex items-center justify-center flex-1 max-w-md mx-4 relative"
+            ref={searchRef}
+          >
             <div
               className={[
                 "w-full flex items-center justify-between px-3 py-1.5 rounded-lg border bg-[var(--bg-soft)] text-xs transition-all",
-                searchOpenDesktop ? "border-[var(--brand)]/50 ring-2 ring-[var(--brand)]/10" : "border-[var(--border)] hover:border-[var(--border)]/80",
+                searchOpenDesktop
+                  ? "border-[var(--brand)]/50 ring-2 ring-[var(--brand)]/10"
+                  : "border-[var(--border)] hover:border-[var(--border)]/80",
               ].join(" ")}
             >
               <div className="flex items-center gap-2 flex-1">
@@ -464,50 +442,6 @@ function AppHeader({
             >
               <Search className="h-4 w-4" />
             </button>
-
-            {/* Language */}
-            <div className="relative hidden sm:block" ref={langRef}>
-              <button
-                onClick={() => setShowLangMenu((v) => !v)}
-                className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs font-medium text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-soft)] transition-colors"
-                aria-label="Changer la langue"
-              >
-                <Globe className="h-4 w-4" />
-                <span className="uppercase">{(i18n.language || "fr").slice(0, 2)}</span>
-              </button>
-
-              <AnimatePresence>
-                {showLangMenu && (
-                  <motion.div
-                    initial={{ opacity: 0, scale: 0.96, y: 6 }}
-                    animate={{ opacity: 1, scale: 1, y: 0 }}
-                    exit={{ opacity: 0, scale: 0.96, y: 6 }}
-                    className="absolute right-0 top-full mt-2 w-44 bg-[var(--panel)] border border-[var(--border)] rounded-xl shadow-xl z-50 overflow-hidden"
-                  >
-                    <div className="p-1">
-                      {LANGUAGES.map((lang) => (
-                        <button
-                          key={lang.code}
-                          onClick={() => changeLang(lang.code)}
-                          className={[
-                            "w-full flex items-center justify-between px-3 py-2 text-xs rounded-lg transition-colors",
-                            i18n.language === lang.code
-                              ? "bg-[var(--brand)]/10 text-[var(--brand)]"
-                              : "text-[var(--ink)]/90 hover:bg-[var(--bg-soft)]",
-                          ].join(" ")}
-                        >
-                          <span className="flex items-center gap-2">
-                            <span>{lang.flag}</span>
-                            <span>{lang.label}</span>
-                          </span>
-                          {i18n.language === lang.code && <Check className="h-3.5 w-3.5" />}
-                        </button>
-                      ))}
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
 
             {/* Theme */}
             <button
@@ -859,7 +793,6 @@ export default function UserAppLayout({ children }: { children: ReactNode }) {
 
       {/* CONTENT */}
       <div className="flex-1 flex flex-col min-w-0 relative">
-        {/* subtle background */}
         <div className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(circle_at_top,_rgba(37,99,235,0.12),_transparent_55%),radial-gradient(circle_at_bottom,_rgba(16,185,129,0.10),_transparent_55%)]" />
 
         <AppHeader

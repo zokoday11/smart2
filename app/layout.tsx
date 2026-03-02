@@ -7,7 +7,6 @@ import { AuthProvider } from "@/context/AuthContext";
 import ActivityTracker from "@/components/ActivityTracker";
 
 import { ThemeProvider } from "@/context/ThemeContext";
-import I18nClientProvider from "@/components/I18nClientProvider";
 import { Starfield } from "@/components/ui/Starfield";
 
 export const metadata: Metadata = {
@@ -67,18 +66,15 @@ export default function RootLayout({
         ) : null}
 
         <ThemeProvider>
-          {/* ✅ i18next provider (détection navigateur + cache) */}
-          <I18nClientProvider>
-            {/* Fond étoilé derrière tout */}
-            <Starfield />
+          {/* Fond étoilé derrière tout */}
+          <Starfield />
 
-            <AuthProvider>
-              <ActivityTracker />
-              <div className="app-shell min-h-screen flex flex-col">
-                {children}
-              </div>
-            </AuthProvider>
-          </I18nClientProvider>
+          <AuthProvider>
+            <ActivityTracker />
+            <div className="app-shell min-h-screen flex flex-col">
+              {children}
+            </div>
+          </AuthProvider>
         </ThemeProvider>
       </body>
     </html>

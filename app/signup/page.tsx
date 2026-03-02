@@ -25,7 +25,6 @@ import {
   Eye,
   EyeOff,
 } from "lucide-react";
-import { useTranslation } from "react-i18next";
 
 // --- VALIDATION MOT DE PASSE ---
 function checkPasswordRules(pwd: string) {
@@ -37,8 +36,45 @@ function checkPasswordRules(pwd: string) {
   return { min, upper, digit, special, ok };
 }
 
+const TXT = {
+  tagline: "Assistant candidatures",
+  titleNav: "Inscription",
+  back: "Retour",
+  login: "Connexion",
+  badge: "Inscription",
+  title: "Créer un compte",
+  subtitle: "Commence en quelques secondes.",
+  welcome: (name: string) => `Bienvenue ${name ? name : ""} !`,
+  emailAlreadyInUse: "Cet email est déjà utilisé.",
+  invalidEmail: "Email invalide.",
+  weakPassword: "Mot de passe trop faible.",
+  generic: "Erreur. Réessaie.",
+  passwordRules: "Le mot de passe ne respecte pas les règles.",
+  recaptchaBlocked: "Vérification anti-bot impossible. Réessaie plus tard.",
+  recaptchaRefused: "Vérification anti-bot refusée. Réessaie.",
+  googleRecaptchaRefused: "Vérification anti-bot refusée (Google).",
+  accountExistsDifferentCredential: "Compte déjà existant avec un autre moyen de connexion.",
+  googleError: "Inscription Google impossible. Réessaie.",
+  firstNameLabel: "Prénom",
+  lastNameLabel: "Nom",
+  firstNamePlaceholder: "Jean",
+  lastNamePlaceholder: "Dupont",
+  emailLabel: "Email",
+  emailPlaceholder: "exemple@email.com",
+  passwordLabel: "Mot de passe",
+  passwordPlaceholder: "••••••••",
+  pwdMin: "8 caractères",
+  pwdUpper: "1 majuscule",
+  pwdDigit: "1 chiffre",
+  pwdSpecial: "1 caractère spécial",
+  submit: "Créer mon compte",
+  or: "OU",
+  google: "Continuer avec Google",
+  already: "Déjà un compte ?",
+  goLogin: "Se connecter",
+};
+
 function SignupPageInner() {
-  const { t } = useTranslation(["common", "auth"]);
   const router = useRouter();
   const searchParams = useSearchParams();
 
@@ -56,10 +92,10 @@ function SignupPageInner() {
 
   function mapSignupError(err: any) {
     const code = err?.code as string | undefined;
-    if (code === "auth/email-already-in-use") return t("auth.signup.errors.emailAlreadyInUse");
-    if (code === "auth/invalid-email") return t("auth.signup.errors.invalidEmail");
-    if (code === "auth/weak-password") return t("auth.signup.errors.weakPassword");
-    return t("auth.signup.errors.generic");
+    if (code === "auth/email-already-in-use") return TXT.emailAlreadyInUse;
+    if (code === "auth/invalid-email") return TXT.invalidEmail;
+    if (code === "auth/weak-password") return TXT.weakPassword;
+    return TXT.generic;
   }
 
   async function handleSubmit(e: FormEvent) {
@@ -68,7 +104,7 @@ function SignupPageInner() {
     setInfo(null);
 
     if (!pwdRules.ok) {
-      setError(t("auth.signup.errors.passwordRules"));
+      setError(TXT.passwordRules);
       return;
     }
 
@@ -79,13 +115,13 @@ function SignupPageInner() {
       try {
         token = await getRecaptchaToken(action);
       } catch {
-        setError(t("auth.signup.errors.recaptchaBlocked"));
+        setError(TXT.recaptchaBlocked);
         return;
       }
 
       const check = await verifyRecaptcha(token, action);
       if (!check.ok) {
-        setError(t("auth.signup.errors.recaptchaRefused"));
+        setError(TXT.recaptchaRefused);
         return;
       }
 
@@ -113,7 +149,7 @@ function SignupPageInner() {
       const check = await verifyRecaptcha(token, action);
 
       if (!check.ok) {
-        setError(t("auth.signup.errors.googleRecaptchaRefused"));
+        setError(TXT.googleRecaptchaRefused);
         return;
       }
 
@@ -121,15 +157,15 @@ function SignupPageInner() {
       const result = await signInWithPopup(auth, provider);
       const user = result.user;
 
-      setInfo(t("auth.signup.messages.welcome", { name: user.displayName || "" }));
+      setInfo(TXT.welcome(user.displayName || ""));
       const redirectTo = searchParams.get("redirect") || "/app";
       router.push(redirectTo);
     } catch (err: any) {
       console.error("Google signup error:", err);
       if (err.code === "auth/account-exists-with-different-credential") {
-        setError(t("auth.signup.errors.accountExistsDifferentCredential"));
+        setError(TXT.accountExistsDifferentCredential);
       } else {
-        setError(t("auth.signup.errors.google"));
+        setError(TXT.googleError);
       }
     } finally {
       setLoading(false);
@@ -150,18 +186,22 @@ function SignupPageInner() {
               IA
             </div>
             <div className="flex flex-col">
-              <span className="text-[10px] uppercase tracking-[0.18em] text-slate-400">
-                {t("common.app.tagline", "Assistant candidatures")}
-              </span>
-              <span className="text-xs font-medium text-slate-100">{t("auth.signup.nav.title")}</span>
+              <span className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{TXT.tagline}</span>
+              <span className="text-xs font-medium text-slate-100">{TXT.titleNav}</span>
             </div>
           </div>
           <nav className="flex items-center gap-2 text-[11px]">
-            <Link href="/" className="px-2 py-1 rounded-full border border-slate-700/80 hover:border-sky-500/80 text-slate-300 hover:text-sky-300 transition-colors flex items-center gap-1">
-              <ArrowLeft className="w-3 h-3" /> {t("auth.signup.nav.back")}
+            <Link
+              href="/"
+              className="px-2 py-1 rounded-full border border-slate-700/80 hover:border-sky-500/80 text-slate-300 hover:text-sky-300 transition-colors flex items-center gap-1"
+            >
+              <ArrowLeft className="w-3 h-3" /> {TXT.back}
             </Link>
-            <Link href="/login" className="px-3 py-1 rounded-full bg-sky-500/90 text-slate-950 font-medium hover:bg-sky-400 transition-colors">
-              {t("auth.signup.nav.login")}
+            <Link
+              href="/login"
+              className="px-3 py-1 rounded-full bg-sky-500/90 text-slate-950 font-medium hover:bg-sky-400 transition-colors"
+            >
+              {TXT.login}
             </Link>
           </nav>
         </div>
@@ -172,10 +212,10 @@ function SignupPageInner() {
           <div className="mb-6 text-center sm:text-left">
             <p className="inline-flex items-center gap-2 rounded-full bg-slate-900/80 border border-slate-700 px-3 py-1 mb-3">
               <UserPlus className="w-3 h-3 text-sky-400" />
-              <span className="text-[10px] uppercase tracking-[0.18em] text-slate-300">{t("auth.signup.badge")}</span>
+              <span className="text-[10px] uppercase tracking-[0.18em] text-slate-300">{TXT.badge}</span>
             </p>
-            <h1 className="text-xl font-bold text-slate-50 mb-1">{t("auth.signup.title")}</h1>
-            <p className="text-xs text-slate-400">{t("auth.signup.subtitle")}</p>
+            <h1 className="text-xl font-bold text-slate-50 mb-1">{TXT.title}</h1>
+            <p className="text-xs text-slate-400">{TXT.subtitle}</p>
           </div>
 
           {info && (
@@ -192,7 +232,7 @@ function SignupPageInner() {
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-300 ml-1">{t("auth.signup.form.firstName.label")}</label>
+                <label className="text-xs font-medium text-slate-300 ml-1">{TXT.firstNameLabel}</label>
                 <div className="relative">
                   <User className="absolute left-3 top-2.5 w-4 h-4 text-slate-500" />
                   <input
@@ -201,12 +241,12 @@ function SignupPageInner() {
                     value={firstName}
                     onChange={(e) => setFirstName(e.target.value)}
                     className="w-full bg-[#0A0A0B] border border-white/10 rounded-xl pl-10 pr-3 py-2 text-xs text-white placeholder:text-slate-600 focus:border-sky-500 focus:ring-1 focus:ring-sky-500 outline-none transition-all"
-                    placeholder={t("auth.signup.form.firstName.placeholder")}
+                    placeholder={TXT.firstNamePlaceholder}
                   />
                 </div>
               </div>
               <div className="space-y-1.5">
-                <label className="text-xs font-medium text-slate-300 ml-1">{t("auth.signup.form.lastName.label")}</label>
+                <label className="text-xs font-medium text-slate-300 ml-1">{TXT.lastNameLabel}</label>
                 <div className="relative">
                   <User className="absolute left-3 top-2.5 w-4 h-4 text-slate-500" />
                   <input
@@ -215,14 +255,14 @@ function SignupPageInner() {
                     value={lastName}
                     onChange={(e) => setLastName(e.target.value)}
                     className="w-full bg-[#0A0A0B] border border-white/10 rounded-xl pl-10 pr-3 py-2 text-xs text-white placeholder:text-slate-600 focus:border-sky-500 focus:ring-1 focus:ring-sky-500 outline-none transition-all"
-                    placeholder={t("auth.signup.form.lastName.placeholder")}
+                    placeholder={TXT.lastNamePlaceholder}
                   />
                 </div>
               </div>
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-slate-300 ml-1">{t("auth.signup.form.email.label")}</label>
+              <label className="text-xs font-medium text-slate-300 ml-1">{TXT.emailLabel}</label>
               <div className="relative">
                 <Mail className="absolute left-3 top-2.5 w-4 h-4 text-slate-500" />
                 <input
@@ -231,13 +271,13 @@ function SignupPageInner() {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   className="w-full bg-[#0A0A0B] border border-white/10 rounded-xl pl-10 pr-3 py-2 text-xs text-white placeholder:text-slate-600 focus:border-sky-500 focus:ring-1 focus:ring-sky-500 outline-none transition-all"
-                  placeholder={t("auth.signup.form.email.placeholder")}
+                  placeholder={TXT.emailPlaceholder}
                 />
               </div>
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-slate-300 ml-1">{t("auth.signup.form.password.label")}</label>
+              <label className="text-xs font-medium text-slate-300 ml-1">{TXT.passwordLabel}</label>
               <div className="relative">
                 <Lock className="absolute left-3 top-2.5 w-4 h-4 text-slate-500" />
                 <input
@@ -248,29 +288,33 @@ function SignupPageInner() {
                   className={`w-full bg-[#0A0A0B] border rounded-xl pl-10 pr-10 py-2 text-xs text-white placeholder:text-slate-600 focus:border-sky-500 focus:ring-1 focus:ring-sky-500 outline-none transition-all ${
                     password && !pwdRules.ok ? "border-rose-500/50" : "border-white/10"
                   }`}
-                  placeholder={t("auth.signup.form.password.placeholder")}
+                  placeholder={TXT.passwordPlaceholder}
                 />
-                <button type="button" onClick={() => setShowPwd(!showPwd)} className="absolute right-3 top-2.5 text-slate-500 hover:text-white transition-colors">
+                <button
+                  type="button"
+                  onClick={() => setShowPwd(!showPwd)}
+                  className="absolute right-3 top-2.5 text-slate-500 hover:text-white transition-colors"
+                >
                   {showPwd ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
               </div>
 
               <div className="grid grid-cols-2 gap-x-2 gap-y-1 mt-2 pl-1">
                 <div className={`flex items-center gap-1.5 text-[10px] ${pwdRules.min ? "text-emerald-400" : "text-slate-500"}`}>
-                  <div className={`w-1.5 h-1.5 rounded-full ${pwdRules.min ? "bg-emerald-400" : "bg-slate-600"}`} />{" "}
-                  {t("auth.signup.pwdRules.min")}
+                  <div className={`w-1.5 h-1.5 rounded-full ${pwdRules.min ? "bg-emerald-400" : "bg-slate-600"}`} />
+                  {TXT.pwdMin}
                 </div>
                 <div className={`flex items-center gap-1.5 text-[10px] ${pwdRules.upper ? "text-emerald-400" : "text-slate-500"}`}>
-                  <div className={`w-1.5 h-1.5 rounded-full ${pwdRules.upper ? "bg-emerald-400" : "bg-slate-600"}`} />{" "}
-                  {t("auth.signup.pwdRules.upper")}
+                  <div className={`w-1.5 h-1.5 rounded-full ${pwdRules.upper ? "bg-emerald-400" : "bg-slate-600"}`} />
+                  {TXT.pwdUpper}
                 </div>
                 <div className={`flex items-center gap-1.5 text-[10px] ${pwdRules.digit ? "text-emerald-400" : "text-slate-500"}`}>
-                  <div className={`w-1.5 h-1.5 rounded-full ${pwdRules.digit ? "bg-emerald-400" : "bg-slate-600"}`} />{" "}
-                  {t("auth.signup.pwdRules.digit")}
+                  <div className={`w-1.5 h-1.5 rounded-full ${pwdRules.digit ? "bg-emerald-400" : "bg-slate-600"}`} />
+                  {TXT.pwdDigit}
                 </div>
                 <div className={`flex items-center gap-1.5 text-[10px] ${pwdRules.special ? "text-emerald-400" : "text-slate-500"}`}>
-                  <div className={`w-1.5 h-1.5 rounded-full ${pwdRules.special ? "bg-emerald-400" : "bg-slate-600"}`} />{" "}
-                  {t("auth.signup.pwdRules.special")}
+                  <div className={`w-1.5 h-1.5 rounded-full ${pwdRules.special ? "bg-emerald-400" : "bg-slate-600"}`} />
+                  {TXT.pwdSpecial}
                 </div>
               </div>
             </div>
@@ -280,13 +324,13 @@ function SignupPageInner() {
               disabled={loading}
               className="w-full h-11 rounded-xl bg-sky-500 hover:bg-sky-400 text-white font-semibold text-sm transition-all shadow-lg shadow-sky-500/20 disabled:opacity-50 flex items-center justify-center gap-2 mt-2"
             >
-              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : t("auth.signup.form.submit")}
+              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : TXT.submit}
             </button>
           </form>
 
           <div className="flex items-center gap-3 my-5">
             <div className="h-px flex-1 bg-slate-800" />
-            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">{t("auth.signup.or")}</span>
+            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">{TXT.or}</span>
             <div className="h-px flex-1 bg-slate-800" />
           </div>
 
@@ -301,13 +345,13 @@ function SignupPageInner() {
               <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.84z" fill="#FBBC05" />
               <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335" />
             </svg>
-            {t("auth.signup.google")}
+            {TXT.google}
           </button>
 
           <p className="mt-6 text-center text-xs text-slate-500">
-            {t("auth.signup.footer.already")}{" "}
+            {TXT.already}{" "}
             <Link href="/login" className="text-sky-400 hover:text-sky-300 font-semibold underline decoration-sky-500/30">
-              {t("auth.signup.footer.login")}
+              {TXT.goLogin}
             </Link>
           </p>
         </div>
@@ -318,7 +362,13 @@ function SignupPageInner() {
 
 export default function SignupPage() {
   return (
-    <Suspense fallback={<div className="min-h-screen bg-[#0A0A0B] flex items-center justify-center"><Loader2 className="w-6 h-6 text-slate-500 animate-spin" /></div>}>
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-[#0A0A0B] flex items-center justify-center">
+          <Loader2 className="w-6 h-6 text-slate-500 animate-spin" />
+        </div>
+      }
+    >
       <SignupPageInner />
     </Suspense>
   );
