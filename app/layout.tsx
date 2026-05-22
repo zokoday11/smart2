@@ -9,9 +9,58 @@ import ActivityTracker from "@/components/ActivityTracker";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { Starfield } from "@/components/ui/Starfield";
 
+const siteName = "Assistant Candidatures IA";
+const siteDescription =
+  "Crée des CV, lettres de motivation et candidatures personnalisées avec un assistant IA moderne, sécurisé et rapide.";
+const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || "https://assistant-ia-v4.web.app";
+
 export const metadata: Metadata = {
-  title: "Assistant Candidatures IA",
-  description: "Tableau de bord CV / LM / candidatures",
+  metadataBase: new URL(siteUrl),
+  applicationName: siteName,
+  title: {
+    default: `${siteName} — CV, lettres & candidatures en 1 clic`,
+    template: `%s | ${siteName}`,
+  },
+  description: siteDescription,
+  keywords: [
+    "assistant IA candidature",
+    "CV IA",
+    "lettre de motivation IA",
+    "candidature emploi",
+    "recherche emploi",
+    "générateur CV",
+    "générateur lettre de motivation",
+  ],
+  authors: [{ name: siteName }],
+  creator: siteName,
+  publisher: siteName,
+  alternates: {
+    canonical: "/",
+  },
+  openGraph: {
+    type: "website",
+    locale: "fr_FR",
+    url: "/",
+    siteName,
+    title: `${siteName} — CV, lettres & candidatures en 1 clic`,
+    description: siteDescription,
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: `${siteName} — CV, lettres & candidatures en 1 clic`,
+    description: siteDescription,
+  },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: {
+      index: true,
+      follow: true,
+      "max-image-preview": "large",
+      "max-snippet": -1,
+      "max-video-preview": -1,
+    },
+  },
 };
 
 export const viewport: Viewport = {
@@ -19,6 +68,10 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   viewportFit: "cover",
+  themeColor: [
+    { media: "(prefers-color-scheme: dark)", color: "#020617" },
+    { media: "(prefers-color-scheme: light)", color: "#f8fafc" },
+  ],
 };
 
 export default function RootLayout({
